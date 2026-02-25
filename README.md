@@ -37,3 +37,6 @@ Optional tuning env vars:
 - `KAIST_KLMS_CONCURRENCY` (default `4`, range `1..16`)
 - `KAIST_KLMS_COURSE_INFO_TTL_SECONDS` (default `21600`)
 - `KAIST_KLMS_NOTICE_BOARD_TTL_SECONDS` (default `1800`)
+
+Fast listing option:
+- `uv run kaist klms courses --no-enrich`

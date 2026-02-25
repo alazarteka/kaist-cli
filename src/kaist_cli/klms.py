@@ -1092,7 +1092,7 @@ async def klms_extract_matches(path_or_url: str, pattern: str, max_matches: int 
     return {"url": path_or_url, "pattern": pattern, "count": len(matches), "matches": matches}
 
 
-async def klms_list_courses(include_all: bool = False) -> list[dict[str, Any]]:
+async def klms_list_courses(include_all: bool = False, *, enrich: bool = True) -> list[dict[str, Any]]:
     """
     List courses.
 
@@ -1110,22 +1110,27 @@ async def klms_list_courses(include_all: bool = False) -> list[dict[str, Any]]:
                     c["term_label"] = term["term_label"]
             if not include_all:
                 discovered = [c for c in discovered if not _is_noise_course(str(c.get("title", "")), config.exclude_course_title_patterns)]
-            # Best-effort enrich with course_code for better labeling.
-            async def enrich_course(course: dict[str, Any]) -> tuple[str | None, str | None, Exception | None]:
-                try:
-                    info = await _get_course_info(str(course["id"]), use_cache=True)
-                    return info.get("course_code"), info.get("course_code_base"), None
-                except KlmsAuthError as e:
-                    return None, None, e
-                except Exception:
-                    return None, None, None
+            if enrich:
+                # Best-effort enrich with course_code for better labeling.
+                async def enrich_course(course: dict[str, Any]) -> tuple[str | None, str | None, Exception | None]:
+                    try:
+                        info = await _get_course_info(str(course["id"]), use_cache=True)
+                        return info.get("course_code"), info.get("course_code_base"), None
+                    except KlmsAuthError as e:
+                        return None, None, e
+                    except Exception:
+                        return None, None, None
 
-            enrichment = await _gather_limited(discovered, enrich_course)
-            for course, (course_code, course_code_base, err) in zip(discovered, enrichment):
-                if err:
-                    raise err
-                course["course_code"] = course_code
-                course["course_code_base"] = course_code_base
+                enrichment = await _gather_limited(discovered, enrich_course)
+                for course, (course_code, course_code_base, err) in zip(discovered, enrichment):
+                    if err:
+                        raise err
+                    course["course_code"] = course_code
+                    course["course_code_base"] = course_code_base
+            else:
+                for course in discovered:
+                    course["course_code"] = None
+                    course["course_code_base"] = None
             return discovered
     except KlmsAuthError:
         raise
@@ -1140,18 +1145,31 @@ async def klms_list_courses(include_all: bool = False) -> list[dict[str, Any]]:
             "or set dashboard_path if your dashboard differs (default: /my/)."
         )
 
-    async def build_course(course_id: str) -> dict[str, Any]:
-        info = await _get_course_info(course_id, use_cache=True)
-        return {
-            "id": course_id,
-            "title": info["course_title"],
-            "course_code": info.get("course_code"),
-            "course_code_base": info.get("course_code_base"),
-            "url": info["course_url"],
-            "term_label": None,
-        }
+    if enrich:
+        async def build_course(course_id: str) -> dict[str, Any]:
+            info = await _get_course_info(course_id, use_cache=True)
+            return {
+                "id": course_id,
+                "title": info["course_title"],
+                "course_code": info.get("course_code"),
+                "course_code_base": info.get("course_code_base"),
+                "url": info["course_url"],
+                "term_label": None,
+            }
 
-    courses = await _gather_limited(list(config.course_ids), build_course)
+        courses = await _gather_limited(list(config.course_ids), build_course)
+    else:
+        courses = [
+            {
+                "id": course_id,
+                "title": f"course-{course_id}",
+                "course_code": None,
+                "course_code_base": None,
+                "url": _abs_url(config.base_url, f"/course/view.php?id={course_id}"),
+                "term_label": None,
+            }
+            for course_id in config.course_ids
+        ]
     if include_all:
         return courses
     return [c for c in courses if not _is_noise_course(str(c.get("title", "")), config.exclude_course_title_patterns)]
@@ -1189,7 +1207,7 @@ async def klms_list_assignments(course_id: str | None = None) -> list[dict[str, 
     if course_id:
         course_ids = [course_id]
     else:
-        course_ids = [c["id"] for c in await klms_list_courses()]
+        course_ids = [c["id"] for c in await klms_list_courses(enrich=False)]
     if not course_ids:
         raise ValueError(f"Pass course_id or configure course_ids in {CONFIG_PATH}")
 
@@ -1302,7 +1320,7 @@ async def klms_list_notices(
     else:
         board_ids = list(config.notice_board_ids)
         if not board_ids:
-            courses = await klms_list_courses()
+            courses = await klms_list_courses(enrich=False)
             board_ids = await _discover_notice_board_ids_for_courses([str(c["id"]) for c in courses], use_cache=True)
     if not board_ids:
         raise ValueError(
@@ -1471,7 +1489,7 @@ async def klms_sync_snapshot(
     config = _load_config()
     snapshot = _load_snapshot()
 
-    courses = await klms_list_courses(include_all=False)
+    courses = await klms_list_courses(include_all=False, enrich=False)
     course_ids = [c["id"] for c in courses]
 
     # Assignments + materials per course.
@@ -1575,7 +1593,7 @@ async def klms_list_files(course_id: str | None = None) -> list[dict[str, Any]]:
     if course_id:
         course_ids = [course_id]
     else:
-        course_ids = [c["id"] for c in await klms_list_courses()]
+        course_ids = [c["id"] for c in await klms_list_courses(enrich=False)]
     if not course_ids:
         raise ValueError(f"Pass course_id or configure course_ids in {CONFIG_PATH}")
 

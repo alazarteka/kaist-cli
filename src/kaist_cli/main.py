@@ -73,6 +73,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     courses = klms_sub.add_parser("courses", help="List courses")
     courses.add_argument("--include-all", action="store_true", help="Include noisy/non-course dashboard items")
+    courses.add_argument(
+        "--no-enrich",
+        action="store_true",
+        help="Skip extra per-course metadata fetches for faster listing.",
+    )
 
     klms_sub.add_parser("term", help="Get current term from dashboard")
 
@@ -135,7 +140,12 @@ def _dispatch_klms(args: argparse.Namespace) -> Any:
             )
         )
     if args.command == "courses":
-        return _run_klms_async(klms.klms_list_courses(include_all=args.include_all))
+        return _run_klms_async(
+            klms.klms_list_courses(
+                include_all=args.include_all,
+                enrich=not args.no_enrich,
+            )
+        )
     if args.command == "term":
         return _run_klms_async(klms.klms_get_current_term())
     if args.command == "course-info":
