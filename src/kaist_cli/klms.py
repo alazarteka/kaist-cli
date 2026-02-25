@@ -13,11 +13,14 @@ scaffold and requires configuration + a one-time login bootstrap.
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import os
 import re
 import time
 import html as _html
 import json
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 from dataclasses import dataclass
@@ -41,6 +44,17 @@ PROFILE_DIR = PRIVATE_ROOT / "profile"
 CONFIG_PATH = PRIVATE_ROOT / "config.toml"
 STORAGE_STATE_PATH = PRIVATE_ROOT / "storage_state.json"
 SNAPSHOT_PATH = PRIVATE_ROOT / "snapshot.json"
+CACHE_PATH = PRIVATE_ROOT / "cache.json"
+
+_RUNTIME_CONTEXT: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
+    "klms_runtime_context",
+    default=None,
+)
+_RUNTIME_AUTH_MODE: contextvars.ContextVar[Literal["profile", "storage_state"] | None] = contextvars.ContextVar(
+    "klms_runtime_auth_mode",
+    default=None,
+)
+_CACHE_IO_LOCK = threading.Lock()
 
 
 def _ensure_private_dirs() -> None:
@@ -50,6 +64,167 @@ def _ensure_private_dirs() -> None:
     except PermissionError:
         pass
     DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _read_positive_int_env(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def _concurrency_limit() -> int:
+    return _read_positive_int_env("KAIST_KLMS_CONCURRENCY", default=4, minimum=1, maximum=16)
+
+
+def _course_info_cache_ttl_seconds() -> int:
+    return _read_positive_int_env("KAIST_KLMS_COURSE_INFO_TTL_SECONDS", default=6 * 3600, minimum=0, maximum=7 * 24 * 3600)
+
+
+def _notice_board_cache_ttl_seconds() -> int:
+    return _read_positive_int_env("KAIST_KLMS_NOTICE_BOARD_TTL_SECONDS", default=1800, minimum=0, maximum=7 * 24 * 3600)
+
+
+def _load_cache() -> dict[str, Any]:
+    _ensure_private_dirs()
+    with _CACHE_IO_LOCK:
+        if not CACHE_PATH.exists():
+            return {"version": 1, "course_info": {}, "notice_board_discovery": {}}
+        try:
+            data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {"version": 1, "course_info": {}, "notice_board_discovery": {}}
+    if not isinstance(data, dict):
+        return {"version": 1, "course_info": {}, "notice_board_discovery": {}}
+    data.setdefault("version", 1)
+    data.setdefault("course_info", {})
+    data.setdefault("notice_board_discovery", {})
+    return data
+
+
+def _save_cache(cache: dict[str, Any]) -> None:
+    _ensure_private_dirs()
+    text = json.dumps(cache, ensure_ascii=False, indent=2) + "\n"
+    with _CACHE_IO_LOCK:
+        CACHE_PATH.write_text(text, encoding="utf-8")
+        try:
+            os.chmod(CACHE_PATH, 0o600)
+        except PermissionError:
+            pass
+
+
+def _cache_get_course_info(course_id: str) -> dict[str, Any] | None:
+    ttl = _course_info_cache_ttl_seconds()
+    if ttl == 0:
+        return None
+    cache = _load_cache()
+    entry = (cache.get("course_info") or {}).get(str(course_id))
+    if not isinstance(entry, dict):
+        return None
+    fetched_at = entry.get("fetched_at_epoch")
+    if not isinstance(fetched_at, (int, float)):
+        return None
+    if time.time() - float(fetched_at) > ttl:
+        return None
+    data = entry.get("data")
+    return data if isinstance(data, dict) else None
+
+
+def _cache_set_course_info(course_id: str, data: dict[str, Any]) -> None:
+    cache = _load_cache()
+    course_info = cache.setdefault("course_info", {})
+    if not isinstance(course_info, dict):
+        course_info = {}
+        cache["course_info"] = course_info
+    course_info[str(course_id)] = {
+        "fetched_at_epoch": time.time(),
+        "fetched_at_iso": _utc_now_iso(),
+        "data": data,
+    }
+    _save_cache(cache)
+
+
+def _course_ids_cache_key(course_ids: list[str]) -> str:
+    normalized = sorted({str(c).strip() for c in course_ids if str(c).strip()})
+    return ",".join(normalized)
+
+
+def _cache_get_notice_board_ids(course_ids: list[str]) -> list[str] | None:
+    ttl = _notice_board_cache_ttl_seconds()
+    if ttl == 0:
+        return None
+    key = _course_ids_cache_key(course_ids)
+    if not key:
+        return None
+    cache = _load_cache()
+    discovery = cache.get("notice_board_discovery") or {}
+    if not isinstance(discovery, dict):
+        return None
+    entry = discovery.get(key)
+    if not isinstance(entry, dict):
+        return None
+    fetched_at = entry.get("fetched_at_epoch")
+    if not isinstance(fetched_at, (int, float)):
+        return None
+    if time.time() - float(fetched_at) > ttl:
+        return None
+    board_ids = entry.get("board_ids") or []
+    if not isinstance(board_ids, list):
+        return None
+    return [str(b).strip() for b in board_ids if str(b).strip()]
+
+
+def _cache_set_notice_board_ids(course_ids: list[str], board_ids: list[str]) -> None:
+    key = _course_ids_cache_key(course_ids)
+    if not key:
+        return
+    cache = _load_cache()
+    discovery = cache.setdefault("notice_board_discovery", {})
+    if not isinstance(discovery, dict):
+        discovery = {}
+        cache["notice_board_discovery"] = discovery
+    discovery[key] = {
+        "fetched_at_epoch": time.time(),
+        "fetched_at_iso": _utc_now_iso(),
+        "board_ids": [str(b).strip() for b in board_ids if str(b).strip()],
+    }
+    _save_cache(cache)
+
+
+async def _gather_limited(items: list[Any], worker: Any, *, limit: int | None = None) -> list[Any]:
+    if not items:
+        return []
+    sem = asyncio.Semaphore(limit or _concurrency_limit())
+
+    async def run_one(item: Any) -> Any:
+        async with sem:
+            return await worker(item)
+
+    return list(await asyncio.gather(*(run_one(item) for item in items)))
+
+
+@asynccontextmanager
+async def klms_runtime(*, headless: bool = True, accept_downloads: bool = True) -> AsyncIterator[dict[str, Any]]:
+    """
+    Keep one authenticated Playwright context alive for an entire CLI command.
+    """
+    existing = _RUNTIME_CONTEXT.get()
+    if existing is not None:
+        yield {"auth_mode": _RUNTIME_AUTH_MODE.get()}
+        return
+
+    async with _authenticated_context(headless=headless, accept_downloads=accept_downloads) as (context, auth_mode):
+        token_ctx = _RUNTIME_CONTEXT.set(context)
+        token_mode = _RUNTIME_AUTH_MODE.set(auth_mode)
+        try:
+            yield {"auth_mode": auth_mode}
+        finally:
+            _RUNTIME_CONTEXT.reset(token_ctx)
+            _RUNTIME_AUTH_MODE.reset(token_mode)
 
 
 class KlmsAuthError(RuntimeError):
@@ -288,12 +463,25 @@ async def _fetch_html(path_or_url: str, *, timeout_ms: int = 20_000, allow_login
     _require_auth_artifact()
 
     url = _abs_url(config.base_url, path_or_url)
+    runtime_context = _RUNTIME_CONTEXT.get()
 
-    async with _authenticated_context(headless=True) as (context, _auth_mode):
-        page = await context.new_page()
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        html = await page.content()
-        final_url = page.url
+    if runtime_context is not None:
+        page = await runtime_context.new_page()
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            html = await page.content()
+            final_url = page.url
+        finally:
+            await page.close()
+    else:
+        async with _authenticated_context(headless=True) as (context, _auth_mode):
+            page = await context.new_page()
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                html = await page.content()
+                final_url = page.url
+            finally:
+                await page.close()
     if not allow_login_page and (_looks_logged_out(html) or _looks_login_url(final_url)):
         _raise_auth_error(final_url=final_url)
     return html
@@ -319,12 +507,27 @@ async def _probe_auth(*, timeout_ms: int = 10_000) -> dict[str, Any]:
     try:
         config = _load_config()
         url = _abs_url(config.base_url, config.dashboard_path)
-        async with _authenticated_context(headless=True) as (context, auth_mode):
-            out["mode"] = auth_mode
-            page = await context.new_page()
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-            html = await page.content()
-            out["final_url"] = page.url
+        runtime_context = _RUNTIME_CONTEXT.get()
+        runtime_mode = _RUNTIME_AUTH_MODE.get()
+        if runtime_context is not None:
+            out["mode"] = runtime_mode or out["mode"]
+            page = await runtime_context.new_page()
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                html = await page.content()
+                out["final_url"] = page.url
+            finally:
+                await page.close()
+        else:
+            async with _authenticated_context(headless=True) as (context, auth_mode):
+                out["mode"] = auth_mode
+                page = await context.new_page()
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    html = await page.content()
+                    out["final_url"] = page.url
+                finally:
+                    await page.close()
 
         out["validated"] = True
         out["authenticated"] = not (_looks_logged_out(html) or _looks_login_url(str(out["final_url"] or "")))
@@ -475,10 +678,15 @@ def _course_code_base(course_code: str | None) -> str | None:
     return s or None
 
 
-async def _get_course_info(course_id: str) -> dict[str, Any]:
+async def _get_course_info(course_id: str, *, use_cache: bool = True) -> dict[str, Any]:
     """
     Return a best-effort course metadata bundle for labeling and file organization.
     """
+    if use_cache:
+        cached = _cache_get_course_info(course_id)
+        if cached:
+            return cached
+
     config = _load_config()
     title = None
     code = None
@@ -496,13 +704,16 @@ async def _get_course_info(course_id: str) -> dict[str, Any]:
         raise
     except Exception:
         pass
-    return {
+    result = {
         "course_id": str(course_id),
         "course_title": title or f"course-{course_id}",
         "course_code": code,  # may be None
         "course_code_base": _course_code_base(code),
         "course_url": _abs_url(config.base_url, f"/course/view.php?id={course_id}"),
     }
+    if use_cache:
+        _cache_set_course_info(course_id, result)
+    return result
 
 
 def _discover_courses_from_dashboard(html: str, base_url: str) -> list[dict[str, Any]]:
@@ -664,6 +875,31 @@ def _discover_notice_board_ids_from_course_page(html: str) -> list[dict[str, str
     return list(found.values())
 
 
+async def _discover_notice_board_ids_for_courses(course_ids: list[str], *, use_cache: bool = True) -> list[str]:
+    normalized_ids = [str(cid).strip() for cid in course_ids if str(cid).strip()]
+    if not normalized_ids:
+        return []
+
+    if use_cache:
+        cached = _cache_get_notice_board_ids(normalized_ids)
+        if cached is not None:
+            return list(dict.fromkeys(cached))
+
+    async def discover_for_course(cid: str) -> list[str]:
+        course_html = await _fetch_html(f"/course/view.php?id={cid}&section=0")
+        return [b["board_id"] for b in _discover_notice_board_ids_from_course_page(course_html)]
+
+    discovered_lists = await _gather_limited(normalized_ids, discover_for_course)
+    merged: list[str] = []
+    for ids in discovered_lists:
+        merged.extend(ids)
+    board_ids = list(dict.fromkeys(merged))
+
+    if use_cache:
+        _cache_set_notice_board_ids(normalized_ids, board_ids)
+    return board_ids
+
+
 def _extract_notice_id_from_href(href: str) -> str | None:
     # courseboard articles look like: article.php?id=<board_id>&bwid=<post_id>
     m = re.search(r"[?&]bwid=(\d+)", href)
@@ -793,7 +1029,9 @@ async def klms_status(validate: bool = True) -> dict[str, Any]:
         "config_path": str(CONFIG_PATH),
         "profile_path": str(PROFILE_DIR),
         "storage_state_path": str(STORAGE_STATE_PATH),
+        "cache_path": str(CACHE_PATH),
         "download_root": str(DOWNLOAD_ROOT),
+        "concurrency_limit": _concurrency_limit(),
         "configured": CONFIG_PATH.exists(),
         "auth_artifacts": {
             "profile": _has_profile_session(),
@@ -872,17 +1110,22 @@ async def klms_list_courses(include_all: bool = False) -> list[dict[str, Any]]:
                     c["term_label"] = term["term_label"]
             if not include_all:
                 discovered = [c for c in discovered if not _is_noise_course(str(c.get("title", "")), config.exclude_course_title_patterns)]
-            # Best-effort enrich with course_code for better labeling (ignore failures).
-            for c in discovered:
+            # Best-effort enrich with course_code for better labeling.
+            async def enrich_course(course: dict[str, Any]) -> tuple[str | None, str | None, Exception | None]:
                 try:
-                    info = await _get_course_info(str(c["id"]))
-                    c["course_code"] = info.get("course_code")
-                    c["course_code_base"] = info.get("course_code_base")
-                except KlmsAuthError:
-                    raise
+                    info = await _get_course_info(str(course["id"]), use_cache=True)
+                    return info.get("course_code"), info.get("course_code_base"), None
+                except KlmsAuthError as e:
+                    return None, None, e
                 except Exception:
-                    c["course_code"] = None
-                    c["course_code_base"] = None
+                    return None, None, None
+
+            enrichment = await _gather_limited(discovered, enrich_course)
+            for course, (course_code, course_code_base, err) in zip(discovered, enrichment):
+                if err:
+                    raise err
+                course["course_code"] = course_code
+                course["course_code_base"] = course_code_base
             return discovered
     except KlmsAuthError:
         raise
@@ -897,19 +1140,18 @@ async def klms_list_courses(include_all: bool = False) -> list[dict[str, Any]]:
             "or set dashboard_path if your dashboard differs (default: /my/)."
         )
 
-    courses: list[dict[str, Any]] = []
-    for course_id in config.course_ids:
-        info = await _get_course_info(course_id)
-        courses.append(
-            {
-                "id": course_id,
-                "title": info["course_title"],
-                "course_code": info.get("course_code"),
-                "course_code_base": info.get("course_code_base"),
-                "url": info["course_url"],
-                "term_label": None,
-            }
-        )
+    async def build_course(course_id: str) -> dict[str, Any]:
+        info = await _get_course_info(course_id, use_cache=True)
+        return {
+            "id": course_id,
+            "title": info["course_title"],
+            "course_code": info.get("course_code"),
+            "course_code_base": info.get("course_code_base"),
+            "url": info["course_url"],
+            "term_label": None,
+        }
+
+    courses = await _gather_limited(list(config.course_ids), build_course)
     if include_all:
         return courses
     return [c for c in courses if not _is_noise_course(str(c.get("title", "")), config.exclude_course_title_patterns)]
@@ -951,11 +1193,11 @@ async def klms_list_assignments(course_id: str | None = None) -> list[dict[str, 
     if not course_ids:
         raise ValueError(f"Pass course_id or configure course_ids in {CONFIG_PATH}")
 
-    all_items: list[dict[str, Any]] = []
-    for cid in course_ids:
+    async def list_assignments_for_course(cid: str) -> list[dict[str, Any]]:
         url_path = f"/mod/assign/index.php?id={cid}"
         html = await _fetch_html(url_path)
         soup = BeautifulSoup(html, "html.parser")
+        out: list[dict[str, Any]] = []
 
         # Find a table that includes "Due date" / "마감" and an assignment name/title column.
         found = _find_table_by_headers(
@@ -971,7 +1213,7 @@ async def klms_list_assignments(course_id: str | None = None) -> list[dict[str, 
                 href = a["href"]
                 if "mod/assign/view.php" in href:
                     title = _norm_text(a.get_text(" ", strip=True))
-                    all_items.append(
+                    out.append(
                         {
                             "course_id": str(cid),
                             "title": title,
@@ -981,7 +1223,7 @@ async def klms_list_assignments(course_id: str | None = None) -> list[dict[str, 
                             "due_iso": None,
                         }
                     )
-            continue
+            return out
 
         headers, table = found
         headers_norm = [h.lower() for h in headers]
@@ -1021,7 +1263,7 @@ async def klms_list_assignments(course_id: str | None = None) -> list[dict[str, 
                 if m:
                     assignment_id = m.group(1)
 
-            all_items.append(
+            out.append(
                 {
                     "course_id": str(cid),
                     "id": assignment_id,
@@ -1031,7 +1273,12 @@ async def klms_list_assignments(course_id: str | None = None) -> list[dict[str, 
                     "due_iso": _parse_datetime_guess(due_raw) if due_raw else None,
                 }
             )
+        return out
 
+    per_course = await _gather_limited(course_ids, list_assignments_for_course)
+    all_items: list[dict[str, Any]] = []
+    for items in per_course:
+        all_items.extend(items)
     return all_items
 
 
@@ -1055,21 +1302,8 @@ async def klms_list_notices(
     else:
         board_ids = list(config.notice_board_ids)
         if not board_ids:
-            # Try to discover boards by scanning each course page.
-            discovered: list[str] = []
-            for c in await klms_list_courses():
-                cid = c["id"]
-                course_html = await _fetch_html(f"/course/view.php?id={cid}")
-                for board in _discover_notice_board_ids_from_course_page(course_html):
-                    discovered.append(board["board_id"])
-            # De-dupe preserving order.
-            seen: set[str] = set()
-            board_ids = []
-            for bid in discovered:
-                if bid in seen:
-                    continue
-                seen.add(bid)
-                board_ids.append(bid)
+            courses = await klms_list_courses()
+            board_ids = await _discover_notice_board_ids_for_courses([str(c["id"]) for c in courses], use_cache=True)
     if not board_ids:
         raise ValueError(
             f"No notice boards found. Configure notice_board_ids in {CONFIG_PATH} "
@@ -1246,9 +1480,15 @@ async def klms_sync_snapshot(
     assignments_updated: list[dict[str, Any]] = []
     materials_new: list[dict[str, Any]] = []
 
-    for cid in course_ids:
-        assignments = await klms_list_assignments(cid)
-        materials = await klms_list_files(cid)
+    async def collect_course_state(cid: str) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+        assignments, materials = await asyncio.gather(
+            klms_list_assignments(cid),
+            klms_list_files(cid),
+        )
+        return cid, assignments, materials
+
+    course_states = await _gather_limited(course_ids, collect_course_state)
+    for cid, assignments, materials in course_states:
         current_courses[cid] = {
             "assignments": {str(a.get("id")): a for a in assignments if a.get("id")},
             "materials": {str(m.get("url")): m for m in materials if m.get("url")},
@@ -1277,17 +1517,12 @@ async def klms_sync_snapshot(
     # Notices: prefer discovered boards (if any) otherwise config.
     board_ids = list(config.notice_board_ids)
     if not board_ids:
-        discovered = []
-        for c in courses:
-            cid = c["id"]
-            course_html = await _fetch_html(f"/course/view.php?id={cid}&section=0")
-            for b in _discover_notice_board_ids_from_course_page(course_html):
-                discovered.append(b["board_id"])
-        board_ids = list(dict.fromkeys(discovered))
+        board_ids = await _discover_notice_board_ids_for_courses(course_ids, use_cache=True)
 
     notices_new: list[dict[str, Any]] = []
     current_boards: dict[str, Any] = {}
-    for bid in board_ids:
+
+    async def collect_board_state(bid: str) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
         prev_board = snapshot.get("boards", {}).get(bid, {})
         prev_posts = prev_board.get("posts", {}) or {}
         # Use any previously-seen bwid as stop point to avoid paging forever.
@@ -1297,10 +1532,16 @@ async def klms_sync_snapshot(
             stop_bwid = next(iter(prev_posts.keys()))
         posts = await klms_list_notices(bid, max_pages=max_notice_pages, stop_bwid=stop_bwid)
         current_posts = {str(p.get("id")): p for p in posts if p.get("id")}
-        current_boards[bid] = {"posts": current_posts}
+        new_posts: list[dict[str, Any]] = []
         for pid, p in current_posts.items():
             if pid not in prev_posts:
-                notices_new.append(p)
+                new_posts.append(p)
+        return bid, {"posts": current_posts}, new_posts
+
+    board_states = await _gather_limited(board_ids, collect_board_state)
+    for bid, board_data, new_posts in board_states:
+        current_boards[bid] = board_data
+        notices_new.extend(new_posts)
 
     result = {
         "snapshot_path": str(SNAPSHOT_PATH),
@@ -1338,8 +1579,7 @@ async def klms_list_files(course_id: str | None = None) -> list[dict[str, Any]]:
     if not course_ids:
         raise ValueError(f"Pass course_id or configure course_ids in {CONFIG_PATH}")
 
-    items: list[dict[str, Any]] = []
-    for cid in course_ids:
+    async def list_files_for_course(cid: str) -> list[dict[str, Any]]:
         def extract_from_html(page_html: str) -> list[dict[str, Any]]:
             soup = BeautifulSoup(page_html, "html.parser")
             out: list[dict[str, Any]] = []
@@ -1423,7 +1663,12 @@ async def klms_list_files(course_id: str | None = None) -> list[dict[str, Any]]:
             course_html = await _fetch_html(f"/course/view.php?id={cid}&section=0")
             per_course_items = extract_from_html(course_html)
 
-        items.extend(per_course_items)
+        return per_course_items
+
+    per_course_items = await _gather_limited(course_ids, list_files_for_course)
+    items: list[dict[str, Any]] = []
+    for course_items in per_course_items:
+        items.extend(course_items)
 
     # De-dupe by URL.
     seen: set[str] = set()
@@ -1461,30 +1706,35 @@ async def klms_download_file(
     if _is_video_url(resolved_url) or (filename and _is_video_filename(filename)):
         return {"skipped": True, "reason": "video", "url": resolved_url}
 
-    async with _authenticated_context(headless=True, accept_downloads=True) as (context, auth_mode):
+    async def run_with_context(context: Any, auth_mode: str) -> dict[str, Any]:
         # Preflight auth check so we fail fast (rather than timing out waiting for a download).
         auth_page = await context.new_page()
-        await auth_page.goto(
-            _abs_url(config.base_url, config.dashboard_path),
-            wait_until="domcontentloaded",
-            timeout=15_000,
-        )
-        auth_html = await auth_page.content()
-        auth_final_url = auth_page.url
-        await auth_page.close()
+        try:
+            await auth_page.goto(
+                _abs_url(config.base_url, config.dashboard_path),
+                wait_until="domcontentloaded",
+                timeout=15_000,
+            )
+            auth_html = await auth_page.content()
+            auth_final_url = auth_page.url
+        finally:
+            await auth_page.close()
         if _looks_logged_out(auth_html) or _looks_login_url(auth_final_url):
             _raise_auth_error(final_url=auth_final_url)
 
         page = await context.new_page()
-        async with page.expect_download() as download_info:
-            # Some KLMS resource URLs trigger downloads immediately, causing Playwright to raise:
-            # "Page.goto: Download is starting". Treat that as success.
-            try:
-                await page.goto(resolved_url, wait_until="commit", timeout=30_000)
-            except Exception as e:  # noqa: BLE001
-                if "Download is starting" not in str(e):
-                    raise
-        download = await download_info.value
+        try:
+            async with page.expect_download() as download_info:
+                # Some KLMS resource URLs trigger downloads immediately, causing Playwright to raise:
+                # "Page.goto: Download is starting". Treat that as success.
+                try:
+                    await page.goto(resolved_url, wait_until="commit", timeout=30_000)
+                except Exception as e:  # noqa: BLE001
+                    if "Download is starting" not in str(e):
+                        raise
+            download = await download_info.value
+        finally:
+            await page.close()
 
         suggested = download.suggested_filename
         final_name = filename or suggested or re.sub(r"[?#].*$", "", resolved_url.rstrip("/").split("/")[-1]) or f"download-{int(time.time())}"
@@ -1513,7 +1763,15 @@ async def klms_download_file(
             }
 
         await download.save_as(str(out_path))
-    return {"ok": True, "path": str(out_path), "url": resolved_url, "auth_mode": auth_mode}
+        return {"ok": True, "path": str(out_path), "url": resolved_url, "auth_mode": auth_mode}
+
+    runtime_context = _RUNTIME_CONTEXT.get()
+    runtime_mode = _RUNTIME_AUTH_MODE.get()
+    if runtime_context is not None:
+        return await run_with_context(runtime_context, str(runtime_mode or _active_auth_mode()))
+
+    async with _authenticated_context(headless=True, accept_downloads=True) as (context, auth_mode):
+        return await run_with_context(context, auth_mode)
 
 
 def klms_bootstrap_login(base_url: str | None = None) -> dict[str, Any]:

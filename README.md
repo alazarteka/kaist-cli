@@ -27,3 +27,13 @@ KLMS auth is persisted in:
 - `~/.kaist-cli/private/klms/storage_state.json` (fallback/debug export)
 
 Use `uv run kaist klms status` to inspect active auth mode and cookie expiry estimates.
+
+## Performance
+
+The CLI reuses a single authenticated browser context per command invocation and
+fetches per-course work concurrently.
+
+Optional tuning env vars:
+- `KAIST_KLMS_CONCURRENCY` (default `4`, range `1..16`)
+- `KAIST_KLMS_COURSE_INFO_TTL_SECONDS` (default `21600`)
+- `KAIST_KLMS_NOTICE_BOARD_TTL_SECONDS` (default `1800`)

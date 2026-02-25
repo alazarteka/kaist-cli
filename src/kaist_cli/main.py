@@ -16,6 +16,16 @@ def _run_async(coro: Any) -> Any:
     return asyncio.run(coro)
 
 
+def _run_klms_async(coro: Any) -> Any:
+    from . import klms
+
+    async def wrapped() -> Any:
+        async with klms.klms_runtime(headless=True, accept_downloads=True):
+            return await coro
+
+    return _run_async(wrapped())
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="kaist", description="CLI for KAIST systems.")
     parser.add_argument("--debug", action="store_true", help="Print traceback on failures.")
@@ -114,9 +124,9 @@ def _dispatch_klms(args: argparse.Namespace) -> Any:
     if args.command == "status":
         return _run_async(klms.klms_status(validate=not args.no_validate))
     if args.command == "fetch-html":
-        return _run_async(klms.klms_fetch_html(args.path_or_url))
+        return _run_klms_async(klms.klms_fetch_html(args.path_or_url))
     if args.command == "extract":
-        return _run_async(
+        return _run_klms_async(
             klms.klms_extract_matches(
                 args.path_or_url,
                 args.pattern,
@@ -125,15 +135,15 @@ def _dispatch_klms(args: argparse.Namespace) -> Any:
             )
         )
     if args.command == "courses":
-        return _run_async(klms.klms_list_courses(include_all=args.include_all))
+        return _run_klms_async(klms.klms_list_courses(include_all=args.include_all))
     if args.command == "term":
-        return _run_async(klms.klms_get_current_term())
+        return _run_klms_async(klms.klms_get_current_term())
     if args.command == "course-info":
-        return _run_async(klms.klms_get_course_info(args.course_id))
+        return _run_klms_async(klms.klms_get_course_info(args.course_id))
     if args.command == "assignments":
-        return _run_async(klms.klms_list_assignments(course_id=args.course_id))
+        return _run_klms_async(klms.klms_list_assignments(course_id=args.course_id))
     if args.command == "notices":
-        return _run_async(
+        return _run_klms_async(
             klms.klms_list_notices(
                 course_id=args.board_id,
                 max_pages=args.max_pages,
@@ -141,16 +151,16 @@ def _dispatch_klms(args: argparse.Namespace) -> Any:
             )
         )
     if args.command == "files":
-        return _run_async(klms.klms_list_files(course_id=args.course_id))
+        return _run_klms_async(klms.klms_list_files(course_id=args.course_id))
     if args.command == "sync":
-        return _run_async(
+        return _run_klms_async(
             klms.klms_sync_snapshot(
                 update=not args.no_update,
                 max_notice_pages=args.max_notice_pages,
             )
         )
     if args.command == "download":
-        return _run_async(
+        return _run_klms_async(
             klms.klms_download_file(
                 args.url,
                 filename=args.filename,
