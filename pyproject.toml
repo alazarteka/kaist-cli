@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kaist-cli"
+version = "0.1.0"
+description = "CLI for KAIST systems (starting with KLMS)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "beautifulsoup4>=4.12.0",
+  "playwright>=1.41.0",
+]
+
+[project.scripts]
+kaist = "kaist_cli.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kaist_cli"]
