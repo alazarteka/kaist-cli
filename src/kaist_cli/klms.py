@@ -26,6 +26,7 @@ from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
+from urllib.parse import parse_qs, urlparse
 
 from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 from playwright.async_api import async_playwright  # type: ignore[import-untyped]
@@ -45,6 +46,8 @@ CONFIG_PATH = PRIVATE_ROOT / "config.toml"
 STORAGE_STATE_PATH = PRIVATE_ROOT / "storage_state.json"
 SNAPSHOT_PATH = PRIVATE_ROOT / "snapshot.json"
 CACHE_PATH = PRIVATE_ROOT / "cache.json"
+ENDPOINT_DISCOVERY_PATH = PRIVATE_ROOT / "endpoint_discovery.json"
+API_MAP_PATH = PRIVATE_ROOT / "api_map.json"
 
 _RUNTIME_CONTEXT: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
     "klms_runtime_context",
@@ -418,6 +421,219 @@ def _sanitize_relpath(rel: str) -> Path:
     rel = re.sub(r"/+", "/", rel)
     parts = [p for p in rel.split("/") if p not in ("", ".", "..")]
     return Path(*parts)
+
+
+def _same_origin(url_a: str, url_b: str) -> bool:
+    try:
+        a = urlparse(url_a)
+        b = urlparse(url_b)
+        return (a.scheme, a.netloc) == (b.scheme, b.netloc)
+    except Exception:
+        return False
+
+
+def _endpoint_canonical_key(method: str, url: str) -> str:
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    info = ",".join(sorted(query.get("info", [])))
+    path = parsed.path or "/"
+    if info:
+        return f"{method.upper()} {path}?info={info}"
+    return f"{method.upper()} {path}"
+
+
+def _extract_methodname_from_post_data_preview(preview: str) -> str | None:
+    text = (preview or "").strip()
+    if not text:
+        return None
+    if not text.startswith("["):
+        return None
+    try:
+        data = json.loads(text)
+    except Exception:
+        return None
+    if isinstance(data, list) and data:
+        first = data[0]
+        if isinstance(first, dict):
+            m = first.get("methodname")
+            if isinstance(m, str) and m.strip():
+                return m.strip()
+    return None
+
+
+def _summarize_json_shape(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 4:
+        return {"type": type(value).__name__}
+    if isinstance(value, dict):
+        keys = list(value.keys())
+        sample: dict[str, Any] = {}
+        for k in keys[:5]:
+            sample[str(k)] = _summarize_json_shape(value[k], depth=depth + 1)
+        return {
+            "type": "object",
+            "key_count": len(keys),
+            "keys": [str(k) for k in keys[:20]],
+            "sample": sample,
+        }
+    if isinstance(value, list):
+        return {
+            "type": "array",
+            "length": len(value),
+            "item_shape": _summarize_json_shape(value[0], depth=depth + 1) if value else None,
+        }
+    if value is None:
+        return {"type": "null"}
+    if isinstance(value, bool):
+        return {"type": "boolean"}
+    if isinstance(value, (int, float)):
+        return {"type": "number"}
+    if isinstance(value, str):
+        return {"type": "string", "length": len(value)}
+    return {"type": type(value).__name__}
+
+
+def _classify_endpoint(endpoint: dict[str, Any]) -> dict[str, Any]:
+    method = str(endpoint.get("method", "")).upper()
+    url = str(endpoint.get("url", ""))
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    info = ",".join(sorted(query.get("info", [])))
+    methodname = _extract_methodname_from_post_data_preview(str(endpoint.get("post_data_preview") or ""))
+    json_like = bool(endpoint.get("json_like"))
+    content_types = [str(c).lower() for c in (endpoint.get("content_types") or [])]
+
+    classification = {
+        "canonical_key": _endpoint_canonical_key(method, url),
+        "path": path,
+        "info": info or None,
+        "methodname": methodname,
+        "category": "unknown",
+        "confidence": 0.2,
+        "recommended_for_cli": False,
+        "reason": "No matching rule.",
+    }
+
+    if path == "/lib/ajax/service.php" and "core_course_get_recent_courses" in info:
+        classification.update(
+            {
+                "category": "courses",
+                "confidence": 0.95,
+                "recommended_for_cli": True,
+                "reason": "Core Moodle AJAX recent-courses endpoint.",
+            }
+        )
+        return classification
+
+    if methodname == "core_course_get_recent_courses":
+        classification.update(
+            {
+                "category": "courses",
+                "confidence": 0.95,
+                "recommended_for_cli": True,
+                "reason": "Detected by methodname in AJAX payload.",
+            }
+        )
+        return classification
+
+    if path == "/lib/ajax/service.php" and "core_course_get_enrolled_courses_by_timeline_classification" in info:
+        classification.update(
+            {
+                "category": "courses",
+                "confidence": 0.9,
+                "recommended_for_cli": True,
+                "reason": "Core Moodle timeline/enrolled-courses endpoint.",
+            }
+        )
+        return classification
+
+    if path == "/lib/ajax/service.php" and "core_calendar_get_action_events_by_timesort" in info:
+        classification.update(
+            {
+                "category": "calendar",
+                "confidence": 0.85,
+                "recommended_for_cli": True,
+                "reason": "Core Moodle calendar events endpoint (potential assignment/deadline source).",
+            }
+        )
+        return classification
+
+    if path == "/lib/ajax/service.php" and "core_output_load_template_with_dependencies" in info:
+        classification.update(
+            {
+                "category": "ui_template",
+                "confidence": 0.7,
+                "recommended_for_cli": False,
+                "reason": "Template-rendering endpoint, likely presentation-focused.",
+            }
+        )
+        return classification
+
+    if path == "/lib/ajax/service-nologin.php":
+        classification.update(
+            {
+                "category": "ui_template",
+                "confidence": 0.6,
+                "recommended_for_cli": False,
+                "reason": "No-login AJAX template endpoint.",
+            }
+        )
+        return classification
+
+    if "/mod/assign/" in path:
+        classification.update(
+            {
+                "category": "assignments",
+                "confidence": 0.8 if json_like else 0.55,
+                "recommended_for_cli": json_like,
+                "reason": "Assignment module endpoint.",
+            }
+        )
+        return classification
+
+    if "/mod/courseboard/" in path:
+        classification.update(
+            {
+                "category": "notices",
+                "confidence": 0.8 if json_like else 0.6,
+                "recommended_for_cli": json_like,
+                "reason": "Courseboard/notice endpoint.",
+            }
+        )
+        return classification
+
+    if "/mod/resource/" in path or "pluginfile.php" in path:
+        classification.update(
+            {
+                "category": "files",
+                "confidence": 0.75 if json_like else 0.6,
+                "recommended_for_cli": json_like,
+                "reason": "Resource/file endpoint.",
+            }
+        )
+        return classification
+
+    if "/panopto/" in path or "video" in path:
+        classification.update(
+            {
+                "category": "video",
+                "confidence": 0.7,
+                "recommended_for_cli": False,
+                "reason": "Video integration endpoint (out of current non-video scope).",
+            }
+        )
+        return classification
+
+    if json_like or any("json" in ct for ct in content_types):
+        classification.update(
+            {
+                "category": "json_unknown",
+                "confidence": 0.4,
+                "recommended_for_cli": False,
+                "reason": "JSON-like endpoint; needs manual inspection.",
+            }
+        )
+    return classification
 
 
 @asynccontextmanager
@@ -1175,6 +1391,134 @@ async def klms_list_courses(include_all: bool = False, *, enrich: bool = True) -
     return [c for c in courses if not _is_noise_course(str(c.get("title", "")), config.exclude_course_title_patterns)]
 
 
+async def klms_list_courses_api(include_all: bool = False, *, limit: int = 50) -> list[dict[str, Any]]:
+    """
+    Experimental: list courses via KLMS internal AJAX endpoint.
+    """
+    config = _load_config()
+    _require_auth_artifact()
+    limit = max(1, min(limit, 200))
+
+    async def run_with_context(context: Any, auth_mode: str) -> list[dict[str, Any]]:
+        loop = asyncio.get_running_loop()
+        response_future: asyncio.Future[dict[str, Any]] = loop.create_future()
+        response_tasks: list[asyncio.Task[Any]] = []
+
+        page = await context.new_page()
+        try:
+            def on_response(resp: Any) -> None:
+                req = resp.request
+                if req.resource_type not in {"xhr", "fetch"}:
+                    return
+                if "core_course_get_recent_courses" not in req.url:
+                    return
+                if not _same_origin(req.url, config.base_url):
+                    return
+
+                async def capture() -> None:
+                    try:
+                        text = await resp.text()
+                    except Exception as e:  # noqa: BLE001
+                        if not response_future.done():
+                            response_future.set_exception(e)
+                        return
+                    if not response_future.done():
+                        response_future.set_result(
+                            {
+                                "ok": 200 <= int(resp.status) < 300,
+                                "status": int(resp.status),
+                                "url": req.url,
+                                "method": req.method,
+                                "post_data_preview": (req.post_data or "")[:400],
+                                "text": text,
+                            }
+                        )
+
+                response_tasks.append(asyncio.create_task(capture()))
+
+            page.on("response", on_response)
+            await page.goto(
+                _abs_url(config.base_url, config.dashboard_path),
+                wait_until="domcontentloaded",
+                timeout=30_000,
+            )
+            if not response_future.done():
+                await asyncio.wait_for(response_future, timeout=8.0)
+            result = response_future.result()
+            if response_tasks:
+                await asyncio.gather(*response_tasks, return_exceptions=True)
+        except asyncio.TimeoutError:
+            # Cautious fallback if the AJAX request is not observed due to UI variant.
+            return await klms_list_courses(include_all=include_all, enrich=False)
+        finally:
+            await page.close()
+
+        if not isinstance(result, dict):
+            raise ValueError("Unexpected browser result when calling core_course_get_recent_courses.")
+        if not result.get("ok"):
+            raise ValueError(f"AJAX call failed for core_course_get_recent_courses: {result}")
+
+        text = str(result.get("text", ""))
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed parsing core_course_get_recent_courses response JSON: {e}") from e
+
+        if not isinstance(payload, list) or not payload:
+            raise ValueError("Unexpected response shape from core_course_get_recent_courses.")
+        first = payload[0]
+        if not isinstance(first, dict):
+            raise ValueError("Unexpected response item type from core_course_get_recent_courses.")
+        if bool(first.get("error")):
+            raise ValueError(f"core_course_get_recent_courses returned error payload: {first}")
+
+        data = first.get("data") or []
+        if not isinstance(data, list):
+            raise ValueError("Unexpected data payload from core_course_get_recent_courses.")
+        if len(data) > limit:
+            data = data[:limit]
+
+        courses: list[dict[str, Any]] = []
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            cid = str(row.get("id") or "").strip()
+            if not cid:
+                continue
+            title = _norm_text(
+                str(row.get("fullname") or row.get("fullnamedisplay") or f"course-{cid}")
+            )
+            course_code = str(row.get("shortname") or "").strip() or None
+            view_url = row.get("viewurl")
+            if isinstance(view_url, str) and view_url.strip():
+                url = view_url.strip()
+            else:
+                url = _abs_url(config.base_url, f"/course/view.php?id={cid}")
+
+            item = {
+                "id": cid,
+                "title": title,
+                "course_code": course_code,
+                "course_code_base": _course_code_base(course_code),
+                "url": url,
+                "term_label": None,
+                "source": "ajax:core_course_get_recent_courses",
+                "auth_mode": auth_mode,
+            }
+            courses.append(item)
+
+        if include_all:
+            return courses
+        return [c for c in courses if not _is_noise_course(str(c.get("title", "")), config.exclude_course_title_patterns)]
+
+    runtime_context = _RUNTIME_CONTEXT.get()
+    runtime_mode = _RUNTIME_AUTH_MODE.get()
+    if runtime_context is not None:
+        return await run_with_context(runtime_context, str(runtime_mode or _active_auth_mode()))
+    async with _authenticated_context(headless=True, accept_downloads=False) as (context, auth_mode):
+        return await run_with_context(context, auth_mode)
+
+
 async def klms_get_current_term() -> dict[str, Any]:
     """
     Return the currently selected term (year + semester) from the KLMS dashboard.
@@ -1790,6 +2134,281 @@ async def klms_download_file(
 
     async with _authenticated_context(headless=True, accept_downloads=True) as (context, auth_mode):
         return await run_with_context(context, auth_mode)
+
+
+async def klms_discover_api(
+    *,
+    max_courses: int = 2,
+    max_notice_boards: int = 2,
+) -> dict[str, Any]:
+    """
+    Experimental: discover internal KLMS XHR/fetch endpoints from authenticated page loads.
+
+    This does not mutate KLMS state. It only observes requests while visiting selected pages.
+    """
+    config = _load_config()
+    _require_auth_artifact()
+    _ensure_private_dirs()
+
+    max_courses = max(0, min(max_courses, 10))
+    max_notice_boards = max(0, min(max_notice_boards, 10))
+
+    courses = await klms_list_courses(include_all=False, enrich=False)
+    course_ids = [str(c["id"]) for c in courses][:max_courses]
+
+    board_ids: list[str] = []
+    if max_notice_boards > 0:
+        board_ids = list(config.notice_board_ids)[:max_notice_boards]
+        if not board_ids and course_ids:
+            discovered = await _discover_notice_board_ids_for_courses(course_ids, use_cache=True)
+            board_ids = discovered[:max_notice_boards]
+
+    paths_to_visit: list[str] = [config.dashboard_path]
+    for cid in course_ids:
+        paths_to_visit.extend(
+            [
+                f"/course/view.php?id={cid}&section=0",
+                f"/mod/assign/index.php?id={cid}",
+                f"/mod/resource/index.php?id={cid}",
+            ]
+        )
+    for bid in board_ids:
+        paths_to_visit.append(f"/mod/courseboard/view.php?id={bid}")
+
+    seen_paths: set[str] = set()
+    deduped_paths: list[str] = []
+    for path in paths_to_visit:
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        deduped_paths.append(path)
+
+    captured: dict[str, dict[str, Any]] = {}
+    base_url = config.base_url.rstrip("/")
+
+    runtime_context = _RUNTIME_CONTEXT.get()
+    runtime_mode = _RUNTIME_AUTH_MODE.get()
+
+    async def run_capture(context: Any, auth_mode: str) -> dict[str, Any]:
+        response_tasks: list[asyncio.Task[Any]] = []
+
+        def on_request(req: Any) -> None:
+            if req.resource_type not in {"xhr", "fetch"}:
+                return
+            url = req.url
+            if not _same_origin(url, base_url):
+                return
+            key = f"{req.method} {url}"
+            item = captured.get(key)
+            if item is None:
+                item = {
+                    "method": req.method,
+                    "url": url,
+                    "resource_type": req.resource_type,
+                    "seen_count": 0,
+                    "request_headers_subset": {
+                        k: v
+                        for k, v in (req.headers or {}).items()
+                        if k.lower() in {"content-type", "accept", "x-requested-with", "referer"}
+                    },
+                    "has_post_data": bool(req.post_data),
+                    "post_data_size": len(req.post_data or ""),
+                    "post_data_preview": (req.post_data or "")[:400],
+                    "status_codes": [],
+                    "content_types": [],
+                    "json_like": False,
+                    "response_preview": "",
+                    "response_json_shape": None,
+                }
+                captured[key] = item
+            item["seen_count"] += 1
+
+        async def capture_response_body(resp: Any, key: str, ctype: str) -> None:
+            if "json" not in ctype.lower():
+                return
+            item = captured.get(key)
+            if item is None:
+                return
+            if item.get("response_json_shape") is not None:
+                return
+            try:
+                text = await resp.text()
+            except Exception:
+                return
+            preview = text[:400]
+            item["response_preview"] = preview
+            try:
+                parsed = json.loads(text)
+                item["response_json_shape"] = _summarize_json_shape(parsed)
+            except Exception:
+                item["response_json_shape"] = {"type": "non-json-text", "length": len(text)}
+
+        def on_response(resp: Any) -> None:
+            req = resp.request
+            if req.resource_type not in {"xhr", "fetch"}:
+                return
+            url = req.url
+            if not _same_origin(url, base_url):
+                return
+            key = f"{req.method} {url}"
+            item = captured.get(key)
+            if item is None:
+                return
+            if resp.status not in item["status_codes"]:
+                item["status_codes"].append(resp.status)
+            ctype = (resp.headers or {}).get("content-type", "")
+            if ctype and ctype not in item["content_types"]:
+                item["content_types"].append(ctype)
+            if "json" in ctype.lower():
+                item["json_like"] = True
+                response_tasks.append(asyncio.create_task(capture_response_body(resp, key, ctype)))
+
+        context.on("request", on_request)
+        context.on("response", on_response)
+
+        visited: list[str] = []
+        for path in deduped_paths:
+            url = _abs_url(config.base_url, path)
+            page = await context.new_page()
+            try:
+                await page.goto(url, wait_until="networkidle", timeout=30_000)
+                visited.append(url)
+            finally:
+                await page.close()
+
+        if response_tasks:
+            await asyncio.gather(*response_tasks, return_exceptions=True)
+
+        endpoints = list(captured.values())
+        endpoints.sort(
+            key=lambda e: (
+                0 if e.get("json_like") else 1,
+                -int(e.get("seen_count", 0)),
+                e.get("url", ""),
+            )
+        )
+        report = {
+            "ok": True,
+            "generated_at_iso": _utc_now_iso(),
+            "base_url": config.base_url,
+            "auth_mode": auth_mode,
+            "visited_urls": visited,
+            "course_ids_used": course_ids,
+            "board_ids_used": board_ids,
+            "endpoint_count": len(endpoints),
+            "endpoints": endpoints,
+        }
+        ENDPOINT_DISCOVERY_PATH.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return {"ok": True, "report_path": str(ENDPOINT_DISCOVERY_PATH), **report}
+
+    if runtime_context is not None:
+        return await run_capture(runtime_context, str(runtime_mode or _active_auth_mode()))
+    async with _authenticated_context(headless=True, accept_downloads=False) as (context, auth_mode):
+        return await run_capture(context, auth_mode)
+
+
+def klms_map_api(
+    *,
+    report_path: str | None = None,
+) -> dict[str, Any]:
+    """
+    Build a categorized endpoint map from a discovery report.
+    """
+    _ensure_private_dirs()
+    source = Path(report_path).expanduser() if report_path else ENDPOINT_DISCOVERY_PATH
+    if not source.exists():
+        raise FileNotFoundError(
+            f"Discovery report not found at {source}. Run `kaist klms discover-api` first."
+        )
+
+    try:
+        report = json.loads(source.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001
+        raise ValueError(f"Could not parse discovery report {source}: {e}") from e
+
+    endpoints = report.get("endpoints") or []
+    if not isinstance(endpoints, list):
+        raise ValueError(f"Invalid discovery report format: endpoints must be a list ({source})")
+
+    mapped: list[dict[str, Any]] = []
+    by_canonical: dict[str, dict[str, Any]] = {}
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        classification = _classify_endpoint(endpoint)
+        canonical_key = classification["canonical_key"]
+
+        existing = by_canonical.get(canonical_key)
+        if existing is None:
+            merged = {
+                "method": endpoint.get("method"),
+                "url": endpoint.get("url"),
+                "path": classification["path"],
+                "info": classification["info"],
+                "methodname": classification.get("methodname"),
+                "category": classification["category"],
+                "confidence": classification["confidence"],
+                "recommended_for_cli": classification["recommended_for_cli"],
+                "reason": classification["reason"],
+                "seen_count": int(endpoint.get("seen_count", 0) or 0),
+                "status_codes": list(endpoint.get("status_codes") or []),
+                "content_types": list(endpoint.get("content_types") or []),
+                "json_like": bool(endpoint.get("json_like")),
+                "request_headers_subset": endpoint.get("request_headers_subset") or {},
+                "has_post_data": bool(endpoint.get("has_post_data")),
+                "post_data_size": int(endpoint.get("post_data_size", 0) or 0),
+                "post_data_preview": endpoint.get("post_data_preview") or "",
+                "response_json_shape": endpoint.get("response_json_shape"),
+                "response_preview": endpoint.get("response_preview"),
+                "canonical_key": canonical_key,
+            }
+            by_canonical[canonical_key] = merged
+            mapped.append(merged)
+            continue
+
+        existing["seen_count"] += int(endpoint.get("seen_count", 0) or 0)
+        for code in endpoint.get("status_codes") or []:
+            if code not in existing["status_codes"]:
+                existing["status_codes"].append(code)
+        for ctype in endpoint.get("content_types") or []:
+            if ctype not in existing["content_types"]:
+                existing["content_types"].append(ctype)
+        existing["json_like"] = bool(existing["json_like"] or endpoint.get("json_like"))
+        # Keep the higher-confidence classification if duplicates disagree.
+        if float(classification["confidence"]) > float(existing["confidence"]):
+            existing["category"] = classification["category"]
+            existing["confidence"] = classification["confidence"]
+            existing["recommended_for_cli"] = classification["recommended_for_cli"]
+            existing["reason"] = classification["reason"]
+            existing["info"] = classification["info"]
+            existing["methodname"] = classification.get("methodname")
+
+    mapped.sort(key=lambda e: (0 if e["recommended_for_cli"] else 1, -float(e["confidence"]), -int(e["seen_count"])))
+
+    category_counts: dict[str, int] = {}
+    recommended: list[dict[str, Any]] = []
+    for item in mapped:
+        category = str(item.get("category") or "unknown")
+        category_counts[category] = category_counts.get(category, 0) + 1
+        if item.get("recommended_for_cli"):
+            recommended.append(item)
+
+    output = {
+        "ok": True,
+        "generated_at_iso": _utc_now_iso(),
+        "source_report_path": str(source),
+        "endpoint_count_raw": len(endpoints),
+        "endpoint_count_unique": len(mapped),
+        "category_counts": category_counts,
+        "recommended_count": len(recommended),
+        "recommended_endpoints": recommended,
+        "mapped_endpoints": mapped,
+    }
+    API_MAP_PATH.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {"ok": True, "map_path": str(API_MAP_PATH), **output}
 
 
 def klms_bootstrap_login(base_url: str | None = None) -> dict[str, Any]:

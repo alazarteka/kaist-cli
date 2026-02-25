@@ -79,6 +79,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Skip extra per-course metadata fetches for faster listing.",
     )
 
+    courses_api = klms_sub.add_parser(
+        "courses-api",
+        help="Experimental: list courses via internal KLMS AJAX endpoint",
+    )
+    courses_api.add_argument("--include-all", action="store_true", help="Include noisy/non-course dashboard items")
+    courses_api.add_argument("--limit", type=int, default=50, help="Max courses requested from AJAX endpoint")
+
     klms_sub.add_parser("term", help="Get current term from dashboard")
 
     course_info = klms_sub.add_parser("course-info", help="Get course metadata")
@@ -102,6 +109,22 @@ def _build_parser() -> argparse.ArgumentParser:
     sync = klms_sub.add_parser("sync", help="Incremental snapshot sync")
     sync.add_argument("--no-update", action="store_true", help="Compute diff only, do not write snapshot")
     sync.add_argument("--max-notice-pages", type=int, default=3)
+
+    discover_api = klms_sub.add_parser(
+        "discover-api",
+        help="Experimental: discover internal KLMS XHR/fetch endpoints",
+    )
+    discover_api.add_argument("--max-courses", type=int, default=2)
+    discover_api.add_argument("--max-notice-boards", type=int, default=2)
+
+    map_api = klms_sub.add_parser(
+        "map-api",
+        help="Classify discovered endpoints into CLI-use candidates",
+    )
+    map_api.add_argument(
+        "--report-path",
+        help="Optional path to endpoint discovery report (defaults to private endpoint_discovery.json)",
+    )
 
     download = klms_sub.add_parser("download", help="Download a material file")
     download.add_argument("url", help="KLMS-relative path or absolute URL")
@@ -146,6 +169,13 @@ def _dispatch_klms(args: argparse.Namespace) -> Any:
                 enrich=not args.no_enrich,
             )
         )
+    if args.command == "courses-api":
+        return _run_klms_async(
+            klms.klms_list_courses_api(
+                include_all=args.include_all,
+                limit=args.limit,
+            )
+        )
     if args.command == "term":
         return _run_klms_async(klms.klms_get_current_term())
     if args.command == "course-info":
@@ -169,6 +199,15 @@ def _dispatch_klms(args: argparse.Namespace) -> Any:
                 max_notice_pages=args.max_notice_pages,
             )
         )
+    if args.command == "discover-api":
+        return _run_klms_async(
+            klms.klms_discover_api(
+                max_courses=args.max_courses,
+                max_notice_boards=args.max_notice_boards,
+            )
+        )
+    if args.command == "map-api":
+        return klms.klms_map_api(report_path=args.report_path)
     if args.command == "download":
         return _run_klms_async(
             klms.klms_download_file(

@@ -40,3 +40,12 @@ Optional tuning env vars:
 
 Fast listing option:
 - `uv run kaist klms courses --no-enrich`
+- Experimental AJAX listing:
+  - `uv run kaist klms courses-api --limit 50`
+
+Experimental endpoint discovery:
+- `uv run kaist klms discover-api --max-courses 2 --max-notice-boards 2`
+- Writes a report to `~/.kaist-cli/private/klms/endpoint_discovery.json`
+- Build a categorized map from that report:
+  - `uv run kaist klms map-api`
+  - Writes `~/.kaist-cli/private/klms/api_map.json`
