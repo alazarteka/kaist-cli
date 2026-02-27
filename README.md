@@ -5,6 +5,10 @@ CLI for KAIST systems by reverse-engineering official web interfaces.
 Current scope:
 - KLMS (read-only): courses, assignments, notices, files, snapshot sync, file downloads
 
+## Spec
+
+- Product spec and roadmap: `docs/PRODUCT_SPEC.md`
+
 ## Quick start
 
 ```bash
