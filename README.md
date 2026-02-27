@@ -45,10 +45,19 @@ Experimental/debug flows:
 
 Global output flag:
 - `--format auto|json|table|text`
+- `--agent` (forces strict JSON envelopes for machine consumers)
 
 Behavior:
 - `auto` prints table/text in interactive terminals and JSON in non-interactive runs.
 - Use `--format json` for scripting.
+- `--agent` returns versioned JSON envelopes and machine-oriented error payloads.
+
+Common non-zero exit codes:
+- `10` auth errors
+- `20` network timeout/connectivity errors
+- `30` parser/API shape drift errors
+- `40` config/validation errors
+- `50` internal/unknown errors
 
 ## Storage
 

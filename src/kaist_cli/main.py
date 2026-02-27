@@ -5,7 +5,21 @@ import asyncio
 import json
 import sys
 import traceback
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
+
+
+@dataclass(frozen=True)
+class CliErrorDescriptor:
+    code: str
+    exit_code: int
+    retryable: bool
+    hint: str | None
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _run_async(coro: Any) -> Any:
@@ -83,10 +97,7 @@ def _emit_table(rows: list[dict[str, Any]]) -> None:
 def _emit_text(data: Any) -> None:
     if isinstance(data, dict):
         for key, value in data.items():
-            if isinstance(value, (dict, list)):
-                rendered = json.dumps(value, ensure_ascii=False)
-            else:
-                rendered = str(value)
+            rendered = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
             print(f"{key}: {rendered}")
         return
     if isinstance(data, list):
@@ -103,11 +114,11 @@ def _emit_text(data: Any) -> None:
     print(str(data))
 
 
-def _emit_json(data: Any) -> None:
-    print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=False))
+def _emit_json(data: Any, *, sort_keys: bool) -> None:
+    print(json.dumps(data, indent=2, ensure_ascii=False, sort_keys=sort_keys))
 
 
-def _emit_output(data: Any, output_format: str) -> None:
+def _emit_human_output(data: Any, output_format: str) -> None:
     resolved = output_format
     if output_format == "auto":
         if sys.stdout.isatty():
@@ -116,7 +127,7 @@ def _emit_output(data: Any, output_format: str) -> None:
             resolved = "json"
 
     if resolved == "json":
-        _emit_json(data)
+        _emit_json(data, sort_keys=False)
         return
     if resolved == "table":
         if _is_tabular_list(data):
@@ -125,6 +136,127 @@ def _emit_output(data: Any, output_format: str) -> None:
             _emit_text(data)
         return
     _emit_text(data)
+
+
+def _sanitize_schema_part(value: str | None) -> str:
+    return (value or "").replace("-", "_").strip("_")
+
+
+def _schema_for_args(args: argparse.Namespace) -> str:
+    if getattr(args, "system", None) != "klms":
+        return "kaist.cli.generic.v1"
+    group = _sanitize_schema_part(getattr(args, "group", "unknown")) or "unknown"
+    action = _sanitize_schema_part(getattr(args, "action", None))
+    if group in {"config", "auth", "dev"} and action:
+        return f"kaist.klms.{group}.{action}.v1"
+    return f"kaist.klms.{group}.v1"
+
+
+def _infer_source(data: Any) -> str:
+    if isinstance(data, dict):
+        src = data.get("source")
+        if isinstance(src, str) and src.strip():
+            return src
+        if isinstance(data.get("recommended_endpoints"), list):
+            return "api"
+        if isinstance(data.get("auth_mode"), str):
+            return "html"
+        return "mixed"
+
+    if isinstance(data, list):
+        sources = {
+            str(item.get("source")).strip()
+            for item in data
+            if isinstance(item, dict) and isinstance(item.get("source"), str) and str(item.get("source")).strip()
+        }
+        if not sources:
+            return "mixed"
+        if len(sources) == 1:
+            return next(iter(sources))
+        return "mixed"
+
+    return "mixed"
+
+
+def _extract_cursor_fields(data: Any) -> tuple[str | None, str | None]:
+    if not isinstance(data, dict):
+        return None, None
+    cur = data.get("cursor")
+    nxt = data.get("next_cursor")
+    return (str(cur) if isinstance(cur, str) else None, str(nxt) if isinstance(nxt, str) else None)
+
+
+def _command_label(args: argparse.Namespace) -> str:
+    parts = [str(getattr(args, "system", "")), str(getattr(args, "group", "")), str(getattr(args, "action", ""))]
+    return " ".join(p for p in parts if p and p != "None")
+
+
+def _success_envelope(args: argparse.Namespace, data: Any) -> dict[str, Any]:
+    cursor, next_cursor = _extract_cursor_fields(data)
+    return {
+        "schema": _schema_for_args(args),
+        "ok": True,
+        "generated_at": _utc_now_iso(),
+        "meta": {
+            "source": _infer_source(data),
+            "cursor": cursor,
+            "next_cursor": next_cursor,
+            "command": _command_label(args),
+        },
+        "data": data,
+    }
+
+
+def _classify_error(exc: Exception) -> CliErrorDescriptor:
+    msg = str(exc)
+    msg_l = msg.lower()
+    name = exc.__class__.__name__
+
+    if name == "KlmsAuthError":
+        return CliErrorDescriptor("AUTH_EXPIRED", 10, True, "kaist klms auth login")
+
+    if isinstance(exc, FileNotFoundError):
+        if "config" in msg_l:
+            return CliErrorDescriptor("CONFIG_INVALID", 40, False, "kaist klms config set --base-url https://klms.kaist.ac.kr")
+        if "login state" in msg_l or "storage state" in msg_l or "profile" in msg_l:
+            return CliErrorDescriptor("AUTH_MISSING", 10, True, "kaist klms auth login")
+        return CliErrorDescriptor("NOT_FOUND", 50, False, None)
+
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return CliErrorDescriptor("NETWORK_TIMEOUT", 20, True, "retry the command")
+
+    if isinstance(exc, ConnectionError):
+        return CliErrorDescriptor("NETWORK_UNAVAILABLE", 20, True, "check network and retry")
+
+    if isinstance(exc, ValueError):
+        if any(token in msg_l for token in ["base_url", "config", "must be a list", "dashboard_path"]):
+            return CliErrorDescriptor("CONFIG_INVALID", 40, False, "kaist klms config show")
+        if any(token in msg_l for token in ["response shape", "payload", "ajax"]):
+            return CliErrorDescriptor("API_SHAPE_CHANGED", 30, True, "retry or run kaist klms dev discover-api")
+        if any(token in msg_l for token in ["parse", "extract", "selector"]):
+            return CliErrorDescriptor("PARSE_DRIFT", 30, True, "retry or run kaist klms dev fetch-html")
+
+    if any(token in msg_l for token in ["ssologin", "re-authenticate", "login state not found", "notloggedin"]):
+        return CliErrorDescriptor("AUTH_EXPIRED", 10, True, "kaist klms auth login")
+
+    if any(token in msg_l for token in ["timeout", "timed out"]):
+        return CliErrorDescriptor("NETWORK_TIMEOUT", 20, True, "retry the command")
+
+    return CliErrorDescriptor("INTERNAL", 50, False, None)
+
+
+def _error_envelope(args: argparse.Namespace, descriptor: CliErrorDescriptor, message: str) -> dict[str, Any]:
+    return {
+        "schema": _schema_for_args(args),
+        "ok": False,
+        "generated_at": _utc_now_iso(),
+        "error": {
+            "code": descriptor.code,
+            "message": message,
+            "retryable": descriptor.retryable,
+            "hint": descriptor.hint,
+        },
+    }
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -139,6 +271,11 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["auto", "json", "table", "text"],
         default="auto",
         help="Output format. auto=table/text in TTY and json in non-TTY.",
+    )
+    parser.add_argument(
+        "--agent",
+        action="store_true",
+        help="Agent mode: force strict JSON envelopes and machine-stable output.",
     )
 
     top = parser.add_subparsers(dest="system", required=True)
@@ -342,21 +479,34 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
+    output_format = "json" if args.agent else args.format
+    json_mode = output_format == "json"
+
     try:
         if args.system != "klms":
             raise ValueError(f"Unsupported system: {args.system}")
         result = _dispatch_klms(args)
-        _emit_output(result, args.format)
+        if json_mode:
+            _emit_json(_success_envelope(args, result), sort_keys=args.agent)
+        else:
+            _emit_human_output(result, output_format)
         return 0
     except KeyboardInterrupt:
-        print("Interrupted.", file=sys.stderr)
+        if json_mode:
+            descriptor = CliErrorDescriptor("INTERNAL", 130, True, "retry command")
+            _emit_json(_error_envelope(args, descriptor, "Interrupted."), sort_keys=args.agent)
+        else:
+            print("Interrupted.", file=sys.stderr)
         return 130
     except Exception as exc:  # noqa: BLE001
+        descriptor = _classify_error(exc)
         if args.debug:
-            traceback.print_exc()
+            traceback.print_exc(file=sys.stderr)
+        if json_mode:
+            _emit_json(_error_envelope(args, descriptor, str(exc)), sort_keys=args.agent)
         else:
-            print(f"error: {exc}", file=sys.stderr)
-        return 1
+            print(f"error [{descriptor.code.lower()}]: {exc}", file=sys.stderr)
+        return descriptor.exit_code
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ import contextvars
 import os
 import re
 import time
+import sys
 import html as _html
 import json
 from contextlib import asynccontextmanager
@@ -2420,8 +2421,8 @@ def klms_bootstrap_login(base_url: str | None = None) -> dict[str, Any]:
     except PermissionError:
         pass
 
-    print(f"Opening browser to: {login_base_url}")
-    print("Log in fully, navigate to a course page, then return here and press Enter.")
+    print(f"Opening browser to: {login_base_url}", file=sys.stderr)
+    print("Log in fully, navigate to a course page, then return here and press Enter.", file=sys.stderr)
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             user_data_dir=str(PROFILE_DIR),
@@ -2429,7 +2430,8 @@ def klms_bootstrap_login(base_url: str | None = None) -> dict[str, Any]:
         )
         page = context.new_page()
         page.goto(login_base_url, wait_until="domcontentloaded", timeout=30_000)
-        input("Press Enter to save session and exit... ")
+        print("Press Enter to save session and exit... ", end="", file=sys.stderr, flush=True)
+        input()
         # Keep storage_state as a fallback/debug artifact even when using profile mode.
         context.storage_state(path=str(STORAGE_STATE_PATH))
         context.close()
