@@ -24,11 +24,12 @@ uv run kaist klms sync
 
 Stable workflows:
 - `kaist klms config set|show`
-- `kaist klms auth login|status`
-- `kaist klms courses`
-- `kaist klms assignments [--course-id <id>]`
-- `kaist klms notices [--notice-board-id <id>] [--max-pages N] [--stop-post-id <id>]`
-- `kaist klms files [--course-id <id>]`
+- `kaist klms auth login|status|refresh|doctor`
+- `kaist klms courses [--limit N]`
+- `kaist klms assignments [--course-id <id>] [--since <ISO>] [--limit N]`
+- `kaist klms notices [--notice-board-id <id>] [--max-pages N] [--stop-post-id <id>] [--since <ISO>] [--limit N]`
+- `kaist klms files [--course-id <id>] [--limit N]`
+- `kaist klms inbox [--limit N] [--max-notice-pages N] [--since <ISO>]`
 - `kaist klms download <url> [--filename ...] [--subdir ...]`
 - `kaist klms sync [--dry-run] [--max-notice-pages N]`
 
@@ -78,3 +79,17 @@ Optional tuning env vars:
 - `KAIST_KLMS_CONCURRENCY` (default `4`, range `1..16`)
 - `KAIST_KLMS_COURSE_INFO_TTL_SECONDS` (default `21600`)
 - `KAIST_KLMS_NOTICE_BOARD_TTL_SECONDS` (default `1800`)
+
+## Tests and Smoke
+
+Unit contract tests:
+
+```bash
+uv run --with pytest pytest -q
+```
+
+Live smoke script:
+
+```bash
+./scripts/smoke.sh
+```

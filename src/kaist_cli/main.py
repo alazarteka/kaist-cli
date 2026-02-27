@@ -315,21 +315,37 @@ def _build_parser() -> argparse.ArgumentParser:
     auth_login.add_argument("--base-url", help="Optional URL override for login bootstrap")
     auth_status = auth_sub.add_parser("status", help="Inspect auth/config status")
     auth_status.add_argument("--no-validate", action="store_true", help="Skip online validation probe")
+    auth_refresh = auth_sub.add_parser("refresh", help="Re-run login flow and verify refreshed session")
+    auth_refresh.add_argument("--base-url", help="Optional URL override for login bootstrap")
+    auth_refresh.add_argument("--no-validate", action="store_true", help="Skip post-refresh validation probe")
+    auth_doctor = auth_sub.add_parser("doctor", help="Run auth/session diagnostics")
+    auth_doctor.add_argument("--no-validate", action="store_true", help="Skip online validation probe")
 
     courses = klms_sub.add_parser("courses", help="List courses")
     courses.add_argument("--include-all", action="store_true", help="Include noisy/non-course dashboard items")
     courses.add_argument("--no-enrich", action="store_true", help="Skip per-course metadata fetches")
+    courses.add_argument("--limit", type=int, help="Maximum number of courses to return")
 
     assignments = klms_sub.add_parser("assignments", help="List assignments")
     assignments.add_argument("--course-id", help="Single course ID; omit for all discovered courses")
+    assignments.add_argument("--since", dest="since_iso", help="Only include assignments with due_iso >= this ISO timestamp")
+    assignments.add_argument("--limit", type=int, help="Maximum number of assignments to return")
 
     notices = klms_sub.add_parser("notices", help="List notices")
     notices.add_argument("--notice-board-id", help="Single notice board ID; omit for configured/discovered boards")
     notices.add_argument("--max-pages", type=int, default=1, help="Maximum pages per board")
     notices.add_argument("--stop-post-id", help="Stop paging when this notice post ID is reached")
+    notices.add_argument("--since", dest="since_iso", help="Only include notices with posted_iso >= this ISO timestamp")
+    notices.add_argument("--limit", type=int, help="Maximum number of notices to return")
 
     files = klms_sub.add_parser("files", help="List non-video materials/files")
     files.add_argument("--course-id", help="Single course ID; omit for all discovered courses")
+    files.add_argument("--limit", type=int, help="Maximum number of files to return")
+
+    inbox = klms_sub.add_parser("inbox", help="Blended feed of assignments, notices, and files")
+    inbox.add_argument("--limit", type=int, default=30, help="Maximum number of inbox items to return")
+    inbox.add_argument("--max-notice-pages", type=int, default=1, help="Maximum notice pages per board")
+    inbox.add_argument("--since", dest="since_iso", help="Filter assignments/notices by ISO timestamp")
 
     download = klms_sub.add_parser("download", help="Download one material file")
     download.add_argument("url", help="KLMS-relative path or absolute URL")
@@ -397,17 +413,28 @@ def _dispatch_klms(args: argparse.Namespace) -> Any:
             return klms.klms_bootstrap_login(args.base_url)
         if args.action == "status":
             return _run_async(klms.klms_status(validate=not args.no_validate))
+        if args.action == "refresh":
+            return klms.klms_refresh_auth(args.base_url, validate=not args.no_validate)
+        if args.action == "doctor":
+            return _run_async(klms.klms_auth_doctor(validate=not args.no_validate))
 
     if group == "courses":
         return _run_klms_async(
             klms.klms_list_courses(
                 include_all=args.include_all,
                 enrich=not args.no_enrich,
+                limit=args.limit,
             )
         )
 
     if group == "assignments":
-        return _run_klms_async(klms.klms_list_assignments(course_id=args.course_id))
+        return _run_klms_async(
+            klms.klms_list_assignments(
+                course_id=args.course_id,
+                limit=args.limit,
+                since_iso=args.since_iso,
+            )
+        )
 
     if group == "notices":
         return _run_klms_async(
@@ -415,11 +442,22 @@ def _dispatch_klms(args: argparse.Namespace) -> Any:
                 notice_board_id=args.notice_board_id,
                 max_pages=args.max_pages,
                 stop_post_id=args.stop_post_id,
+                limit=args.limit,
+                since_iso=args.since_iso,
             )
         )
 
     if group == "files":
-        return _run_klms_async(klms.klms_list_files(course_id=args.course_id))
+        return _run_klms_async(klms.klms_list_files(course_id=args.course_id, limit=args.limit))
+
+    if group == "inbox":
+        return _run_klms_async(
+            klms.klms_inbox(
+                limit=args.limit,
+                max_notice_pages=args.max_notice_pages,
+                since_iso=args.since_iso,
+            )
+        )
 
     if group == "download":
         return _run_klms_async(

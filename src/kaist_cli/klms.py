@@ -26,7 +26,7 @@ from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 from playwright.async_api import async_playwright  # type: ignore[import-untyped]
@@ -552,6 +552,28 @@ def _classify_endpoint(endpoint: dict[str, Any]) -> dict[str, Any]:
         )
         return classification
 
+    if methodname and ("courseboard" in methodname or "notice" in methodname):
+        classification.update(
+            {
+                "category": "notices",
+                "confidence": 0.82,
+                "recommended_for_cli": True,
+                "reason": "Methodname indicates notice/courseboard data.",
+            }
+        )
+        return classification
+
+    if methodname and ("assign" in methodname or "calendar" in methodname):
+        classification.update(
+            {
+                "category": "assignments",
+                "confidence": 0.82,
+                "recommended_for_cli": True,
+                "reason": "Methodname indicates assignment/calendar event data.",
+            }
+        )
+        return classification
+
     if path == "/lib/ajax/service.php" and "core_course_get_enrolled_courses_by_timeline_classification" in info:
         classification.update(
             {
@@ -762,6 +784,47 @@ async def _probe_auth(*, timeout_ms: int = 10_000) -> dict[str, Any]:
         return out
 
 
+def _extract_sesskey(html: str) -> str | None:
+    patterns = [
+        r'"sesskey"\s*:\s*"([^"]+)"',
+        r"sesskey=([A-Za-z0-9]+)",
+        r'name=["\']sesskey["\']\s+value=["\']([^"\']+)["\']',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, html)
+        if m:
+            key = _norm_text(m.group(1))
+            if key:
+                return key
+    return None
+
+
+async def _moodle_ajax_call(context: Any, *, base_url: str, sesskey: str, methodname: str, args: dict[str, Any]) -> Any:
+    url = _abs_url(base_url, f"/lib/ajax/service.php?sesskey={quote(sesskey)}&info={quote(methodname)}")
+    payload = [{"index": 0, "methodname": methodname, "args": args}]
+    resp = await context.request.post(
+        url,
+        data=json.dumps(payload),
+        headers={"content-type": "application/json"},
+        timeout=20_000,
+    )
+    text = await resp.text()
+    if not (200 <= int(resp.status) < 300):
+        raise ValueError(f"AJAX call failed ({resp.status}) for {methodname}")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed parsing AJAX JSON for {methodname}: {e}") from e
+    if not isinstance(parsed, list) or not parsed:
+        raise ValueError(f"Unexpected AJAX response shape for {methodname}")
+    first = parsed[0]
+    if not isinstance(first, dict):
+        raise ValueError(f"Unexpected AJAX item type for {methodname}")
+    if bool(first.get("error")):
+        raise ValueError(f"AJAX error payload for {methodname}: {first}")
+    return first.get("data")
+
+
 def _norm_text(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
@@ -806,6 +869,71 @@ def _parse_datetime_guess(raw: str) -> str | None:
 def _utc_now_iso() -> str:
     # Keep it timezone-agnostic; treat as informational.
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def _iso_from_epoch(epoch: float | int | None) -> str | None:
+    if not isinstance(epoch, (int, float)):
+        return None
+    try:
+        return datetime.utcfromtimestamp(float(epoch)).replace(microsecond=0).isoformat() + "Z"
+    except Exception:
+        return None
+
+
+def _tag_items(items: list[dict[str, Any]], *, source: str, confidence: float) -> list[dict[str, Any]]:
+    tagged: list[dict[str, Any]] = []
+    for item in items:
+        row = dict(item)
+        row["source"] = source
+        row["confidence"] = float(confidence)
+        tagged.append(row)
+    return tagged
+
+
+def _apply_limit(items: list[dict[str, Any]], limit: int | None) -> list[dict[str, Any]]:
+    if limit is None:
+        return items
+    return items[: max(0, int(limit))]
+
+
+def _apply_since_filter(items: list[dict[str, Any]], *, field: str, since_iso: str | None) -> list[dict[str, Any]]:
+    if not since_iso:
+        return items
+    threshold = _norm_text(str(since_iso))
+    if not threshold:
+        return items
+    filtered: list[dict[str, Any]] = []
+    for item in items:
+        value = _norm_text(str(item.get(field) or ""))
+        if value and value >= threshold:
+            filtered.append(item)
+    return filtered
+
+
+def _load_api_map() -> dict[str, Any] | None:
+    if not API_MAP_PATH.exists():
+        return None
+    try:
+        data = json.loads(API_MAP_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _recommended_methodnames_for_category(category: str) -> list[str]:
+    api_map = _load_api_map()
+    if not api_map:
+        return []
+    out: list[str] = []
+    for endpoint in api_map.get("recommended_endpoints") or []:
+        if not isinstance(endpoint, dict):
+            continue
+        if str(endpoint.get("category") or "") != category:
+            continue
+        methodname = endpoint.get("methodname")
+        if isinstance(methodname, str) and methodname.strip():
+            out.append(methodname.strip())
+    return list(dict.fromkeys(out))
 
 
 def _load_snapshot() -> dict[str, Any]:
@@ -1280,7 +1408,79 @@ async def klms_status(validate: bool = True) -> dict[str, Any]:
             status["config_error"] = str(e)
     if validate:
         status["auth"] = await _probe_auth()
+    warnings: list[str] = []
+    cookie_stats = status.get("storage_state_cookie_stats") or {}
+    if isinstance(cookie_stats, dict):
+        hours = cookie_stats.get("next_expiry_in_hours")
+        if isinstance(hours, (int, float)):
+            if float(hours) <= 2:
+                warnings.append("Session cookies are near expiry (<2h). Re-run `kaist klms auth refresh` soon.")
+            elif float(hours) <= 24:
+                warnings.append("Session cookies may expire within 24h.")
+    auth = status.get("auth") or {}
+    if isinstance(auth, dict) and auth.get("validated") and not auth.get("authenticated"):
+        warnings.append("Saved session exists but online validation failed. Run `kaist klms auth refresh`.")
+    status["warnings"] = warnings
     return status
+
+
+def klms_refresh_auth(base_url: str | None = None, *, validate: bool = True) -> dict[str, Any]:
+    refreshed = klms_bootstrap_login(base_url)
+    if not validate:
+        return {"ok": True, "refreshed": refreshed, "validated": False}
+    status = asyncio.run(klms_status(validate=True))
+    auth = status.get("auth") or {}
+    return {
+        "ok": bool(isinstance(auth, dict) and auth.get("authenticated")),
+        "refreshed": refreshed,
+        "validated": True,
+        "status": status,
+    }
+
+
+async def klms_auth_doctor(validate: bool = True) -> dict[str, Any]:
+    _ensure_private_dirs()
+    checks: list[dict[str, Any]] = []
+
+    def record(name: str, ok: bool, detail: str) -> None:
+        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+
+    record("private_root_exists", PRIVATE_ROOT.exists(), str(PRIVATE_ROOT))
+    record("download_root_exists", DOWNLOAD_ROOT.exists(), str(DOWNLOAD_ROOT))
+    record("config_exists", CONFIG_PATH.exists(), str(CONFIG_PATH))
+    record("profile_exists", PROFILE_DIR.exists(), str(PROFILE_DIR))
+    record("storage_state_exists", STORAGE_STATE_PATH.exists(), str(STORAGE_STATE_PATH))
+
+    try:
+        _load_config()
+        record("config_parse", True, "config parsed successfully")
+    except Exception as e:  # noqa: BLE001
+        record("config_parse", False, str(e))
+
+    status = await klms_status(validate=validate)
+    auth = status.get("auth") or {}
+    if validate and isinstance(auth, dict):
+        record(
+            "online_auth_validation",
+            bool(auth.get("authenticated")),
+            str(auth.get("final_url") or auth.get("error") or "no details"),
+        )
+
+    all_ok = all(bool(c.get("ok")) for c in checks)
+    recommendations: list[str] = []
+    if not status.get("has_session"):
+        recommendations.append("Run `kaist klms auth login`.")
+    if isinstance(auth, dict) and auth.get("validated") and not auth.get("authenticated"):
+        recommendations.append("Run `kaist klms auth refresh`.")
+    if status.get("warnings"):
+        recommendations.extend([str(w) for w in status.get("warnings") or []])
+
+    return {
+        "ok": all_ok,
+        "checks": checks,
+        "status": status,
+        "recommendations": recommendations,
+    }
 
 
 async def klms_fetch_html(path_or_url: str) -> dict[str, Any]:
@@ -1324,7 +1524,12 @@ async def klms_extract_matches(path_or_url: str, pattern: str, max_matches: int 
     return {"url": path_or_url, "pattern": pattern, "count": len(matches), "matches": matches}
 
 
-async def klms_list_courses(include_all: bool = False, *, enrich: bool = True) -> list[dict[str, Any]]:
+async def klms_list_courses(
+    include_all: bool = False,
+    *,
+    enrich: bool = True,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
     """
     List courses.
 
@@ -1363,7 +1568,7 @@ async def klms_list_courses(include_all: bool = False, *, enrich: bool = True) -
                 for course in discovered:
                     course["course_code"] = None
                     course["course_code_base"] = None
-            return discovered
+            return _apply_limit(_tag_items(discovered, source="html:dashboard", confidence=0.72), limit)
     except KlmsAuthError:
         raise
     except Exception:
@@ -1403,8 +1608,9 @@ async def klms_list_courses(include_all: bool = False, *, enrich: bool = True) -
             for course_id in config.course_ids
         ]
     if include_all:
-        return courses
-    return [c for c in courses if not _is_noise_course(str(c.get("title", "")), config.exclude_course_title_patterns)]
+        return _apply_limit(_tag_items(courses, source="config:course_ids", confidence=0.55), limit)
+    filtered = [c for c in courses if not _is_noise_course(str(c.get("title", "")), config.exclude_course_title_patterns)]
+    return _apply_limit(_tag_items(filtered, source="config:course_ids", confidence=0.55), limit)
 
 
 async def klms_list_courses_api(include_all: bool = False, *, limit: int = 50) -> list[dict[str, Any]]:
@@ -1528,6 +1734,7 @@ async def klms_list_courses_api(include_all: bool = False, *, limit: int = 50) -
                 "url": url,
                 "term_label": None,
                 "source": "ajax:core_course_get_recent_courses",
+                "confidence": 0.9,
                 "auth_mode": auth_mode,
             }
             courses.append(item)
@@ -1559,7 +1766,202 @@ async def klms_get_course_info(course_id: str) -> dict[str, Any]:
     return await _get_course_info(course_id)
 
 
-async def klms_list_assignments(course_id: str | None = None) -> list[dict[str, Any]]:
+def _dedupe_strings(values: list[str]) -> list[str]:
+    return list(dict.fromkeys([v for v in values if isinstance(v, str) and v.strip()]))
+
+
+def _extract_assignment_rows_from_calendar_data(data: Any, *, base_url: str) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+
+    def push_list(items: Any) -> None:
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict):
+                    candidates.append(it)
+
+    if isinstance(data, dict):
+        push_list(data.get("events"))
+        push_list(data.get("data"))
+        push_list(data.get("items"))
+    elif isinstance(data, list):
+        push_list(data)
+
+    out: list[dict[str, Any]] = []
+    for row in candidates:
+        module = str(row.get("modulename") or row.get("modname") or "").lower()
+        eventtype = str(row.get("eventtype") or row.get("name") or "").lower()
+        if module and module != "assign":
+            continue
+        if "assign" not in module and "assignment" not in eventtype and "assign" not in eventtype:
+            continue
+
+        cid = str(row.get("courseid") or row.get("course_id") or "").strip() or None
+        title = _norm_text(str(row.get("name") or row.get("title") or "assignment"))
+        url = row.get("url") or row.get("viewurl") or row.get("view_url")
+        due_epoch = row.get("timesort") or row.get("timestart") or row.get("timedue")
+        due_iso = _iso_from_epoch(due_epoch)
+        out.append(
+            {
+                "course_id": cid,
+                "id": str(row.get("instance") or row.get("id") or "").strip() or None,
+                "title": title,
+                "url": _abs_url(base_url, str(url)) if isinstance(url, str) and url.strip() else None,
+                "due_raw": str(row.get("formattedtime") or row.get("timestring") or "").strip() or None,
+                "due_iso": due_iso,
+            }
+        )
+    return out
+
+
+async def _list_assignments_api(course_ids: list[str]) -> tuple[list[dict[str, Any]], str] | None:
+    """
+    Best-effort API path for assignments using Moodle calendar actions endpoint.
+    Returns None when API path is unavailable so caller can use HTML fallback.
+    """
+    config = _load_config()
+    methodnames = _dedupe_strings(
+        [
+            "core_calendar_get_action_events_by_timesort",
+            *(_recommended_methodnames_for_category("calendar")),
+            *(_recommended_methodnames_for_category("assignments")),
+        ]
+    )
+    if not methodnames:
+        return None
+
+    async with _borrow_authenticated_context(headless=True, accept_downloads=False) as (context, _auth_mode):
+        page = await context.new_page()
+        try:
+            await page.goto(
+                _abs_url(config.base_url, config.dashboard_path),
+                wait_until="domcontentloaded",
+                timeout=20_000,
+            )
+            dashboard_html = await page.content()
+        finally:
+            await page.close()
+        sesskey = _extract_sesskey(dashboard_html)
+        if not sesskey:
+            return None
+
+        args_candidates = [
+            {"limitnum": 200, "timesortfrom": 0},
+            {"limitnum": 200, "timesortfrom": int(time.time()) - (180 * 24 * 3600)},
+            {},
+        ]
+        for methodname in methodnames:
+            for args in args_candidates:
+                try:
+                    data = await _moodle_ajax_call(
+                        context,
+                        base_url=config.base_url,
+                        sesskey=sesskey,
+                        methodname=methodname,
+                        args=args,
+                    )
+                except Exception:
+                    continue
+                items = _extract_assignment_rows_from_calendar_data(data, base_url=config.base_url)
+                if course_ids:
+                    allowed = set(str(cid) for cid in course_ids)
+                    items = [it for it in items if str(it.get("course_id") or "") in allowed]
+                if items:
+                    return _tag_items(items, source=f"api:{methodname}", confidence=0.82), methodname
+    return None
+
+
+def _extract_notice_rows_from_api_data(data: Any, *, base_url: str, board_id: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if isinstance(data, list):
+        rows = [r for r in data if isinstance(r, dict)]
+    elif isinstance(data, dict):
+        for key in ("posts", "items", "data", "articles"):
+            value = data.get(key)
+            if isinstance(value, list):
+                rows = [r for r in value if isinstance(r, dict)]
+                break
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        title = _norm_text(str(row.get("title") or row.get("subject") or "notice"))
+        url = row.get("url") or row.get("viewurl")
+        post_id = str(row.get("id") or row.get("postid") or row.get("bwid") or "").strip() or None
+        posted_iso = _iso_from_epoch(row.get("timecreated") or row.get("created"))
+        out.append(
+            {
+                "board_id": board_id,
+                "id": post_id,
+                "title": title,
+                "url": _abs_url(base_url, str(url)) if isinstance(url, str) and url.strip() else None,
+                "posted_raw": None,
+                "posted_iso": posted_iso,
+            }
+        )
+    return out
+
+
+async def _list_notices_api(board_ids: list[str], *, max_pages: int, stop_post_id: str | None) -> list[dict[str, Any]] | None:
+    """
+    Best-effort API path for notices based on discovered endpoint map.
+    Returns None when no suitable API mapping exists.
+    """
+    config = _load_config()
+    methodnames = _dedupe_strings(_recommended_methodnames_for_category("notices"))
+    if not methodnames:
+        return None
+
+    async with _borrow_authenticated_context(headless=True, accept_downloads=False) as (context, _auth_mode):
+        page = await context.new_page()
+        try:
+            await page.goto(
+                _abs_url(config.base_url, config.dashboard_path),
+                wait_until="domcontentloaded",
+                timeout=20_000,
+            )
+            dashboard_html = await page.content()
+        finally:
+            await page.close()
+        sesskey = _extract_sesskey(dashboard_html)
+        if not sesskey:
+            return None
+
+        out: list[dict[str, Any]] = []
+        for board_id in board_ids:
+            for methodname in methodnames:
+                args_candidates = [
+                    {"id": int(board_id) if str(board_id).isdigit() else board_id, "page": 0, "perpage": max(1, max_pages) * 20},
+                    {"boardid": int(board_id) if str(board_id).isdigit() else board_id},
+                    {"id": board_id},
+                    {},
+                ]
+                for args in args_candidates:
+                    try:
+                        data = await _moodle_ajax_call(
+                            context,
+                            base_url=config.base_url,
+                            sesskey=sesskey,
+                            methodname=methodname,
+                            args=args,
+                        )
+                    except Exception:
+                        continue
+                    rows = _extract_notice_rows_from_api_data(data, base_url=config.base_url, board_id=str(board_id))
+                    for row in rows:
+                        out.append(row)
+                        if stop_post_id and str(row.get("id") or "") == str(stop_post_id):
+                            return _tag_items(out, source=f"api:{methodname}", confidence=0.75)
+                    if rows:
+                        break
+        if out:
+            return _tag_items(out, source="api:mapped_notices", confidence=0.75)
+        return None
+
+
+async def klms_list_assignments(
+    course_id: str | None = None,
+    *,
+    limit: int | None = None,
+    since_iso: str | None = None,
+) -> list[dict[str, Any]]:
     """
     List assignments with due dates for a course (or all courses).
 
@@ -1575,6 +1977,11 @@ async def klms_list_assignments(course_id: str | None = None) -> list[dict[str, 
         course_ids = [c["id"] for c in await klms_list_courses(enrich=False)]
     if not course_ids:
         raise ValueError(f"Pass course_id or configure course_ids in {CONFIG_PATH}")
+
+    api_items = await _list_assignments_api(course_ids)
+    if api_items is not None:
+        tagged, _methodname = api_items
+        return _apply_limit(_apply_since_filter(tagged, field="due_iso", since_iso=since_iso), limit)
 
     async def list_assignments_for_course(cid: str) -> list[dict[str, Any]]:
         url_path = f"/mod/assign/index.php?id={cid}"
@@ -1606,7 +2013,7 @@ async def klms_list_assignments(course_id: str | None = None) -> list[dict[str, 
                             "due_iso": None,
                         }
                     )
-            return out
+            return _tag_items(out, source="html:assign-index-fallback", confidence=0.62)
 
         headers, table = found
         headers_norm = [h.lower() for h in headers]
@@ -1656,13 +2063,14 @@ async def klms_list_assignments(course_id: str | None = None) -> list[dict[str, 
                     "due_iso": _parse_datetime_guess(due_raw) if due_raw else None,
                 }
             )
-        return out
+        return _tag_items(out, source="html:assign-index", confidence=0.68)
 
     per_course = await _gather_limited(course_ids, list_assignments_for_course)
     all_items: list[dict[str, Any]] = []
     for items in per_course:
         all_items.extend(items)
-    return all_items
+    filtered = _apply_since_filter(all_items, field="due_iso", since_iso=since_iso)
+    return _apply_limit(filtered, limit)
 
 
 async def _resolve_notice_board_ids(explicit_board_id: str | None, config: KlmsConfig) -> list[str]:
@@ -1767,6 +2175,8 @@ async def klms_list_notices(
     *,
     max_pages: int = 1,
     stop_post_id: str | None = None,
+    limit: int | None = None,
+    since_iso: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     List notices from one board or all configured/discovered boards.
@@ -1778,6 +2188,10 @@ async def klms_list_notices(
             f"No notice boards found. Configure notice_board_ids in {CONFIG_PATH} "
             "or pass --notice-board-id."
         )
+
+    api_items = await _list_notices_api(board_ids, max_pages=max_pages, stop_post_id=stop_post_id)
+    if api_items is not None:
+        return _apply_limit(_apply_since_filter(api_items, field="posted_iso", since_iso=since_iso), limit)
 
     all_items: list[dict[str, Any]] = []
     for board_id in board_ids:
@@ -1809,11 +2223,16 @@ async def klms_list_notices(
                 if key in seen_keys:
                     continue
                 seen_keys.add(key)
-                all_items.append(post)
+                tagged = dict(post)
+                tagged["source"] = "html:courseboard"
+                tagged["confidence"] = 0.66
+                all_items.append(tagged)
                 if stop_post_id and pid and pid == str(stop_post_id):
-                    return all_items
+                    filtered = _apply_since_filter(all_items, field="posted_iso", since_iso=since_iso)
+                    return _apply_limit(filtered, limit)
 
-    return all_items
+    filtered = _apply_since_filter(all_items, field="posted_iso", since_iso=since_iso)
+    return _apply_limit(filtered, limit)
 
 
 async def klms_sync_snapshot(
@@ -1930,7 +2349,76 @@ async def klms_sync_snapshot(
     return result
 
 
-async def klms_list_files(course_id: str | None = None) -> list[dict[str, Any]]:
+async def klms_inbox(
+    *,
+    limit: int = 30,
+    max_notice_pages: int = 1,
+    since_iso: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Build a blended feed for daily checks (assignments + notices + files).
+    """
+    limit = max(1, min(int(limit), 500))
+
+    assignments_task = klms_list_assignments(limit=max(limit * 2, 50), since_iso=since_iso)
+    notices_task = klms_list_notices(max_pages=max_notice_pages, limit=max(limit * 2, 50), since_iso=since_iso)
+    files_task = klms_list_files(limit=max(limit * 2, 50))
+    assignments, notices, files = await asyncio.gather(assignments_task, notices_task, files_task)
+
+    inbox: list[dict[str, Any]] = []
+    for row in assignments:
+        inbox.append(
+            {
+                "kind": "assignment",
+                "id": row.get("id"),
+                "title": row.get("title"),
+                "url": row.get("url"),
+                "course_id": row.get("course_id"),
+                "time_iso": row.get("due_iso"),
+                "due_iso": row.get("due_iso"),
+                "source": row.get("source"),
+                "confidence": row.get("confidence"),
+            }
+        )
+    for row in notices:
+        inbox.append(
+            {
+                "kind": "notice",
+                "id": row.get("id"),
+                "title": row.get("title"),
+                "url": row.get("url"),
+                "board_id": row.get("board_id"),
+                "time_iso": row.get("posted_iso"),
+                "posted_iso": row.get("posted_iso"),
+                "source": row.get("source"),
+                "confidence": row.get("confidence"),
+            }
+        )
+    for row in files:
+        inbox.append(
+            {
+                "kind": "file",
+                "id": row.get("url"),
+                "title": row.get("title"),
+                "url": row.get("url"),
+                "course_id": row.get("course_id"),
+                "time_iso": None,
+                "source": row.get("source"),
+                "confidence": row.get("confidence"),
+            }
+        )
+
+    # Sort by recency first, then keep stable kind priority (assignment -> notice -> file).
+    inbox.sort(key=lambda item: (str(item.get("time_iso") or ""), str(item.get("title") or "")), reverse=True)
+    inbox.sort(key=lambda item: {"assignment": 0, "notice": 1, "file": 2}.get(str(item.get("kind")), 9))
+    return inbox[:limit]
+
+
+async def klms_list_files(
+    course_id: str | None = None,
+    *,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
     """
     List downloadable files (excluding videos by default).
 
@@ -2044,7 +2532,8 @@ async def klms_list_files(course_id: str | None = None) -> list[dict[str, Any]]:
             continue
         seen.add(u)
         deduped.append(it)
-    return deduped
+    tagged = _tag_items(deduped, source="html:resource-index", confidence=0.7)
+    return _apply_limit(tagged, limit)
 
 
 async def klms_download_file(
@@ -2269,6 +2758,36 @@ async def klms_discover_api(
                 try:
                     await page.goto(url, wait_until="networkidle", timeout=30_000)
                     visited.append(url)
+                    # Trigger additional likely API calls by visiting a small set of page-local links.
+                    link_candidates: list[str] = []
+                    try:
+                        anchors = await page.eval_on_selector_all(
+                            "a[href]",
+                            "els => els.map(el => el.href).filter(Boolean)",
+                        )
+                        if isinstance(anchors, list):
+                            for href in anchors:
+                                if not isinstance(href, str):
+                                    continue
+                                if not _same_origin(href, base_url):
+                                    continue
+                                if (
+                                    "mod/assign/view.php" in href
+                                    or "mod/courseboard/article.php" in href
+                                    or "mod/resource/view.php" in href
+                                ):
+                                    link_candidates.append(href)
+                        link_candidates = _dedupe_strings(link_candidates)[:3]
+                    except Exception:
+                        link_candidates = []
+
+                    for href in link_candidates:
+                        sub = await context.new_page()
+                        try:
+                            await sub.goto(href, wait_until="networkidle", timeout=20_000)
+                            visited.append(href)
+                        finally:
+                            await sub.close()
                 finally:
                     await page.close()
         finally:
