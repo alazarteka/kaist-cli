@@ -311,10 +311,10 @@ def _has_storage_state_session() -> bool:
 
 
 def _active_auth_mode() -> Literal["profile", "storage_state", "none"]:
-    if _has_profile_session():
-        return "profile"
     if _has_storage_state_session():
         return "storage_state"
+    if _has_profile_session():
+        return "profile"
     return "none"
 
 
@@ -668,14 +668,15 @@ async def _authenticated_context(
                     headless=headless,
                     accept_downloads=accept_downloads,
                 )
+            except Exception:
+                if not _has_storage_state_session():
+                    raise
+            else:
                 try:
                     yield context, "profile"
                 finally:
                     await context.close()
                 return
-            except Exception:
-                if not _has_storage_state_session():
-                    raise
 
         browser = await p.chromium.launch(headless=headless)
         context = await browser.new_context(
@@ -2443,7 +2444,7 @@ def klms_bootstrap_login(base_url: str | None = None) -> dict[str, Any]:
         "base_url": login_base_url,
         "profile_path": str(PROFILE_DIR),
         "storage_state_path": str(STORAGE_STATE_PATH),
-        "preferred_mode": "profile",
+        "preferred_mode": "storage_state",
     }
 
 
