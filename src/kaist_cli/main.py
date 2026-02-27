@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import sys
+import textwrap
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -16,6 +17,14 @@ class CliErrorDescriptor:
     exit_code: int
     retryable: bool
     hint: str | None
+
+
+class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
+    pass
+
+
+def _dedent(text: str) -> str:
+    return textwrap.dedent(text).strip()
 
 
 def _utc_now_iso() -> str:
@@ -262,130 +271,330 @@ def _error_envelope(args: argparse.Namespace, descriptor: CliErrorDescriptor, me
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="kaist",
-        description="CLI for KAIST systems.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=_dedent(
+            """
+            CLI for KAIST systems.
+
+            Quick start (KLMS):
+              1) kaist klms config set --base-url https://klms.kaist.ac.kr
+              2) kaist klms auth login
+              3) kaist klms inbox --limit 20
+
+            Use `kaist klms <command> -h` for command-specific examples.
+            """
+        ),
+        epilog=_dedent(
+            """
+            Common examples:
+              kaist klms auth status
+              kaist klms courses --limit 10
+              kaist --agent klms notices --max-pages 2 --limit 50
+            """
+        ),
+        formatter_class=_HelpFormatter,
     )
     parser.add_argument("--debug", action="store_true", help="Print traceback on failures.")
     parser.add_argument(
         "--format",
         choices=["auto", "json", "table", "text"],
         default="auto",
-        help="Output format. auto=table/text in TTY and json in non-TTY.",
+        help="Output format. auto selects table/text in TTY and json in non-TTY.",
     )
     parser.add_argument(
         "--agent",
         action="store_true",
-        help="Agent mode: force strict JSON envelopes and machine-stable output.",
+        help="Agent mode. Forces strict JSON envelopes and deterministic key ordering.",
     )
 
-    top = parser.add_subparsers(dest="system", required=True)
-    klms_parser = top.add_parser("klms", help="KAIST Learning Management System")
-    klms_sub = klms_parser.add_subparsers(dest="group", required=True)
+    top = parser.add_subparsers(dest="system", required=True, title="Systems", metavar="SYSTEM")
+    klms_parser = top.add_parser(
+        "klms",
+        help="KAIST Learning Management System",
+        description=_dedent(
+            """
+            KLMS read-only interface.
 
-    config = klms_sub.add_parser("config", help="Manage KLMS config")
-    config_sub = config.add_subparsers(dest="action", required=True)
+            Stable workflow groups:
+              config, auth, courses, assignments, notices, files, inbox, download, sync
 
-    config_set = config_sub.add_parser("set", help="Create or update KLMS config")
-    config_set.add_argument("--base-url", help='KLMS base URL, e.g. "https://klms.kaist.ac.kr"')
-    config_set.add_argument("--dashboard-path", help='Dashboard path (e.g. "/my/")')
-    config_set.add_argument("--course-id", action="append", dest="course_ids", help="Course ID (repeatable)")
+            Experimental/debug:
+              dev
+            """
+        ),
+        epilog=_dedent(
+            """
+            Examples:
+              kaist klms auth status
+              kaist klms assignments --since 2026-02-01T00:00 --limit 20
+              kaist klms inbox --limit 30
+              kaist klms dev discover-api --max-courses 3 --max-notice-boards 2
+            """
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    klms_sub = klms_parser.add_subparsers(dest="group", required=True, title="KLMS Commands", metavar="COMMAND")
+
+    config = klms_sub.add_parser(
+        "config",
+        help="Manage local KLMS configuration",
+        description="Create/update local KLMS config used by all commands.",
+        epilog=_dedent(
+            """
+            Examples:
+              kaist klms config set --base-url https://klms.kaist.ac.kr
+              kaist klms config set --course-id 180871 --course-id 178434
+              kaist klms config show
+            """
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    config_sub = config.add_subparsers(dest="action", required=True, title="Config Commands", metavar="ACTION")
+
+    config_set = config_sub.add_parser(
+        "set",
+        help="Create or update KLMS config",
+        description="Write config.toml. By default, merges unspecified fields from existing config.",
+        formatter_class=_HelpFormatter,
+    )
+    config_set.add_argument(
+        "--base-url",
+        metavar="URL",
+        help='KLMS base URL, for example "https://klms.kaist.ac.kr".',
+    )
+    config_set.add_argument("--dashboard-path", metavar="PATH", help='Dashboard path, for example "/my/".')
+    config_set.add_argument("--course-id", action="append", dest="course_ids", metavar="ID", help="Course ID (repeatable).")
     config_set.add_argument(
         "--notice-board-id",
         action="append",
         dest="notice_board_ids",
-        help="Notice board ID (repeatable)",
+        metavar="ID",
+        help="Notice board ID (repeatable).",
     )
     config_set.add_argument(
         "--exclude-course-title-pattern",
         action="append",
         dest="exclude_course_title_patterns",
-        help="Regex filter for noisy/non-course dashboard cards (repeatable)",
+        metavar="REGEX",
+        help="Regex filter for noisy/non-course dashboard cards (repeatable).",
     )
     config_set.add_argument(
         "--replace",
         action="store_true",
-        help="Overwrite unspecified fields instead of merging with existing config.",
+        help="Overwrite unspecified fields instead of merging existing config.",
     )
 
-    config_sub.add_parser("show", help="Show config and auth status")
+    config_sub.add_parser(
+        "show",
+        help="Show config/auth summary",
+        description="Display config and local auth artifact status without online validation.",
+        formatter_class=_HelpFormatter,
+    )
 
-    auth = klms_sub.add_parser("auth", help="Manage KLMS authentication")
-    auth_sub = auth.add_subparsers(dest="action", required=True)
-    auth_login = auth_sub.add_parser("login", help="Interactive browser login bootstrap")
-    auth_login.add_argument("--base-url", help="Optional URL override for login bootstrap")
-    auth_status = auth_sub.add_parser("status", help="Inspect auth/config status")
+    auth = klms_sub.add_parser(
+        "auth",
+        help="Manage KLMS authentication/session",
+        description="Authenticate and diagnose session state stored under ~/.kaist-cli/private/klms.",
+        epilog=_dedent(
+            """
+            Examples:
+              kaist klms auth login
+              kaist klms auth status
+              kaist klms auth refresh
+              kaist klms auth doctor
+            """
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    auth_sub = auth.add_subparsers(dest="action", required=True, title="Auth Commands", metavar="ACTION")
+    auth_login = auth_sub.add_parser(
+        "login",
+        help="Interactive browser login bootstrap",
+        description="Open a browser, sign in to KLMS, then persist profile/storage_state artifacts.",
+        formatter_class=_HelpFormatter,
+    )
+    auth_login.add_argument("--base-url", metavar="URL", help="Optional URL override for login bootstrap.")
+    auth_status = auth_sub.add_parser(
+        "status",
+        help="Inspect auth/config status",
+        description="Show auth artifacts and optionally verify live authentication against dashboard.",
+        formatter_class=_HelpFormatter,
+    )
     auth_status.add_argument("--no-validate", action="store_true", help="Skip online validation probe")
-    auth_refresh = auth_sub.add_parser("refresh", help="Re-run login flow and verify refreshed session")
-    auth_refresh.add_argument("--base-url", help="Optional URL override for login bootstrap")
+    auth_refresh = auth_sub.add_parser(
+        "refresh",
+        help="Re-run login flow and verify refreshed session",
+        description="Run interactive login and immediately verify the refreshed session.",
+        formatter_class=_HelpFormatter,
+    )
+    auth_refresh.add_argument("--base-url", metavar="URL", help="Optional URL override for login bootstrap.")
     auth_refresh.add_argument("--no-validate", action="store_true", help="Skip post-refresh validation probe")
-    auth_doctor = auth_sub.add_parser("doctor", help="Run auth/session diagnostics")
+    auth_doctor = auth_sub.add_parser(
+        "doctor",
+        help="Run auth/session diagnostics",
+        description="Run local artifact/config checks and optional live auth validation.",
+        formatter_class=_HelpFormatter,
+    )
     auth_doctor.add_argument("--no-validate", action="store_true", help="Skip online validation probe")
 
-    courses = klms_sub.add_parser("courses", help="List courses")
+    courses = klms_sub.add_parser(
+        "courses",
+        help="List courses",
+        description="List courses discovered from dashboard (with config fallback).",
+        epilog="Example: kaist klms courses --no-enrich --limit 20",
+        formatter_class=_HelpFormatter,
+    )
     courses.add_argument("--include-all", action="store_true", help="Include noisy/non-course dashboard items")
     courses.add_argument("--no-enrich", action="store_true", help="Skip per-course metadata fetches")
-    courses.add_argument("--limit", type=int, help="Maximum number of courses to return")
+    courses.add_argument("--limit", type=int, metavar="N", help="Maximum number of courses to return.")
 
-    assignments = klms_sub.add_parser("assignments", help="List assignments")
-    assignments.add_argument("--course-id", help="Single course ID; omit for all discovered courses")
-    assignments.add_argument("--since", dest="since_iso", help="Only include assignments with due_iso >= this ISO timestamp")
-    assignments.add_argument("--limit", type=int, help="Maximum number of assignments to return")
+    assignments = klms_sub.add_parser(
+        "assignments",
+        help="List assignments",
+        description="List assignments (API-first with HTML fallback).",
+        epilog="Example: kaist klms assignments --course-id 180871 --since 2026-02-01T00:00 --limit 30",
+        formatter_class=_HelpFormatter,
+    )
+    assignments.add_argument("--course-id", metavar="ID", help="Single course ID; omit for all discovered courses.")
+    assignments.add_argument(
+        "--since",
+        dest="since_iso",
+        metavar="ISO",
+        help="Only include assignments with due_iso >= this ISO timestamp.",
+    )
+    assignments.add_argument("--limit", type=int, metavar="N", help="Maximum number of assignments to return.")
 
-    notices = klms_sub.add_parser("notices", help="List notices")
-    notices.add_argument("--notice-board-id", help="Single notice board ID; omit for configured/discovered boards")
-    notices.add_argument("--max-pages", type=int, default=1, help="Maximum pages per board")
-    notices.add_argument("--stop-post-id", help="Stop paging when this notice post ID is reached")
-    notices.add_argument("--since", dest="since_iso", help="Only include notices with posted_iso >= this ISO timestamp")
-    notices.add_argument("--limit", type=int, help="Maximum number of notices to return")
+    notices = klms_sub.add_parser(
+        "notices",
+        help="List notices",
+        description="List course notices (API-first with HTML fallback).",
+        epilog="Example: kaist klms notices --notice-board-id 1183822 --max-pages 2 --limit 50",
+        formatter_class=_HelpFormatter,
+    )
+    notices.add_argument("--notice-board-id", metavar="ID", help="Single notice board ID; omit for configured/discovered boards.")
+    notices.add_argument("--max-pages", type=int, default=1, metavar="N", help="Maximum pages per board.")
+    notices.add_argument("--stop-post-id", metavar="ID", help="Stop paging when this notice post ID is reached.")
+    notices.add_argument(
+        "--since",
+        dest="since_iso",
+        metavar="ISO",
+        help="Only include notices with posted_iso >= this ISO timestamp.",
+    )
+    notices.add_argument("--limit", type=int, metavar="N", help="Maximum number of notices to return.")
 
-    files = klms_sub.add_parser("files", help="List non-video materials/files")
-    files.add_argument("--course-id", help="Single course ID; omit for all discovered courses")
-    files.add_argument("--limit", type=int, help="Maximum number of files to return")
+    files = klms_sub.add_parser(
+        "files",
+        help="List non-video materials/files",
+        description="List non-video file/material links from course resources.",
+        epilog="Example: kaist klms files --course-id 180871 --limit 40",
+        formatter_class=_HelpFormatter,
+    )
+    files.add_argument("--course-id", metavar="ID", help="Single course ID; omit for all discovered courses.")
+    files.add_argument("--limit", type=int, metavar="N", help="Maximum number of files to return.")
 
-    inbox = klms_sub.add_parser("inbox", help="Blended feed of assignments, notices, and files")
-    inbox.add_argument("--limit", type=int, default=30, help="Maximum number of inbox items to return")
-    inbox.add_argument("--max-notice-pages", type=int, default=1, help="Maximum notice pages per board")
-    inbox.add_argument("--since", dest="since_iso", help="Filter assignments/notices by ISO timestamp")
+    inbox = klms_sub.add_parser(
+        "inbox",
+        help="Blended feed of assignments, notices, and files",
+        description="Build a daily feed by combining assignments, notices, and files.",
+        epilog="Example: kaist klms inbox --since 2026-02-01T00:00 --limit 30",
+        formatter_class=_HelpFormatter,
+    )
+    inbox.add_argument("--limit", type=int, default=30, metavar="N", help="Maximum number of inbox items to return.")
+    inbox.add_argument("--max-notice-pages", type=int, default=1, metavar="N", help="Maximum notice pages per board.")
+    inbox.add_argument("--since", dest="since_iso", metavar="ISO", help="Filter assignments/notices by ISO timestamp.")
 
-    download = klms_sub.add_parser("download", help="Download one material file")
-    download.add_argument("url", help="KLMS-relative path or absolute URL")
-    download.add_argument("--filename", help="Optional filename override")
-    download.add_argument("--subdir", help='Relative destination under files root (e.g. "2026 Spring/CS370")')
-    download.add_argument("--if-exists", choices=["skip", "overwrite"], default="skip")
+    download = klms_sub.add_parser(
+        "download",
+        help="Download one material file",
+        description="Download a file URL into ~/.kaist-cli/files/klms.",
+        epilog='Example: kaist klms download "https://.../pluginfile.php/..." --subdir "2026 Spring/CS30000"',
+        formatter_class=_HelpFormatter,
+    )
+    download.add_argument("url", metavar="URL", help="KLMS-relative path or absolute URL.")
+    download.add_argument("--filename", metavar="NAME", help="Optional filename override.")
+    download.add_argument("--subdir", metavar="DIR", help='Relative destination under files root (for example "2026 Spring/CS370").')
+    download.add_argument("--if-exists", choices=["skip", "overwrite"], default="skip", help="Behavior when destination file exists.")
 
-    sync = klms_sub.add_parser("sync", help="Incremental snapshot sync")
+    sync = klms_sub.add_parser(
+        "sync",
+        help="Incremental snapshot sync",
+        description="Diff current assignments/notices/files against saved snapshot.",
+        epilog="Example: kaist klms sync --dry-run --max-notice-pages 2",
+        formatter_class=_HelpFormatter,
+    )
     sync.add_argument("--dry-run", action="store_true", help="Compute diff only; do not update snapshot")
-    sync.add_argument("--max-notice-pages", type=int, default=3, help="Maximum notice pages per board")
+    sync.add_argument("--max-notice-pages", type=int, default=3, metavar="N", help="Maximum notice pages per board.")
 
-    dev = klms_sub.add_parser("dev", help="Experimental and debugging commands")
-    dev_sub = dev.add_subparsers(dest="action", required=True)
+    dev = klms_sub.add_parser(
+        "dev",
+        help="Experimental and debugging commands",
+        description="Unstable tooling for endpoint discovery and parser debugging.",
+        formatter_class=_HelpFormatter,
+    )
+    dev_sub = dev.add_subparsers(dest="action", required=True, title="Dev Commands", metavar="ACTION")
 
-    fetch_html = dev_sub.add_parser("fetch-html", help="Fetch raw HTML for selector debugging")
-    fetch_html.add_argument("path_or_url", help="KLMS-relative path or absolute URL")
+    fetch_html = dev_sub.add_parser(
+        "fetch-html",
+        help="Fetch raw HTML for selector debugging",
+        description="Fetch a page and return raw HTML using current auth session.",
+        formatter_class=_HelpFormatter,
+    )
+    fetch_html.add_argument("path_or_url", metavar="PATH_OR_URL", help="KLMS-relative path or absolute URL.")
 
-    extract = dev_sub.add_parser("extract", help="Extract regex snippets from fetched HTML")
-    extract.add_argument("path_or_url", help="KLMS-relative path or absolute URL")
-    extract.add_argument("pattern", help="Regex pattern")
-    extract.add_argument("--max-matches", type=int, default=20, help="Max matches to return")
-    extract.add_argument("--context-chars", type=int, default=120, help="Context chars around each match")
+    extract = dev_sub.add_parser(
+        "extract",
+        help="Extract regex snippets from fetched HTML",
+        description="Fetch HTML and return regex match snippets for debugging selectors/patterns.",
+        formatter_class=_HelpFormatter,
+    )
+    extract.add_argument("path_or_url", metavar="PATH_OR_URL", help="KLMS-relative path or absolute URL.")
+    extract.add_argument("pattern", metavar="REGEX", help="Regex pattern.")
+    extract.add_argument("--max-matches", type=int, default=20, metavar="N", help="Maximum matches to return.")
+    extract.add_argument("--context-chars", type=int, default=120, metavar="N", help="Context chars around each match.")
 
-    courses_api = dev_sub.add_parser("courses-api", help="Experimental AJAX-based course listing")
+    courses_api = dev_sub.add_parser(
+        "courses-api",
+        help="Experimental AJAX-based course listing",
+        description="Force the AJAX-based course listing path for debugging/perf checks.",
+        formatter_class=_HelpFormatter,
+    )
     courses_api.add_argument("--include-all", action="store_true", help="Include noisy/non-course dashboard items")
-    courses_api.add_argument("--limit", type=int, default=50, help="Max courses requested from AJAX endpoint")
+    courses_api.add_argument("--limit", type=int, default=50, metavar="N", help="Maximum courses requested from AJAX endpoint.")
 
-    dev_sub.add_parser("term", help="Get current term from dashboard")
+    dev_sub.add_parser(
+        "term",
+        help="Get current term from dashboard",
+        description="Extract currently selected term from dashboard controls.",
+        formatter_class=_HelpFormatter,
+    )
 
-    course_info = dev_sub.add_parser("course-info", help="Get course metadata")
-    course_info.add_argument("course_id", help="Course ID")
+    course_info = dev_sub.add_parser(
+        "course-info",
+        help="Get course metadata",
+        description="Fetch metadata for one course id (title/code/url).",
+        formatter_class=_HelpFormatter,
+    )
+    course_info.add_argument("course_id", metavar="ID", help="Course ID.")
 
-    discover_api = dev_sub.add_parser("discover-api", help="Discover internal KLMS XHR/fetch endpoints")
-    discover_api.add_argument("--max-courses", type=int, default=2, help="Max courses to sample")
-    discover_api.add_argument("--max-notice-boards", type=int, default=2, help="Max notice boards to sample")
+    discover_api = dev_sub.add_parser(
+        "discover-api",
+        help="Discover internal KLMS XHR/fetch endpoints",
+        description="Observe XHR/fetch traffic while visiting representative pages.",
+        epilog="Example: kaist klms dev discover-api --max-courses 5 --max-notice-boards 5",
+        formatter_class=_HelpFormatter,
+    )
+    discover_api.add_argument("--max-courses", type=int, default=2, metavar="N", help="Maximum courses to sample.")
+    discover_api.add_argument("--max-notice-boards", type=int, default=2, metavar="N", help="Maximum notice boards to sample.")
 
-    map_api = dev_sub.add_parser("map-api", help="Classify discovered endpoints into CLI-use candidates")
+    map_api = dev_sub.add_parser(
+        "map-api",
+        help="Classify discovered endpoints into CLI-use candidates",
+        description="Read discovery report and build categorized endpoint map with recommendations.",
+        formatter_class=_HelpFormatter,
+    )
     map_api.add_argument(
         "--report-path",
-        help="Optional path to endpoint discovery report (defaults to private endpoint_discovery.json)",
+        metavar="PATH",
+        help="Optional path to endpoint discovery report (default: ~/.kaist-cli/private/klms/endpoint_discovery.json).",
     )
 
     return parser
