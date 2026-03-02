@@ -19,6 +19,7 @@ import os
 import re
 import time
 import subprocess
+import shutil
 import sys
 import html as _html
 import json
@@ -89,6 +90,224 @@ def _is_missing_browser_error(exc: BaseException) -> bool:
         or "download new browsers" in message
         or "playwright install" in message
     )
+
+
+def _system_browser_channel_candidates() -> list[str]:
+    override = os.environ.get("KAIST_KLMS_BROWSER_CHANNEL", "").strip()
+    if override:
+        return [override]
+    return ["chrome", "msedge"]
+
+
+def _system_chromium_executable_candidates() -> list[Path]:
+    override = os.environ.get("KAIST_KLMS_BROWSER_EXECUTABLE", "").strip()
+    if override:
+        return [Path(override).expanduser()]
+
+    candidates: list[Path] = []
+    if sys.platform == "darwin":
+        candidates.extend(
+            [
+                Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                Path("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+                Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+                Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+                Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                Path.home() / "Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+                Path.home() / "Applications/Chromium.app/Contents/MacOS/Chromium",
+                Path.home() / "Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            ]
+        )
+    elif sys.platform.startswith("linux"):
+        for cmd in (
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            "brave-browser",
+            "microsoft-edge",
+            "msedge",
+        ):
+            resolved = shutil.which(cmd)
+            if resolved:
+                candidates.append(Path(resolved))
+    elif sys.platform == "win32":
+        for path in (
+            Path("C:/Program Files/Google/Chrome/Application/chrome.exe"),
+            Path("C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"),
+            Path("C:/Program Files/Microsoft/Edge/Application/msedge.exe"),
+            Path("C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"),
+            Path.home() / "AppData/Local/Google/Chrome/Application/chrome.exe",
+            Path.home() / "AppData/Local/Microsoft/Edge/Application/msedge.exe",
+        ):
+            candidates.append(path)
+
+    # De-duplicate while preserving preference order.
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def _resolve_system_chromium_executable() -> str | None:
+    for candidate in _system_chromium_executable_candidates():
+        try:
+            if candidate.exists() and candidate.is_file():
+                return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
+def _browser_override_launch_options() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for channel in _system_browser_channel_candidates():
+        out.append({"channel": channel, "_label": f"channel={channel}"})
+    executable = _resolve_system_chromium_executable()
+    if executable:
+        out.append({"executable_path": executable, "_label": f"executable_path={executable}"})
+    return out
+
+
+def _browser_fallback_error(prefix: str, errors: list[str]) -> RuntimeError:
+    detail = _tail_text("\n".join(errors), max_lines=16) or "unknown error"
+    return RuntimeError(f"{prefix}. Details:\n{detail}")
+
+
+async def _launch_chromium_persistent_context_async(
+    playwright: Any,
+    *,
+    user_data_dir: str,
+    headless: bool,
+    accept_downloads: bool,
+) -> Any:
+    launch_kwargs = {
+        "user_data_dir": user_data_dir,
+        "headless": headless,
+        "accept_downloads": accept_downloads,
+    }
+    try:
+        return await playwright.chromium.launch_persistent_context(**launch_kwargs)
+    except Exception as exc:
+        if not _is_missing_browser_error(exc):
+            raise
+        errors = [f"default bundled Chromium missing: {exc}"]
+
+    for option in _browser_override_launch_options():
+        kwargs = dict(launch_kwargs)
+        label = str(option.get("_label") or "override")
+        kwargs.update({k: v for k, v in option.items() if k != "_label"})
+        try:
+            return await playwright.chromium.launch_persistent_context(**kwargs)
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+
+    try:
+        await asyncio.to_thread(klms_install_browser, force=False)
+    except Exception as exc:
+        errors.append(f"playwright install chromium: {exc}")
+        raise _browser_fallback_error(
+            "Failed to launch browser and automatic install also failed",
+            errors,
+        ) from exc
+
+    try:
+        return await playwright.chromium.launch_persistent_context(**launch_kwargs)
+    except Exception as exc:
+        errors.append(f"after install retry: {exc}")
+        raise _browser_fallback_error(
+            "Failed to launch browser after installation retry",
+            errors,
+        ) from exc
+
+
+async def _launch_chromium_browser_async(playwright: Any, *, headless: bool) -> Any:
+    launch_kwargs = {"headless": headless}
+    try:
+        return await playwright.chromium.launch(**launch_kwargs)
+    except Exception as exc:
+        if not _is_missing_browser_error(exc):
+            raise
+        errors = [f"default bundled Chromium missing: {exc}"]
+
+    for option in _browser_override_launch_options():
+        kwargs = dict(launch_kwargs)
+        label = str(option.get("_label") or "override")
+        kwargs.update({k: v for k, v in option.items() if k != "_label"})
+        try:
+            return await playwright.chromium.launch(**kwargs)
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+
+    try:
+        await asyncio.to_thread(klms_install_browser, force=False)
+    except Exception as exc:
+        errors.append(f"playwright install chromium: {exc}")
+        raise _browser_fallback_error(
+            "Failed to launch browser and automatic install also failed",
+            errors,
+        ) from exc
+
+    try:
+        return await playwright.chromium.launch(**launch_kwargs)
+    except Exception as exc:
+        errors.append(f"after install retry: {exc}")
+        raise _browser_fallback_error(
+            "Failed to launch browser after installation retry",
+            errors,
+        ) from exc
+
+
+def _launch_chromium_persistent_context_sync(
+    playwright: Any,
+    *,
+    user_data_dir: str,
+    headless: bool,
+    accept_downloads: bool,
+) -> Any:
+    launch_kwargs = {
+        "user_data_dir": user_data_dir,
+        "headless": headless,
+        "accept_downloads": accept_downloads,
+    }
+    try:
+        return playwright.chromium.launch_persistent_context(**launch_kwargs)
+    except Exception as exc:
+        if not _is_missing_browser_error(exc):
+            raise
+        errors = [f"default bundled Chromium missing: {exc}"]
+
+    for option in _browser_override_launch_options():
+        kwargs = dict(launch_kwargs)
+        label = str(option.get("_label") or "override")
+        kwargs.update({k: v for k, v in option.items() if k != "_label"})
+        try:
+            return playwright.chromium.launch_persistent_context(**kwargs)
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+
+    try:
+        klms_install_browser(force=False)
+    except Exception as exc:
+        errors.append(f"playwright install chromium: {exc}")
+        raise _browser_fallback_error(
+            "Failed to launch browser and automatic install also failed",
+            errors,
+        ) from exc
+
+    try:
+        return playwright.chromium.launch_persistent_context(**launch_kwargs)
+    except Exception as exc:
+        errors.append(f"after install retry: {exc}")
+        raise _browser_fallback_error(
+            "Failed to launch browser after installation retry",
+            errors,
+        ) from exc
 
 
 def _playwright_install_cmd() -> tuple[list[str], dict[str, str]]:
@@ -764,36 +983,15 @@ async def _authenticated_context(
     _configure_playwright_env()
     from playwright.async_api import async_playwright  # type: ignore[import-untyped]
 
-    async def launch_profile_context(playwright: Any) -> Any:
-        try:
-            return await playwright.chromium.launch_persistent_context(
-                user_data_dir=str(PROFILE_DIR),
-                headless=headless,
-                accept_downloads=accept_downloads,
-            )
-        except Exception as exc:
-            if not _is_missing_browser_error(exc):
-                raise
-            await asyncio.to_thread(klms_install_browser, force=False)
-            return await playwright.chromium.launch_persistent_context(
-                user_data_dir=str(PROFILE_DIR),
-                headless=headless,
-                accept_downloads=accept_downloads,
-            )
-
-    async def launch_browser(playwright: Any) -> Any:
-        try:
-            return await playwright.chromium.launch(headless=headless)
-        except Exception as exc:
-            if not _is_missing_browser_error(exc):
-                raise
-            await asyncio.to_thread(klms_install_browser, force=False)
-            return await playwright.chromium.launch(headless=headless)
-
     async with async_playwright() as p:
         if mode == "profile":
             try:
-                context = await launch_profile_context(p)
+                context = await _launch_chromium_persistent_context_async(
+                    p,
+                    user_data_dir=str(PROFILE_DIR),
+                    headless=headless,
+                    accept_downloads=accept_downloads,
+                )
             except Exception:
                 if not _has_storage_state_session():
                     raise
@@ -812,7 +1010,7 @@ async def _authenticated_context(
                         await context.close()
                     return
 
-        browser = await launch_browser(p)
+        browser = await _launch_chromium_browser_async(p, headless=headless)
         context = await browser.new_context(
             storage_state=str(STORAGE_STATE_PATH),
             accept_downloads=accept_downloads,
@@ -1605,6 +1803,10 @@ async def klms_status(validate: bool = True) -> dict[str, Any]:
         "profile_path": str(PROFILE_DIR),
         "storage_state_path": str(STORAGE_STATE_PATH),
         "playwright_browsers_path": str(_configure_playwright_env()),
+        "browser_overrides": {
+            "channel_candidates": _system_browser_channel_candidates(),
+            "resolved_executable": _resolve_system_chromium_executable(),
+        },
         "cache_path": str(CACHE_PATH),
         "download_root": str(DOWNLOAD_ROOT),
         "concurrency_limit": _concurrency_limit(),
@@ -3608,20 +3810,12 @@ def klms_bootstrap_login(base_url: str | None = None) -> dict[str, Any]:
     print(f"Opening browser to: {login_base_url}", file=sys.stderr)
     print("Log in fully, navigate to a course page, then return here and press Enter.", file=sys.stderr)
     with sync_playwright() as p:
-        try:
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=str(PROFILE_DIR),
-                headless=False,
-            )
-        except Exception as exc:
-            if not _is_missing_browser_error(exc):
-                raise
-            print("Playwright Chromium runtime not found; installing now...", file=sys.stderr)
-            klms_install_browser(force=False)
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=str(PROFILE_DIR),
-                headless=False,
-            )
+        context = _launch_chromium_persistent_context_sync(
+            p,
+            user_data_dir=str(PROFILE_DIR),
+            headless=False,
+            accept_downloads=False,
+        )
         page = context.new_page()
         page.goto(login_base_url, wait_until="domcontentloaded", timeout=30_000)
         print("Press Enter to save session and exit... ", end="", file=sys.stderr, flush=True)

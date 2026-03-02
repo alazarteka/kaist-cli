@@ -95,6 +95,8 @@ Optional tuning env vars:
 - `KAIST_KLMS_CONCURRENCY` (default `4`, range `1..16`)
 - `KAIST_KLMS_COURSE_INFO_TTL_SECONDS` (default `21600`)
 - `KAIST_KLMS_NOTICE_BOARD_TTL_SECONDS` (default `1800`)
+- `KAIST_KLMS_BROWSER_CHANNEL` (default tries `chrome`, then `msedge`)
+- `KAIST_KLMS_BROWSER_EXECUTABLE` (absolute path override for browser binary)
 
 ## Binary Install and Update
 
@@ -103,7 +105,7 @@ Planned release path uses unsigned standalone binaries published on GitHub Relea
 Manual install (example for macOS Apple Silicon):
 
 ```bash
-TAG=v0.1.3
+TAG=v0.1.4
 REPO=alazarteka/kaist-cli
 TARGET=darwin-arm64
 ASSET="kaist-${TAG}-${TARGET}.tar.gz"
