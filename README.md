@@ -102,7 +102,7 @@ Planned release path uses unsigned standalone binaries published on GitHub Relea
 Manual install (example for macOS Apple Silicon):
 
 ```bash
-TAG=v0.1.0
+TAG=v0.1.1
 REPO=alazarteka/kaist-cli
 TARGET=darwin-arm64
 ASSET="kaist-${TAG}-${TARGET}.tar.gz"

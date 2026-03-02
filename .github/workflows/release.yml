@@ -37,7 +37,7 @@ jobs:
             --hidden-import playwright.sync_api \
             --collect-submodules playwright \
             --collect-data playwright \
-            src/kaist_cli/main.py
+            scripts/pyinstaller_entrypoint.py
 
       - name: Package release assets
         shell: bash
