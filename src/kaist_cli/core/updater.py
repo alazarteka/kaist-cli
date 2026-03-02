@@ -6,6 +6,7 @@ import os
 import platform
 import re
 import shutil
+import ssl
 import tarfile
 import tempfile
 import urllib.error
@@ -30,6 +31,20 @@ class ReleaseAsset:
     name: str
     browser_download_url: str
     size: int
+
+
+def _urlopen(request: urllib.request.Request, *, timeout: int) -> Any:
+    context = None
+    try:
+        import certifi  # type: ignore[import-untyped]
+
+        context = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        context = None
+
+    if context is None:
+        return urllib.request.urlopen(request, timeout=timeout)
+    return urllib.request.urlopen(request, timeout=timeout, context=context)
 
 
 def normalize_version(value: str) -> str:
@@ -81,7 +96,7 @@ def _github_json(url: str) -> dict[str, Any]:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with _urlopen(request, timeout=20) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -142,7 +157,7 @@ def select_checksums_asset(assets: list[ReleaseAsset]) -> ReleaseAsset:
 def _download_to_path(url: str, destination: Path) -> None:
     request = urllib.request.Request(url, headers={"User-Agent": "kaist-cli-updater"})
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with _urlopen(request, timeout=60) as response:
             destination.write_bytes(response.read())
     except urllib.error.URLError as exc:
         raise SelfUpdateError(f"Failed downloading release asset: {exc}") from exc
