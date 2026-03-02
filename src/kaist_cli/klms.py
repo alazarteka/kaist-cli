@@ -22,11 +22,11 @@ import sys
 import html as _html
 import json
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 from playwright.async_api import async_playwright  # type: ignore[import-untyped]
@@ -312,10 +312,10 @@ def _has_storage_state_session() -> bool:
 
 
 def _active_auth_mode() -> Literal["profile", "storage_state", "none"]:
-    if _has_storage_state_session():
-        return "storage_state"
     if _has_profile_session():
         return "profile"
+    if _has_storage_state_session():
+        return "storage_state"
     return "none"
 
 
@@ -335,7 +335,7 @@ def _klms_login_help() -> str:
 
 
 def _epoch_to_iso_utc(epoch: float) -> str:
-    return datetime.utcfromtimestamp(epoch).replace(microsecond=0).isoformat() + "Z"
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _storage_state_cookie_stats() -> dict[str, Any] | None:
@@ -682,6 +682,11 @@ async def _authenticated_context(
 ) -> AsyncIterator[tuple[Any, Literal["profile", "storage_state"]]]:
     _require_auth_artifact()
     mode = _active_auth_mode()
+    config: KlmsConfig | None = None
+    try:
+        config = _load_config()
+    except Exception:
+        config = None
 
     async with async_playwright() as p:
         if mode == "profile":
@@ -695,11 +700,19 @@ async def _authenticated_context(
                 if not _has_storage_state_session():
                     raise
             else:
-                try:
-                    yield context, "profile"
-                finally:
+                use_profile = True
+                # Some environments can open the profile but still get bounced to SSO.
+                # If storage_state exists, probe profile quickly and fall back when needed.
+                if config is not None and _has_storage_state_session():
+                    use_profile = await _context_is_authenticated(context, config=config)
+                if not use_profile:
                     await context.close()
-                return
+                else:
+                    try:
+                        yield context, "profile"
+                    finally:
+                        await context.close()
+                    return
 
         browser = await p.chromium.launch(headless=headless)
         context = await browser.new_context(
@@ -728,7 +741,12 @@ async def _borrow_authenticated_context(
         yield context, auth_mode
 
 
-async def _fetch_html(path_or_url: str, *, timeout_ms: int = 20_000, allow_login_page: bool = False) -> str:
+async def _fetch_html_and_url(
+    path_or_url: str,
+    *,
+    timeout_ms: int = 20_000,
+    allow_login_page: bool = False,
+) -> tuple[str, str]:
     config = _load_config()
     _require_auth_artifact()
 
@@ -743,7 +761,32 @@ async def _fetch_html(path_or_url: str, *, timeout_ms: int = 20_000, allow_login
             await page.close()
     if not allow_login_page and (_looks_logged_out(html) or _looks_login_url(final_url)):
         _raise_auth_error(final_url=final_url)
+    return html, final_url
+
+
+async def _fetch_html(path_or_url: str, *, timeout_ms: int = 20_000, allow_login_page: bool = False) -> str:
+    html, _final_url = await _fetch_html_and_url(
+        path_or_url,
+        timeout_ms=timeout_ms,
+        allow_login_page=allow_login_page,
+    )
     return html
+
+
+async def _context_is_authenticated(context: Any, *, config: KlmsConfig, timeout_ms: int = 10_000) -> bool:
+    """
+    Lightweight probe used to decide whether a candidate auth context is usable.
+    """
+    page = await context.new_page()
+    try:
+        await page.goto(_abs_url(config.base_url, config.dashboard_path), wait_until="domcontentloaded", timeout=timeout_ms)
+        html = await page.content()
+        final_url = page.url
+    except Exception:
+        return False
+    finally:
+        await page.close()
+    return not (_looks_logged_out(html) or _looks_login_url(final_url))
 
 
 async def _probe_auth(*, timeout_ms: int = 10_000) -> dict[str, Any]:
@@ -867,15 +910,14 @@ def _parse_datetime_guess(raw: str) -> str | None:
 
 
 def _utc_now_iso() -> str:
-    # Keep it timezone-agnostic; treat as informational.
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.now(tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _iso_from_epoch(epoch: float | int | None) -> str | None:
     if not isinstance(epoch, (int, float)):
         return None
     try:
-        return datetime.utcfromtimestamp(float(epoch)).replace(microsecond=0).isoformat() + "Z"
+        return datetime.fromtimestamp(float(epoch), tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     except Exception:
         return None
 
@@ -1011,6 +1053,78 @@ def _extract_course_code_from_resource_index(html: str) -> str | None:
     return m.group(0) if m else None
 
 
+def _split_person_names(raw: str) -> list[str]:
+    text = _norm_text(raw)
+    if not text:
+        return []
+    text = re.sub(r"^(professors?|instructors?|teachers?|담당교수|교수진)\s*[:：]?\s*", "", text, flags=re.IGNORECASE)
+    chunks = [c.strip() for c in re.split(r"[,/;|·\n]+", text) if c.strip()]
+    out: list[str] = []
+    for chunk in chunks:
+        normalized = _norm_text(chunk)
+        if not normalized:
+            continue
+        if "@" in normalized:
+            continue
+        if re.fullmatch(r"[0-9\-\+\(\)\s]{6,}", normalized):
+            continue
+        if len(normalized) > 80:
+            continue
+        out.append(normalized)
+    return list(dict.fromkeys(out))
+
+
+def _extract_professors_from_course_page(html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    names: list[str] = []
+
+    role_hint = re.compile(r"^(professors?|instructors?|teachers?|담당교수|교수진|교강사)\s*$", re.IGNORECASE)
+    role_in_key = re.compile(r"(professor|instructor|teacher|담당교수|교수진|교강사)", re.IGNORECASE)
+    assistant_hint = re.compile(r"(assistant|ta|조교)", re.IGNORECASE)
+
+    # KLMS commonly exposes a dedicated "Professors" label in the course header.
+    role_labels = [
+        node
+        for node in soup.find_all(string=True)
+        if role_hint.match(_norm_text(str(node)))
+    ]
+    for label in role_labels:
+        container = label.parent
+        if container is None:
+            continue
+        block = container.parent if getattr(container.parent, "name", None) else container
+        if block is None:
+            continue
+        anchors = list(block.find_all("a"))
+        if len(anchors) > 8:
+            # Avoid broad navigation blocks that happen to contain role text.
+            continue
+        for anchor in anchors:
+            value = _norm_text(anchor.get_text(" ", strip=True))
+            if not value:
+                continue
+            if "@" in value or assistant_hint.search(value):
+                continue
+            names.extend(_split_person_names(value))
+        if not anchors:
+            names.extend(_split_person_names(block.get_text(" ", strip=True)))
+
+    # Fallback for table-style metadata rows.
+    if not names:
+        for row in soup.find_all("tr"):
+            th = row.find("th")
+            td = row.find("td")
+            if not th or not td:
+                continue
+            key = _norm_text(th.get_text(" ", strip=True))
+            if not key or not role_in_key.search(key):
+                continue
+            names.extend(_split_person_names(td.get_text(" ", strip=True)))
+
+    deduped = list(dict.fromkeys([n for n in names if n and not assistant_hint.search(n)]))
+    return deduped[:8]
+
+
 def _course_code_base(course_code: str | None) -> str | None:
     """
     Normalize a KLMS course code to a stable base identifier for labels.
@@ -1034,15 +1148,17 @@ async def _get_course_info(course_id: str, *, use_cache: bool = True) -> dict[st
     """
     if use_cache:
         cached = _cache_get_course_info(course_id)
-        if cached:
+        if cached and isinstance(cached.get("professors"), list):
             return cached
 
     config = _load_config()
     title = None
     code = None
+    professors: list[str] = []
     try:
         course_html = await _fetch_html(f"/course/view.php?id={course_id}&section=0")
         title = _extract_title_from_course_page(course_html)
+        professors = _extract_professors_from_course_page(course_html)
     except KlmsAuthError:
         raise
     except Exception:
@@ -1060,6 +1176,7 @@ async def _get_course_info(course_id: str, *, use_cache: bool = True) -> dict[st
         "course_code": code,  # may be None
         "course_code_base": _course_code_base(code),
         "course_url": _abs_url(config.base_url, f"/course/view.php?id={course_id}"),
+        "professors": professors,
     }
     if use_cache:
         _cache_set_course_info(course_id, result)
@@ -2170,6 +2287,236 @@ def _parse_notice_items_from_soup(
     return out
 
 
+def _extract_notice_ids_from_url(url: str | None) -> tuple[str | None, str | None]:
+    if not url:
+        return None, None
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None, None
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    board_id = (query.get("id") or [None])[0]
+    notice_id = (query.get("bwid") or [None])[0]
+    board_id_s = str(board_id).strip() if isinstance(board_id, str) else None
+    notice_id_s = str(notice_id).strip() if isinstance(notice_id, str) else None
+    return (board_id_s or None), (notice_id_s or None)
+
+
+def _looks_like_attachment_url(url: str) -> bool:
+    parsed = urlparse(url)
+    path = (parsed.path or "").lower()
+    query = (parsed.query or "").lower()
+    if "pluginfile.php" in path:
+        return True
+    if "forcedownload=1" in query:
+        return True
+    if "/mod/resource/" in path:
+        return True
+    return bool(
+        re.search(
+            r"\.(pdf|zip|7z|tar|gz|hwp|hwpx|doc|docx|ppt|pptx|xls|xlsx|txt|csv|py|ipynb)$",
+            path,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _attachment_filename_from_url(url: str) -> str | None:
+    try:
+        path_name = Path(unquote(urlparse(url).path or "")).name
+    except Exception:
+        return None
+    return path_name or None
+
+
+def _extract_notice_title_from_soup(soup: BeautifulSoup) -> str | None:
+    selectors = [
+        "h1",
+        "h2",
+        "#page-header h1",
+        ".subject",
+        ".board-title",
+        ".article-title",
+        ".post-title",
+    ]
+    for selector in selectors:
+        for node in soup.select(selector):
+            title = _norm_text(node.get_text(" ", strip=True))
+            if title:
+                return title
+    og_title = soup.select_one('meta[property="og:title"]')
+    if og_title and isinstance(og_title.get("content"), str):
+        title = _norm_text(str(og_title.get("content") or ""))
+        if title:
+            return title
+    if soup.title:
+        title = _norm_text(soup.title.get_text(" ", strip=True))
+        if title:
+            # Common Moodle title form: "<notice title> : <course>".
+            if ":" in title:
+                left = _norm_text(title.split(":", 1)[0])
+                if left:
+                    return left
+            return title
+    return None
+
+
+def _extract_notice_meta_from_soup(soup: BeautifulSoup) -> tuple[str | None, str | None]:
+    author: str | None = None
+    posted_raw: str | None = None
+
+    for row in soup.select("table tr"):
+        th = row.find("th")
+        td = row.find("td")
+        if not th or not td:
+            continue
+        key = _norm_text(th.get_text(" ", strip=True)).lower()
+        value = _norm_text(td.get_text(" ", strip=True))
+        if not value:
+            continue
+        if not author and any(k in key for k in ("작성자", "author", "writer", "등록자")):
+            author = value
+        if not posted_raw and any(k in key for k in ("작성일", "등록일", "date", "posted", "시간")):
+            posted_raw = value
+
+    if not author or not posted_raw:
+        for node in soup.select(".author, .writer, .user, .posted, .date, .time, .regdate, .info, .post-info"):
+            text = _norm_text(node.get_text(" ", strip=True))
+            if not text:
+                continue
+            if not author:
+                m_author = re.search(r"(?:작성자|author|writer)\s*[:：]\s*(.+)$", text, flags=re.IGNORECASE)
+                if m_author:
+                    author = _norm_text(m_author.group(1))
+            if not posted_raw:
+                m_posted = re.search(r"(?:작성일|등록일|date|posted)\s*[:：]\s*(.+)$", text, flags=re.IGNORECASE)
+                if m_posted:
+                    posted_raw = _norm_text(m_posted.group(1))
+                elif re.search(r"(20\d{2}[-./]\d{1,2}[-./]\d{1,2})", text):
+                    posted_raw = text
+
+    return author, posted_raw
+
+
+def _select_notice_body_node(soup: BeautifulSoup) -> Any:
+    selectors = [
+        ".board_view .content",
+        ".board_view .view-content",
+        ".board_view .article-content",
+        ".article-content",
+        ".post-content",
+        ".entry-content",
+        "[class*=board][class*=content]",
+        "#region-main .content",
+        "#region-main",
+        "article",
+        "main",
+    ]
+    best_node: Any = None
+    best_score = -1
+    for selector in selectors:
+        for node in soup.select(selector):
+            text = _norm_text(node.get_text(" ", strip=True))
+            if len(text) < 40:
+                continue
+            score = len(text)
+            if node.find("p"):
+                score += 40
+            if len(node.find_all("a", href=True)) > 30:
+                score -= 300
+            if score > best_score:
+                best_score = score
+                best_node = node
+    if best_node is not None:
+        return best_node
+    if soup.body:
+        return soup.body
+    return soup
+
+
+def _collect_notice_attachments(soup: BeautifulSoup, *, base_url: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for link in soup.find_all("a", href=True):
+        href = str(link.get("href") or "").strip()
+        if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+            continue
+        url = _abs_url(base_url, href)
+        classes = " ".join(str(c) for c in (link.get("class") or [])).lower()
+        if not _looks_like_attachment_url(url) and not any(token in classes for token in ("attach", "download", "file")):
+            continue
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        title = _norm_text(link.get_text(" ", strip=True))
+        filename = _attachment_filename_from_url(url)
+        if not title:
+            title = filename or url
+        out.append(
+            {
+                "title": title,
+                "url": url,
+                "filename": filename,
+                "is_video": _is_video_filename(filename or "") or _is_video_url(url),
+            }
+        )
+    return out
+
+
+def _parse_notice_detail_from_html(
+    html: str,
+    *,
+    base_url: str,
+    url: str | None = None,
+    fallback_board_id: str | None = None,
+    fallback_notice_id: str | None = None,
+    include_html: bool = False,
+) -> dict[str, Any]:
+    soup = BeautifulSoup(html, "html.parser")
+    for node in soup(["script", "style", "noscript"]):
+        node.decompose()
+
+    board_from_url, notice_from_url = _extract_notice_ids_from_url(url)
+    board_id = fallback_board_id or board_from_url
+    notice_id = fallback_notice_id or notice_from_url
+
+    if not board_id or not notice_id:
+        for link in soup.find_all("a", href=True):
+            href = str(link.get("href") or "")
+            if "mod/courseboard/article.php" not in href:
+                continue
+            bid, nid = _extract_notice_ids_from_url(href)
+            board_id = board_id or bid
+            notice_id = notice_id or nid
+            if board_id and notice_id:
+                break
+
+    title = _extract_notice_title_from_soup(soup) or (f"notice-{notice_id}" if notice_id else "notice")
+    author, posted_raw = _extract_notice_meta_from_soup(soup)
+    posted_iso = _parse_datetime_guess(posted_raw) if posted_raw else None
+    body_node = _select_notice_body_node(soup)
+    body_text = _norm_text(body_node.get_text("\n", strip=True))
+    attachments = _collect_notice_attachments(soup, base_url=base_url)
+
+    result: dict[str, Any] = {
+        "board_id": board_id,
+        "id": notice_id,
+        "title": title,
+        "url": url,
+        "author": author,
+        "posted_raw": posted_raw,
+        "posted_iso": posted_iso,
+        "body_text": body_text or None,
+        "attachments": attachments,
+        "detail_available": bool(body_text),
+        "source": "html:courseboard-article",
+        "confidence": 0.78 if body_text else 0.62,
+    }
+    if include_html:
+        result["body_html"] = str(body_node)
+    return result
+
+
 async def klms_list_notices(
     notice_board_id: str | None = None,
     *,
@@ -2233,6 +2580,106 @@ async def klms_list_notices(
 
     filtered = _apply_since_filter(all_items, field="posted_iso", since_iso=since_iso)
     return _apply_limit(filtered, limit)
+
+
+async def klms_get_notice(
+    notice_id: str,
+    *,
+    notice_board_id: str | None = None,
+    max_pages: int = 3,
+    include_html: bool = False,
+) -> dict[str, Any]:
+    target_notice_id = str(notice_id).strip()
+    if not target_notice_id:
+        raise ValueError("notice_id is required")
+
+    config = _load_config()
+    board_ids = await _resolve_notice_board_ids(notice_board_id, config)
+    if not board_ids:
+        raise ValueError(
+            f"No notice boards found. Configure notice_board_ids in {CONFIG_PATH} "
+            "or pass --notice-board-id."
+        )
+
+    candidates: list[tuple[str, str, bool]] = []
+    if notice_board_id:
+        board_ids = [str(notice_board_id)]
+
+    metadata_row: dict[str, Any] | None = None
+    if not notice_board_id:
+        try:
+            rows = await klms_list_notices(max_pages=max_pages, limit=None)
+            for row in rows:
+                if str(row.get("id") or "") == target_notice_id:
+                    metadata_row = dict(row)
+                    break
+        except Exception:
+            metadata_row = None
+
+    if metadata_row:
+        board_from_row = str(metadata_row.get("board_id") or "").strip()
+        url_from_row = str(metadata_row.get("url") or "").strip()
+        if board_from_row and board_from_row in board_ids:
+            board_ids = [board_from_row] + [bid for bid in board_ids if bid != board_from_row]
+        if board_from_row and url_from_row:
+            candidates.append((url_from_row, board_from_row, False))
+
+    for board_id in board_ids:
+        candidates.append(
+            (
+                _abs_url(config.base_url, f"/mod/courseboard/article.php?id={board_id}&bwid={target_notice_id}"),
+                str(board_id),
+                True,
+            )
+        )
+
+    seen_urls: set[str] = set()
+    for url, board_id, strict_article_url in candidates:
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        try:
+            html, final_url = await _fetch_html_and_url(url)
+        except KlmsAuthError:
+            raise
+        except Exception:
+            continue
+
+        if strict_article_url:
+            final_url_l = final_url.lower()
+            if "mod/courseboard/article.php" not in final_url_l:
+                continue
+            if f"bwid={target_notice_id}" not in final_url_l:
+                continue
+
+        detail = _parse_notice_detail_from_html(
+            html,
+            base_url=config.base_url,
+            url=final_url,
+            fallback_board_id=board_id,
+            fallback_notice_id=target_notice_id,
+            include_html=include_html,
+        )
+        parsed_notice_id = str(detail.get("id") or "").strip()
+        if parsed_notice_id and parsed_notice_id != target_notice_id:
+            continue
+
+        detail["id"] = target_notice_id
+        if metadata_row:
+            merged = dict(metadata_row)
+            merged.update(detail)
+            return merged
+        return detail
+
+    if metadata_row:
+        fallback = dict(metadata_row)
+        fallback["detail_available"] = False
+        fallback["body_text"] = None
+        fallback["attachments"] = []
+        if include_html:
+            fallback["body_html"] = None
+        return fallback
+    raise FileNotFoundError(f"Notice not found: {notice_id}")
 
 
 async def klms_sync_snapshot(
@@ -2536,6 +2983,97 @@ async def klms_list_files(
     return _apply_limit(tagged, limit)
 
 
+def _infer_course_id_for_download(resolved_url: str, subdir: str | None) -> str | None:
+    if subdir:
+        parts = list(_sanitize_relpath(subdir).parts)
+        for part in reversed(parts):
+            token = str(part).strip()
+            if re.fullmatch(r"\d{4,}", token):
+                return token
+
+    try:
+        parsed = urlparse(resolved_url)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+    except Exception:
+        return None
+
+    for key in ("courseid", "course_id", "cid"):
+        values = query.get(key) or []
+        if values:
+            candidate = str(values[0]).strip()
+            if re.fullmatch(r"\d{4,}", candidate):
+                return candidate
+
+    path = (parsed.path or "").lower()
+    if path.endswith("/course/view.php") or path.endswith("/mod/resource/index.php"):
+        values = query.get("id") or []
+        if values:
+            candidate = str(values[0]).strip()
+            if re.fullmatch(r"\d{4,}", candidate):
+                return candidate
+    return None
+
+
+async def _term_label_for_course(course_id: str) -> str | None:
+    try:
+        courses = await klms_list_courses(include_all=True, enrich=False)
+    except Exception:
+        return None
+    for row in courses:
+        if str(row.get("id") or "") != str(course_id):
+            continue
+        term = row.get("term_label")
+        if isinstance(term, str) and term.strip():
+            return term.strip()
+    return None
+
+
+def _render_course_metadata_markdown(
+    *,
+    course_id: str,
+    course_name: str,
+    semester: str | None,
+    course_code: str | None,
+    course_code_base: str | None,
+    professors: list[str],
+    course_url: str | None,
+) -> str:
+    lines = [
+        "# Course Metadata",
+        "",
+        f"- Course ID: `{course_id}`",
+        f"- Course Name: {course_name}",
+        f"- Semester: {semester or '(not detected)'}",
+        f"- Course Code: {course_code or '(not detected)'}",
+        f"- Course Code Base: {course_code_base or '(not detected)'}",
+        f"- Professors: {', '.join(professors) if professors else '(not detected)'}",
+        f"- KLMS URL: {course_url or '(not detected)'}",
+        f"- Last Updated (UTC): {_utc_now_iso()}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+async def _write_course_metadata_markdown(course_id: str) -> Path:
+    info = await _get_course_info(course_id, use_cache=False)
+    term_label = await _term_label_for_course(course_id)
+    professors = [str(p).strip() for p in (info.get("professors") or []) if str(p).strip()]
+    markdown = _render_course_metadata_markdown(
+        course_id=str(info.get("course_id") or course_id),
+        course_name=str(info.get("course_title") or f"course-{course_id}"),
+        semester=term_label,
+        course_code=str(info.get("course_code")).strip() if info.get("course_code") else None,
+        course_code_base=str(info.get("course_code_base")).strip() if info.get("course_code_base") else None,
+        professors=professors,
+        course_url=str(info.get("course_url")).strip() if info.get("course_url") else None,
+    )
+    course_dir = DOWNLOAD_ROOT / _sanitize_relpath(course_id)
+    course_dir.mkdir(parents=True, exist_ok=True)
+    doc_path = course_dir / "COURSE.md"
+    doc_path.write_text(markdown, encoding="utf-8")
+    return doc_path
+
+
 async def klms_download_file(
     url: str,
     *,
@@ -2557,6 +3095,7 @@ async def klms_download_file(
     _ensure_private_dirs()
 
     resolved_url = _abs_url(config.base_url, url)
+    course_id_hint = _infer_course_id_for_download(resolved_url, subdir)
     if _is_video_url(resolved_url) or (filename and _is_video_filename(filename)):
         return {"skipped": True, "reason": "video", "url": resolved_url}
 
@@ -2607,17 +3146,44 @@ async def klms_download_file(
             out_dir.mkdir(parents=True, exist_ok=True)
 
         out_path = out_dir / final_name
+
+        course_metadata_path: str | None = None
+        course_metadata_error: str | None = None
+
+        async def ensure_course_metadata() -> None:
+            nonlocal course_metadata_path, course_metadata_error
+            if not course_id_hint:
+                return
+            try:
+                doc_path = await _write_course_metadata_markdown(course_id_hint)
+                course_metadata_path = str(doc_path)
+            except Exception as exc:  # noqa: BLE001
+                course_metadata_error = str(exc)
+
         if out_path.exists() and if_exists == "skip":
+            await ensure_course_metadata()
             return {
                 "skipped": True,
                 "reason": "exists",
                 "path": str(out_path),
                 "url": resolved_url,
                 "auth_mode": auth_mode,
+                "course_id": course_id_hint,
+                "course_metadata_path": course_metadata_path,
+                "course_metadata_error": course_metadata_error,
             }
 
         await download.save_as(str(out_path))
-        return {"ok": True, "path": str(out_path), "url": resolved_url, "auth_mode": auth_mode}
+        await ensure_course_metadata()
+        return {
+            "ok": True,
+            "path": str(out_path),
+            "url": resolved_url,
+            "auth_mode": auth_mode,
+            "course_id": course_id_hint,
+            "course_metadata_path": course_metadata_path,
+            "course_metadata_error": course_metadata_error,
+        }
 
     async with _borrow_authenticated_context(headless=True, accept_downloads=True) as (context, auth_mode):
         return await run_with_context(context, auth_mode)
@@ -2965,7 +3531,7 @@ def klms_bootstrap_login(base_url: str | None = None) -> dict[str, Any]:
         "base_url": login_base_url,
         "profile_path": str(PROFILE_DIR),
         "storage_state_path": str(STORAGE_STATE_PATH),
-        "preferred_mode": "storage_state",
+        "preferred_mode": "profile",
     }
 
 

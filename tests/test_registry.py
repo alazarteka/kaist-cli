@@ -1,0 +1,33 @@
+from __future__ import annotations
+
+import pytest
+
+from kaist_cli.cli.parser import build_parser
+
+
+def test_registry_registers_core_and_system_commands() -> None:
+    parser = build_parser()
+
+    args_version = parser.parse_args(["version"])
+    assert args_version.system == "version"
+    assert callable(args_version.handler)
+
+    args_update = parser.parse_args(["update", "--check"])
+    assert args_update.system == "update"
+    assert callable(args_update.handler)
+
+    args_portal = parser.parse_args(["portal", "status"])
+    assert args_portal.system == "portal"
+    assert callable(args_portal.handler)
+
+    args_klms = parser.parse_args(["klms", "list", "courses"])
+    assert args_klms.system == "klms"
+    assert args_klms.group == "list"
+    assert args_klms.resource == "courses"
+    assert callable(args_klms.handler)
+
+
+def test_old_flat_klms_commands_are_not_parseable() -> None:
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["klms", "courses"])
