@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
-from .... import klms as legacy
+def _legacy() -> Any:
+    from .... import klms as legacy
+
+    return legacy
 
 
 async def run(*, update: bool = True, max_notice_pages: int = 3) -> dict[str, object]:
-    return await legacy.klms_sync_snapshot(update=update, max_notice_pages=max_notice_pages)
+    return await _legacy().klms_sync_snapshot(update=update, max_notice_pages=max_notice_pages)
 
 
 def status() -> dict[str, object]:
-    snapshot_path = Path(legacy.SNAPSHOT_PATH)
+    snapshot_path = Path(_legacy().SNAPSHOT_PATH)
     if not snapshot_path.exists():
         return {
             "ok": True,
@@ -36,7 +40,7 @@ def status() -> dict[str, object]:
 
 
 def reset() -> dict[str, object]:
-    snapshot_path = Path(legacy.SNAPSHOT_PATH)
+    snapshot_path = Path(_legacy().SNAPSHOT_PATH)
     existed = snapshot_path.exists()
     if existed:
         snapshot_path.unlink()

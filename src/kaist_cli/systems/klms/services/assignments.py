@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from .... import klms as legacy
+from typing import Any
+
+
+def _legacy() -> Any:
+    from .... import klms as legacy
+
+    return legacy
 
 
 async def list_assignments(
@@ -9,7 +15,7 @@ async def list_assignments(
     since_iso: str | None = None,
     limit: int | None = None,
 ) -> list[dict[str, object]]:
-    return await legacy.klms_list_assignments(course_id=course_id, since_iso=since_iso, limit=limit)
+    return await _legacy().klms_list_assignments(course_id=course_id, since_iso=since_iso, limit=limit)
 
 
 async def get_assignment(assignment_id: str, *, course_id: str | None = None) -> dict[str, object]:

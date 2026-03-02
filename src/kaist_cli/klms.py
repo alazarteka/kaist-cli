@@ -18,6 +18,7 @@ import contextvars
 import os
 import re
 import time
+import subprocess
 import sys
 import html as _html
 import json
@@ -29,7 +30,6 @@ from typing import Any, AsyncIterator, Literal
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from bs4 import BeautifulSoup  # type: ignore[import-untyped]
-from playwright.async_api import async_playwright  # type: ignore[import-untyped]
 
 from .storage import read_json_file, update_json_file, write_json_file_atomic
 
@@ -50,6 +50,7 @@ SNAPSHOT_PATH = PRIVATE_ROOT / "snapshot.json"
 CACHE_PATH = PRIVATE_ROOT / "cache.json"
 ENDPOINT_DISCOVERY_PATH = PRIVATE_ROOT / "endpoint_discovery.json"
 API_MAP_PATH = PRIVATE_ROOT / "api_map.json"
+PLAYWRIGHT_BROWSERS_DIR = PRIVATE_ROOT / "playwright-browsers"
 
 _RUNTIME_CONTEXT: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
     "klms_runtime_context",
@@ -68,6 +69,78 @@ def _ensure_private_dirs() -> None:
     except PermissionError:
         pass
     DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _configure_playwright_env() -> Path:
+    _ensure_private_dirs()
+    PLAYWRIGHT_BROWSERS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(PLAYWRIGHT_BROWSERS_DIR, 0o700)
+    except PermissionError:
+        pass
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(PLAYWRIGHT_BROWSERS_DIR))
+    return Path(os.environ["PLAYWRIGHT_BROWSERS_PATH"]).expanduser()
+
+
+def _is_missing_browser_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return (
+        "executable doesn't exist" in message
+        or "download new browsers" in message
+        or "playwright install" in message
+    )
+
+
+def _playwright_install_cmd() -> tuple[list[str], dict[str, str]]:
+    _configure_playwright_env()
+    from playwright._impl._driver import compute_driver_executable, get_driver_env  # type: ignore[import-untyped]
+
+    node_path, cli_path = compute_driver_executable()
+    env = os.environ.copy()
+    env.update(get_driver_env())
+    env["PLAYWRIGHT_BROWSERS_PATH"] = os.environ["PLAYWRIGHT_BROWSERS_PATH"]
+    return [node_path, cli_path], env
+
+
+def _tail_text(text: str, *, max_lines: int = 20) -> str:
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    return "\n".join(lines[-max_lines:])
+
+
+def klms_install_browser(*, force: bool = False) -> dict[str, Any]:
+    browser_path = _configure_playwright_env()
+    driver_cmd, env = _playwright_install_cmd()
+    cmd = [*driver_cmd, "install"]
+    if force:
+        cmd.append("--force")
+    cmd.append("chromium")
+    completed = subprocess.run(  # noqa: S603
+        cmd,
+        check=False,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    result = {
+        "ok": completed.returncode == 0,
+        "browser": "chromium",
+        "forced": force,
+        "install_dir": str(browser_path),
+        "command": cmd,
+    }
+    stdout_tail = _tail_text(completed.stdout)
+    stderr_tail = _tail_text(completed.stderr)
+    if stdout_tail:
+        result["stdout_tail"] = stdout_tail
+    if stderr_tail:
+        result["stderr_tail"] = stderr_tail
+    if completed.returncode != 0:
+        hint = "Run `kaist klms auth install-browser --force` to retry."
+        detail = stderr_tail or stdout_tail or f"exit code {completed.returncode}"
+        raise RuntimeError(f"Failed to install Playwright Chromium ({detail}). {hint}")
+    return result
 
 
 def _read_positive_int_env(name: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -688,14 +761,39 @@ async def _authenticated_context(
     except Exception:
         config = None
 
+    _configure_playwright_env()
+    from playwright.async_api import async_playwright  # type: ignore[import-untyped]
+
+    async def launch_profile_context(playwright: Any) -> Any:
+        try:
+            return await playwright.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE_DIR),
+                headless=headless,
+                accept_downloads=accept_downloads,
+            )
+        except Exception as exc:
+            if not _is_missing_browser_error(exc):
+                raise
+            await asyncio.to_thread(klms_install_browser, force=False)
+            return await playwright.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE_DIR),
+                headless=headless,
+                accept_downloads=accept_downloads,
+            )
+
+    async def launch_browser(playwright: Any) -> Any:
+        try:
+            return await playwright.chromium.launch(headless=headless)
+        except Exception as exc:
+            if not _is_missing_browser_error(exc):
+                raise
+            await asyncio.to_thread(klms_install_browser, force=False)
+            return await playwright.chromium.launch(headless=headless)
+
     async with async_playwright() as p:
         if mode == "profile":
             try:
-                context = await p.chromium.launch_persistent_context(
-                    user_data_dir=str(PROFILE_DIR),
-                    headless=headless,
-                    accept_downloads=accept_downloads,
-                )
+                context = await launch_profile_context(p)
             except Exception:
                 if not _has_storage_state_session():
                     raise
@@ -714,7 +812,7 @@ async def _authenticated_context(
                         await context.close()
                     return
 
-        browser = await p.chromium.launch(headless=headless)
+        browser = await launch_browser(p)
         context = await browser.new_context(
             storage_state=str(STORAGE_STATE_PATH),
             accept_downloads=accept_downloads,
@@ -1506,6 +1604,7 @@ async def klms_status(validate: bool = True) -> dict[str, Any]:
         "config_path": str(CONFIG_PATH),
         "profile_path": str(PROFILE_DIR),
         "storage_state_path": str(STORAGE_STATE_PATH),
+        "playwright_browsers_path": str(_configure_playwright_env()),
         "cache_path": str(CACHE_PATH),
         "download_root": str(DOWNLOAD_ROOT),
         "concurrency_limit": _concurrency_limit(),
@@ -3496,7 +3595,7 @@ def klms_bootstrap_login(base_url: str | None = None) -> dict[str, Any]:
     """
     Open an interactive browser, let the user log in, then persist auth artifacts.
     """
-    _ensure_private_dirs()
+    _configure_playwright_env()
     login_base_url = base_url.strip().rstrip("/") if base_url else _load_config().base_url
     from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
 
@@ -3509,10 +3608,20 @@ def klms_bootstrap_login(base_url: str | None = None) -> dict[str, Any]:
     print(f"Opening browser to: {login_base_url}", file=sys.stderr)
     print("Log in fully, navigate to a course page, then return here and press Enter.", file=sys.stderr)
     with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            headless=False,
-        )
+        try:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE_DIR),
+                headless=False,
+            )
+        except Exception as exc:
+            if not _is_missing_browser_error(exc):
+                raise
+            print("Playwright Chromium runtime not found; installing now...", file=sys.stderr)
+            klms_install_browser(force=False)
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE_DIR),
+                headless=False,
+            )
         page = context.new_page()
         page.goto(login_base_url, wait_until="domcontentloaded", timeout=30_000)
         print("Press Enter to save session and exit... ", end="", file=sys.stderr, flush=True)

@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from .... import klms as legacy
+from typing import Any
+
+
+def _legacy() -> Any:
+    from .... import klms as legacy
+
+    return legacy
 
 
 async def get_file(
@@ -10,4 +16,4 @@ async def get_file(
     subdir: str | None = None,
     if_exists: str = "skip",
 ) -> dict[str, object]:
-    return await legacy.klms_download_file(url, filename=filename, subdir=subdir, if_exists=if_exists)
+    return await _legacy().klms_download_file(url, filename=filename, subdir=subdir, if_exists=if_exists)

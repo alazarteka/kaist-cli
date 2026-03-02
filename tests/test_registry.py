@@ -26,6 +26,12 @@ def test_registry_registers_core_and_system_commands() -> None:
     assert args_klms.resource == "courses"
     assert callable(args_klms.handler)
 
+    args_install_browser = parser.parse_args(["klms", "auth", "install-browser"])
+    assert args_install_browser.system == "klms"
+    assert args_install_browser.group == "auth"
+    assert args_install_browser.action == "install-browser"
+    assert callable(args_install_browser.handler)
+
 
 def test_old_flat_klms_commands_are_not_parseable() -> None:
     parser = build_parser()

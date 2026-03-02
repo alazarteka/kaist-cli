@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from ... import klms as legacy
+def _legacy() -> Any:
+    from ... import klms as legacy
+
+    return legacy
 
 
 def set_config(
@@ -15,7 +18,7 @@ def set_config(
     exclude_course_title_patterns: list[str] | None = None,
     merge_existing: bool = True,
 ) -> dict[str, Any]:
-    return legacy.klms_configure(
+    return _legacy().klms_configure(
         base_url,
         dashboard_path=dashboard_path,
         course_ids=course_ids,
@@ -26,4 +29,4 @@ def set_config(
 
 
 def show_config() -> dict[str, Any]:
-    return asyncio.run(legacy.klms_status(validate=False))
+    return asyncio.run(_legacy().klms_status(validate=False))

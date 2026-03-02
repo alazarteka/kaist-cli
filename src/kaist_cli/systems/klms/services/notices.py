@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from .... import klms as legacy
+from typing import Any
+
+
+def _legacy() -> Any:
+    from .... import klms as legacy
+
+    return legacy
 
 
 async def list_notices(
@@ -11,7 +17,7 @@ async def list_notices(
     since_iso: str | None = None,
     limit: int | None = None,
 ) -> list[dict[str, object]]:
-    return await legacy.klms_list_notices(
+    return await _legacy().klms_list_notices(
         notice_board_id=notice_board_id,
         max_pages=max_pages,
         stop_post_id=stop_post_id,
@@ -27,7 +33,7 @@ async def get_notice(
     max_pages: int = 3,
     include_html: bool = False,
 ) -> dict[str, object]:
-    return await legacy.klms_get_notice(
+    return await _legacy().klms_get_notice(
         notice_id,
         notice_board_id=notice_board_id,
         max_pages=max_pages,

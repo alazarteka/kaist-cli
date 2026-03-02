@@ -15,7 +15,7 @@ Current scope:
 
 ```bash
 uv sync
-uv run playwright install chromium
+uv run kaist klms auth install-browser
 uv run kaist klms config set --base-url https://klms.kaist.ac.kr
 uv run kaist klms auth login
 uv run kaist klms auth status
@@ -29,7 +29,7 @@ Stable workflows:
 - `kaist update --check`
 - `kaist update`
 - `kaist klms config set|show`
-- `kaist klms auth login|status|refresh|doctor`
+- `kaist klms auth login|install-browser|status|refresh|doctor`
 - `kaist klms list courses [--limit N]`
 - `kaist klms list assignments [--course-id <id>] [--since <ISO>] [--limit N]`
 - `kaist klms list notices [--notice-board-id <id>] [--max-pages N] [--stop-post-id <id>] [--since <ISO>] [--limit N]`
@@ -84,6 +84,7 @@ with best-effort course metadata (term, title, code, professors, URL).
 KLMS auth is persisted in:
 - `~/.kaist-cli/private/klms/profile/` (preferred, full Playwright browser profile)
 - `~/.kaist-cli/private/klms/storage_state.json` (fallback/debug export)
+- `~/.kaist-cli/private/klms/playwright-browsers/` (Playwright Chromium runtime cache)
 
 ## Performance
 
@@ -102,7 +103,7 @@ Planned release path uses unsigned standalone binaries published on GitHub Relea
 Manual install (example for macOS Apple Silicon):
 
 ```bash
-TAG=v0.1.2
+TAG=v0.1.3
 REPO=alazarteka/kaist-cli
 TARGET=darwin-arm64
 ASSET="kaist-${TAG}-${TARGET}.tar.gz"

@@ -5,7 +5,6 @@ import asyncio
 import textwrap
 from typing import Any, Callable
 
-from ... import klms as legacy
 from ...core.contracts import SystemAdapter
 from . import auth as klms_auth
 from . import config as klms_config
@@ -53,6 +52,12 @@ class KlmsAdapter(SystemAdapter):
     @staticmethod
     def _run_async(coro: Any) -> Any:
         return asyncio.run(coro)
+
+    @staticmethod
+    def _legacy() -> Any:
+        from ... import klms as legacy
+
+        return legacy
 
     @staticmethod
     def _run_klms_async(coro_factory: Callable[[], Any]) -> Any:
@@ -118,6 +123,18 @@ class KlmsAdapter(SystemAdapter):
             handler=self._handle_auth_login,
             schema_name="kaist.klms.auth.login.v1",
             command_path="klms auth login",
+        )
+
+        auth_install = auth_sub.add_parser(
+            "install-browser",
+            help="Install Playwright Chromium runtime for KLMS auth commands",
+            formatter_class=_HelpFormatter,
+        )
+        auth_install.add_argument("--force", action="store_true", help="Reinstall Chromium even if already installed.")
+        auth_install.set_defaults(
+            handler=self._handle_auth_install_browser,
+            schema_name="kaist.klms.auth.install_browser.v1",
+            command_path="klms auth install-browser",
         )
 
         auth_status = auth_sub.add_parser("status", help="Inspect auth/config status", formatter_class=_HelpFormatter)
@@ -362,6 +379,9 @@ class KlmsAdapter(SystemAdapter):
     def _handle_auth_status(self, args: argparse.Namespace) -> dict[str, Any]:
         return self._run_async(klms_auth.status(validate=not args.no_validate))
 
+    def _handle_auth_install_browser(self, args: argparse.Namespace) -> dict[str, Any]:
+        return klms_auth.install_browser(force=args.force)
+
     def _handle_auth_refresh(self, args: argparse.Namespace) -> dict[str, Any]:
         return klms_auth.refresh(args.base_url, validate=not args.no_validate)
 
@@ -433,11 +453,11 @@ class KlmsAdapter(SystemAdapter):
         )
 
     def _handle_dev_fetch_html(self, args: argparse.Namespace) -> Any:
-        return self._run_klms_async(lambda: legacy.klms_fetch_html(args.path_or_url))
+        return self._run_klms_async(lambda: self._legacy().klms_fetch_html(args.path_or_url))
 
     def _handle_dev_extract(self, args: argparse.Namespace) -> Any:
         return self._run_klms_async(
-            lambda: legacy.klms_extract_matches(
+            lambda: self._legacy().klms_extract_matches(
                 args.path_or_url,
                 args.pattern,
                 max_matches=args.max_matches,
@@ -456,11 +476,11 @@ class KlmsAdapter(SystemAdapter):
 
     def _handle_dev_discover_api(self, args: argparse.Namespace) -> Any:
         return self._run_klms_async(
-            lambda: legacy.klms_discover_api(
+            lambda: self._legacy().klms_discover_api(
                 max_courses=args.max_courses,
                 max_notice_boards=args.max_notice_boards,
             )
         )
 
     def _handle_dev_map_api(self, args: argparse.Namespace) -> dict[str, Any]:
-        return legacy.klms_map_api(report_path=args.report_path)
+        return self._legacy().klms_map_api(report_path=args.report_path)

@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 
-from .... import klms as legacy
+from typing import Any
+
+
+def _legacy() -> Any:
+    from .... import klms as legacy
+
+    return legacy
 
 
 def parse_notice_items(
@@ -13,7 +19,7 @@ def parse_notice_items(
     fallback_url_path: str,
 ) -> list[dict[str, object]]:
     soup = BeautifulSoup(html, "html.parser")
-    return legacy._parse_notice_items_from_soup(  # type: ignore[attr-defined]
+    return _legacy()._parse_notice_items_from_soup(  # type: ignore[attr-defined]
         soup,
         board_id=board_id,
         base_url=base_url,
@@ -30,7 +36,7 @@ def parse_notice_detail(
     fallback_notice_id: str | None = None,
     include_html: bool = False,
 ) -> dict[str, object]:
-    return legacy._parse_notice_detail_from_html(  # type: ignore[attr-defined]
+    return _legacy()._parse_notice_detail_from_html(  # type: ignore[attr-defined]
         html,
         base_url=base_url,
         url=url,
