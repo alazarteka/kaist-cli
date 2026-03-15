@@ -70,6 +70,20 @@ def infer_source(data: Any) -> str:
     return "mixed"
 
 
+def explicit_source(args: argparse.Namespace) -> str | None:
+    value = getattr(args, "_explicit_source", None)
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def explicit_capability(args: argparse.Namespace) -> str | None:
+    value = getattr(args, "_explicit_capability", None)
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
 def extract_cursor_fields(data: Any) -> tuple[str | None, str | None]:
     if not isinstance(data, dict):
         return None, None
@@ -95,16 +109,20 @@ def command_label(args: argparse.Namespace) -> str:
 
 def success_envelope(args: argparse.Namespace, data: Any) -> dict[str, Any]:
     cursor, next_cursor = extract_cursor_fields(data)
+    meta = {
+        "source": explicit_source(args) or infer_source(data),
+        "cursor": cursor,
+        "next_cursor": next_cursor,
+        "command": command_label(args),
+    }
+    capability = explicit_capability(args)
+    if capability is not None:
+        meta["capability"] = capability
     return {
         "schema": schema_for_args(args),
         "ok": True,
         "generated_at": utc_now_iso(),
-        "meta": {
-            "source": infer_source(data),
-            "cursor": cursor,
-            "next_cursor": next_cursor,
-            "command": command_label(args),
-        },
+        "meta": meta,
         "data": data,
     }
 

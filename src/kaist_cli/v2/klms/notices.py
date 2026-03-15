@@ -1,0 +1,1166 @@
+from __future__ import annotations
+
+import re
+from datetime import datetime, timezone
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+from bs4 import BeautifulSoup  # type: ignore[import-untyped]
+
+from ..contracts import CommandError, CommandResult
+from .auth import AuthService, looks_logged_out_html, looks_login_url
+from .cache import list_cache_entries, load_cache_entry, save_cache_value
+from .assignments import _attachment_filename_from_url, _looks_like_attachment_url, _parse_datetime_guess
+from .config import KlmsConfig, abs_url, load_config
+from .courses import _discover_courses_from_dashboard, _is_noise_course, _norm_text
+from .deadline import RefreshDeadline
+from .models import Notice
+from .paths import KlmsPaths
+from .provider_state import ProviderLoad
+from .session import KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
+
+NOTICE_BOARD_TTL_SECONDS = 6 * 3600
+NOTICE_LIST_TTL_SECONDS = 5 * 60
+MAX_NOTICE_HTTP_WORKERS = 4
+
+
+def _extract_course_ids_from_dashboard(
+    html: str,
+    *,
+    base_url: str,
+    configured_ids: tuple[str, ...],
+    exclude_patterns: tuple[str, ...],
+) -> list[str]:
+    out: list[str] = []
+    for course in _discover_courses_from_dashboard(html, base_url=base_url):
+        if _is_noise_course(course.title, exclude_patterns):
+            continue
+        out.append(str(course.id).strip())
+    out.extend(str(course_id).strip() for course_id in configured_ids if str(course_id).strip())
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in out:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _discover_notice_board_ids_from_course_page(html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    found: list[str] = []
+
+    def in_header_like_region(element: Any) -> bool:
+        current = element
+        for _ in range(12):
+            if not current or not getattr(current, "attrs", None):
+                break
+            classes = " ".join(current.attrs.get("class", [])).lower()
+            if any(marker in classes for marker in ("ks-header", "all-menu", "tooltip-layer", "breadcrumb", "navbar", "footer", "menu")):
+                return True
+            current = current.parent
+        return False
+
+    for anchor in soup.find_all("a", href=True):
+        href = str(anchor["href"])
+        if "mod/courseboard/view.php" not in href:
+            continue
+        match = re.search(r"[?&]id=(\d+)", href)
+        if not match:
+            continue
+        board_id = match.group(1)
+        label = _norm_text(anchor.get_text(" ", strip=True)).lower()
+        if anchor.get("target") == "_blank" or in_header_like_region(anchor):
+            continue
+        if board_id in {"32044", "32045", "32047", "531193"}:
+            continue
+        if label in {"notice", "guide to klms", "q&a", "faq"}:
+            continue
+        found.append(board_id)
+    return list(dict.fromkeys(found))
+
+
+def _extract_pagination_pages(soup: BeautifulSoup) -> list[int]:
+    pages: set[int] = set()
+    for anchor in soup.find_all("a", href=True):
+        href = str(anchor.get("href") or "")
+        for pattern in (r"[?&]page=(\d+)", r"[?&]p=(\d+)"):
+            match = re.search(pattern, href)
+            if match:
+                pages.add(int(match.group(1)))
+                break
+    return sorted(pages)
+
+
+def _plan_notice_page_sequence(first_soup: BeautifulSoup, *, max_pages: int) -> tuple[int, list[int]]:
+    pages = [page for page in _extract_pagination_pages(first_soup) if page >= 0]
+    if pages:
+        first_page_index = 0 if 0 in pages else min(pages)
+        sequence = [first_page_index] + [page for page in pages if page != first_page_index]
+    else:
+        first_page_index = 0
+        sequence = [0, 1]
+    return first_page_index, sequence[: max(0, max_pages)]
+
+
+def _extract_notice_id_from_href(href: str | None) -> str | None:
+    if not href:
+        return None
+    match = re.search(r"[?&]bwid=(\d+)", href)
+    if match:
+        return match.group(1)
+    match = re.search(r"[?&]id=(\d+)", href)
+    return match.group(1) if match else None
+
+
+def _looks_like_hidden_notice(title: str) -> bool:
+    text = _norm_text(title).lower()
+    if not text:
+        return True
+    markers = (
+        "this is a hidden post",
+        "hidden post",
+        "비밀글",
+        "숨김글",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _parse_notice_items_from_soup(
+    soup: BeautifulSoup,
+    *,
+    board_id: str,
+    base_url: str,
+    fallback_url_path: str,
+) -> list[Notice]:
+    def find_table_with_title_headers() -> tuple[list[str], Any] | None:
+        for table in soup.find_all("table"):
+            rows = table.find_all("tr")
+            if not rows:
+                continue
+            headers = [_norm_text(cell.get_text(" ", strip=True)) for cell in rows[0].find_all(["th", "td"])]
+            headers_norm = [header.lower() for header in headers]
+            if any(any(needle in header for needle in ("title", "제목", "subject")) for header in headers_norm):
+                return headers, table
+        return None
+
+    found = find_table_with_title_headers()
+    if found:
+        headers, table = found
+        headers_norm = [header.lower() for header in headers]
+
+        def col_index(*needles: str) -> int | None:
+            for needle in needles:
+                for index, header in enumerate(headers_norm):
+                    if needle in header:
+                        return index
+            return None
+
+        title_i = col_index("title", "제목", "subject") or 0
+        date_i = col_index("date", "작성", "등록", "posted", "일자")
+        rows = table.find_all("tr")
+        if rows and rows[0].find_all("th"):
+            rows = rows[1:]
+
+        notices: list[Notice] = []
+        for row in rows:
+            cells = row.find_all(["td", "th"])
+            if not cells or title_i >= len(cells):
+                continue
+            title_cell = cells[title_i]
+            link = title_cell.find("a", href=True)
+            title = _norm_text(title_cell.get_text(" ", strip=True))
+            href = str(link["href"]) if link else None
+            if _looks_like_hidden_notice(title):
+                continue
+            posted_raw = None
+            if date_i is not None and date_i < len(cells):
+                posted_raw = _norm_text(cells[date_i].get_text(" ", strip=True)) or None
+            notice_id = _extract_notice_id_from_href(href)
+            if href and "article.php" in href and notice_id is None:
+                continue
+            notices.append(
+                Notice(
+                    board_id=board_id,
+                    id=notice_id,
+                    title=title or "notice",
+                    url=abs_url(base_url, href) if href else abs_url(base_url, fallback_url_path),
+                    posted_raw=posted_raw,
+                    posted_iso=_parse_datetime_guess(posted_raw) if posted_raw else None,
+                    source="html:courseboard",
+                    confidence=0.66,
+                )
+            )
+        return notices
+
+    out: list[Notice] = []
+    for anchor in soup.find_all("a", href=True):
+        href = str(anchor.get("href") or "")
+        if "mod/courseboard" not in href:
+            continue
+        title = _norm_text(anchor.get_text(" ", strip=True))
+        if not title or _looks_like_hidden_notice(title):
+            continue
+        notice_id = _extract_notice_id_from_href(href)
+        if "article.php" not in href or notice_id is None:
+            continue
+        out.append(
+            Notice(
+                board_id=board_id,
+                id=notice_id,
+                title=title,
+                url=abs_url(base_url, href),
+                posted_raw=None,
+                posted_iso=None,
+                source="html:courseboard-fallback",
+                confidence=0.58,
+            )
+        )
+    return out
+
+
+def _extract_notice_ids_from_url(url: str | None) -> tuple[str | None, str | None]:
+    if not url:
+        return None, None
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    board_id = (query.get("id") or [None])[0]
+    notice_id = (query.get("bwid") or [None])[0]
+    return (str(board_id).strip() or None) if isinstance(board_id, str) else None, (str(notice_id).strip() or None) if isinstance(notice_id, str) else None
+
+
+def _extract_notice_title_from_soup(soup: BeautifulSoup) -> str | None:
+    for selector in ("h1", "h2", "#page-header h1", ".subject", ".board-title", ".article-title", ".post-title"):
+        for node in soup.select(selector):
+            title = _norm_text(node.get_text(" ", strip=True))
+            if title:
+                return title
+    og_title = soup.select_one('meta[property="og:title"]')
+    if og_title and isinstance(og_title.get("content"), str):
+        title = _norm_text(str(og_title.get("content") or ""))
+        if title:
+            return title
+    if soup.title:
+        title = _norm_text(soup.title.get_text(" ", strip=True))
+        if title and ":" in title:
+            left = _norm_text(title.split(":", 1)[0])
+            if left:
+                return left
+        return title or None
+    return None
+
+
+def _extract_notice_meta_from_soup(soup: BeautifulSoup) -> tuple[str | None, str | None]:
+    author = None
+    posted_raw = None
+    label_patterns = {
+        "author": re.compile(r"^(?:author|writer|작성자|등록자)\s*[:：]?\s*(.+)$", flags=re.IGNORECASE),
+        "posted": re.compile(r"^(?:wrote on|date|posted|작성일|등록일)\s*[:：]?\s*(.+)$", flags=re.IGNORECASE),
+    }
+
+    for selector, key in (
+        (".courseboard_view .info .writer", "author"),
+        (".courseboard_view .info .date", "posted"),
+        (".courseboard_view .info .regdate", "posted"),
+    ):
+        node = soup.select_one(selector)
+        if not node:
+            continue
+        text = _norm_text(node.get_text(" ", strip=True))
+        if not text:
+            continue
+        match = label_patterns[key].match(text)
+        value = _norm_text(match.group(1) if match else text)
+        if key == "author" and not author and value:
+            author = value
+        if key == "posted" and not posted_raw and value:
+            posted_raw = value
+
+    for row in soup.select("table tr"):
+        th = row.find("th")
+        td = row.find("td")
+        if not th or not td:
+            continue
+        key = _norm_text(th.get_text(" ", strip=True)).lower()
+        value = _norm_text(td.get_text(" ", strip=True))
+        if not value:
+            continue
+        if not author and any(token in key for token in ("작성자", "author", "writer", "등록자")):
+            author = value
+        if not posted_raw and any(token in key for token in ("작성일", "등록일", "date", "posted", "시간")):
+            posted_raw = value
+
+    if not author or not posted_raw:
+        for node in soup.select(".courseboard_view .info .author, .courseboard_view .info .writer, .courseboard_view .info .user, .courseboard_view .info .posted, .courseboard_view .info .date, .courseboard_view .info .time, .courseboard_view .info .regdate, .courseboard_view .info, .post-info"):
+            text = _norm_text(node.get_text(" ", strip=True))
+            if not text:
+                continue
+            if not author:
+                match = re.search(r"(?:작성자|author|writer)\s*[:：]\s*(.+?)(?:\s+(?:wrote on|작성일|date|posted)\s*[:：].+)?$", text, flags=re.IGNORECASE)
+                if match:
+                    author = _norm_text(match.group(1))
+            if not posted_raw:
+                match = re.search(r"(?:wrote on|작성일|등록일|date|posted)\s*[:：]\s*(.+?)(?:\s+(?:views|조회)\s*[:：].+)?$", text, flags=re.IGNORECASE)
+                if match:
+                    posted_raw = _norm_text(match.group(1))
+    return author, posted_raw
+
+
+def _select_notice_body_node(soup: BeautifulSoup) -> Any:
+    selectors = (
+        (".courseboard_view .content", True),
+        (".courseboard .content", True),
+        (".courseboard_view .text_to_html", True),
+        ".board_view .content",
+        ".board_view .view-content",
+        ".board_view .article-content",
+        ".article-content",
+        ".post-content",
+        ".entry-content",
+        "[class*=board][class*=content]",
+        "#region-main .content",
+        "#region-main",
+        "article",
+        "main",
+    )
+    best = None
+    best_score = -1
+    normalized_selectors: list[tuple[str, bool]] = []
+    for selector in selectors:
+        if isinstance(selector, tuple):
+            normalized_selectors.append(selector)
+        else:
+            normalized_selectors.append((selector, False))
+
+    for selector, prefer_first in normalized_selectors:
+        for node in soup.select(selector):
+            text = _norm_text(node.get_text(" ", strip=True))
+            if len(text) < 40:
+                continue
+            if prefer_first:
+                return node
+            score = len(text)
+            if node.find("p"):
+                score += 40
+            if len(node.find_all("a", href=True)) > 30:
+                score -= 300
+            if score > best_score:
+                best = node
+                best_score = score
+    return best or soup.body or soup
+
+
+def _sanitize_notice_body_node(body_node: Any) -> tuple[str | None, str | None]:
+    fragment = BeautifulSoup(str(body_node), "html.parser")
+    for selector in (
+        ".pre_next",
+        ".button_area",
+        ".modal",
+        ".mod-tabmenus-wrap",
+        ".activity-navigation",
+        ".info",
+        ".subject",
+        "form",
+        "button",
+    ):
+        for node in fragment.select(selector):
+            node.decompose()
+    root = fragment.body or fragment
+    body_text = _norm_text(root.get_text("\n", strip=True)) or None
+    body_html = str(root) if body_text else None
+    return body_text, body_html
+
+
+def _collect_notice_attachments(soup: BeautifulSoup, *, base_url: str) -> tuple[dict[str, Any], ...]:
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for link in soup.find_all("a", href=True):
+        href = str(link.get("href") or "").strip()
+        if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+            continue
+        url = abs_url(base_url, href)
+        classes = " ".join(str(item) for item in (link.get("class") or [])).lower()
+        if not _looks_like_attachment_url(url) and not any(token in classes for token in ("attach", "download", "file")):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        title = _norm_text(link.get_text(" ", strip=True)) or _attachment_filename_from_url(url) or url
+        out.append(
+            {
+                "title": title,
+                "url": url,
+                "filename": _attachment_filename_from_url(url),
+            }
+        )
+    return tuple(out)
+
+
+def _iso_from_epoch_seconds(value: float | int | None) -> str | None:
+    if not isinstance(value, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    except Exception:
+        return None
+
+
+def _finalize_notice_items(items: list[Notice], *, since_iso: str | None, limit: int | None) -> list[Notice]:
+    filtered = items
+    if since_iso:
+        floor = str(since_iso).strip()
+        filtered = [item for item in filtered if item.posted_iso and item.posted_iso >= floor]
+    filtered = sorted(filtered, key=lambda item: (item.posted_iso is not None, item.posted_iso or "", item.title), reverse=True)
+    if limit is not None:
+        filtered = filtered[: max(0, limit)]
+    return filtered
+
+
+def _matching_notice_count(items: list[Notice], *, since_iso: str | None) -> int:
+    if not since_iso:
+        return len(items)
+    floor = str(since_iso).strip()
+    return sum(1 for item in items if item.posted_iso and item.posted_iso >= floor)
+
+
+def _provider_warning(code: str, message: str, **extra: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {"code": code, "message": message}
+    payload.update(extra)
+    return payload
+
+
+def _parse_notice_detail_from_html(
+    html: str,
+    *,
+    base_url: str,
+    url: str | None = None,
+    fallback_board_id: str | None = None,
+    fallback_notice_id: str | None = None,
+    include_html: bool = False,
+    auth_mode: str | None = None,
+) -> Notice:
+    soup = BeautifulSoup(html, "html.parser")
+    for node in soup(["script", "style", "noscript"]):
+        node.decompose()
+
+    board_from_url, notice_from_url = _extract_notice_ids_from_url(url)
+    board_id = fallback_board_id or board_from_url
+    notice_id = fallback_notice_id or notice_from_url
+    if not board_id or not notice_id:
+        for link in soup.find_all("a", href=True):
+            href = str(link.get("href") or "")
+            if "mod/courseboard/article.php" not in href:
+                continue
+            board_candidate, notice_candidate = _extract_notice_ids_from_url(href)
+            board_id = board_id or board_candidate
+            notice_id = notice_id or notice_candidate
+            if board_id and notice_id:
+                break
+
+    title = _extract_notice_title_from_soup(soup) or (f"notice-{notice_id}" if notice_id else "notice")
+    author, posted_raw = _extract_notice_meta_from_soup(soup)
+    posted_iso = _parse_datetime_guess(posted_raw) if posted_raw else None
+    body_node = _select_notice_body_node(soup)
+    body_text, body_html = _sanitize_notice_body_node(body_node)
+
+    return Notice(
+        board_id=board_id,
+        id=notice_id,
+        title=title,
+        url=url,
+        posted_raw=posted_raw,
+        posted_iso=posted_iso,
+        author=author,
+        body_text=body_text,
+        body_html=body_html if include_html else None,
+        attachments=_collect_notice_attachments(soup, base_url=base_url),
+        detail_available=bool(body_text),
+        source="html:courseboard-article",
+        confidence=0.78 if body_text else 0.62,
+        auth_mode=auth_mode,
+    )
+
+
+class NoticeService:
+    def __init__(self, paths: KlmsPaths, auth: AuthService) -> None:
+        self._paths = paths
+        self._auth = auth
+
+    @staticmethod
+    def _notice_board_cache_key(config: KlmsConfig, course_ids: list[str]) -> str:
+        return "::".join(
+            [
+                "notice-board-map-v2",
+                config.base_url.rstrip("/"),
+                config.dashboard_path,
+                ",".join(course_ids),
+            ]
+        )
+
+    @staticmethod
+    def _notice_list_cache_key(config: KlmsConfig, board_ids: list[str], max_pages: int) -> str:
+        return "::".join(
+            [
+                "notice-list-v2",
+                config.base_url.rstrip("/"),
+                str(max_pages),
+                ",".join(board_ids),
+            ]
+        )
+
+    def _load_notice_cache_entry(
+        self,
+        *,
+        config: KlmsConfig,
+        board_ids: list[str],
+        max_pages: int,
+    ) -> dict[str, Any] | None:
+        exact_key = self._notice_list_cache_key(config, board_ids, max_pages)
+        exact = load_cache_entry(self._paths, exact_key)
+        if exact is not None:
+            return exact
+
+        prefix = f"notice-list-v2::{config.base_url.rstrip('/')}::"
+        suffix = f"::{','.join(board_ids)}"
+        candidates = list_cache_entries(self._paths, prefixes=(prefix,))
+        matches: list[tuple[float, dict[str, Any]]] = []
+        for key, entry in candidates.items():
+            if not str(key).endswith(suffix):
+                continue
+            stored_at = float(entry.get("stored_at") or 0.0)
+            matches.append((stored_at, entry))
+        if not matches:
+            return None
+        matches.sort(key=lambda item: (bool(item[1].get("stale")), -item[0]))
+        return matches[0][1]
+
+    def list_with_context(
+        self,
+        *,
+        context: Any,
+        config: KlmsConfig,
+        auth_mode: str,
+        notice_board_id: str | None = None,
+        max_pages: int = 1,
+        since_iso: str | None = None,
+        limit: int | None = None,
+        bootstrap: KlmsSessionBootstrap | None = None,
+    ) -> CommandResult:
+        bootstrap = bootstrap or build_session_bootstrap(
+            self._paths,
+            context=context,
+            config=config,
+            auth_mode=auth_mode,
+        )
+        notices = self._list_html(
+            context=context,
+            config=config,
+            auth_mode=auth_mode,
+            notice_board_id=notice_board_id,
+            max_pages=max_pages,
+            since_iso=since_iso,
+            limit=limit,
+            bootstrap=bootstrap,
+        )
+        return CommandResult(data=[notice.to_dict() for notice in notices], source="html", capability="partial")
+
+    def load_for_dashboard(
+        self,
+        *,
+        context: Any,
+        config: KlmsConfig,
+        auth_mode: str,
+        notice_board_id: str | None = None,
+        max_pages: int = 1,
+        since_iso: str | None = None,
+        limit: int | None = None,
+        bootstrap: KlmsSessionBootstrap | None = None,
+        deadline: RefreshDeadline | None = None,
+        prefer_cache: bool = True,
+    ) -> ProviderLoad:
+        bootstrap = bootstrap or build_session_bootstrap(
+            self._paths,
+            context=context,
+            config=config,
+            auth_mode=auth_mode,
+        )
+        board_ids = self._resolve_notice_board_ids(
+            context=context,
+            config=config,
+            explicit_board_id=notice_board_id,
+            bootstrap=bootstrap,
+            deadline=deadline,
+            allow_stale_cache=True,
+        )
+        if not board_ids:
+            return ProviderLoad(
+                items=[],
+                source="html",
+                capability="degraded",
+                freshness_mode="live",
+                cache_hit=False,
+                stale=False,
+                fetched_at=None,
+                expires_at=None,
+                refresh_attempted=False,
+                ok=False,
+                warnings=(
+                    _provider_warning(
+                        "LIVE_REFRESH_FAILED",
+                        "No notice boards could be discovered for this session.",
+                    ),
+                ),
+            )
+
+        cache_key = self._notice_list_cache_key(config, board_ids, max_pages)
+        cache_entry = self._load_notice_cache_entry(config=config, board_ids=board_ids, max_pages=max_pages)
+        cached_rows = cache_entry.get("value") if isinstance(cache_entry, dict) else None
+        cached_items = [Notice(**row) for row in cached_rows if isinstance(row, dict)] if isinstance(cached_rows, list) else []
+        cached_filtered = _finalize_notice_items(cached_items, since_iso=since_iso, limit=limit)
+        if prefer_cache and cache_entry is not None and not bool(cache_entry.get("stale")):
+            return ProviderLoad(
+                items=[item.to_dict() for item in cached_filtered],
+                source="html",
+                capability="partial",
+                freshness_mode="cache",
+                cache_hit=True,
+                stale=False,
+                fetched_at=_iso_from_epoch_seconds(cache_entry.get("stored_at")),
+                expires_at=_iso_from_epoch_seconds(cache_entry.get("expires_at")),
+                refresh_attempted=False,
+                ok=True,
+            )
+
+        if deadline is not None and deadline.hard_expired():
+            if cache_entry is not None and cached_filtered:
+                warnings = [_provider_warning("LIVE_REFRESH_TIMEOUT", "Interactive refresh budget expired before notice refresh completed.")]
+                if bool(cache_entry.get("stale")):
+                    warnings.insert(0, _provider_warning("STALE_CACHE", "Returning stale notice cache because live refresh could not finish in time."))
+                return ProviderLoad(
+                    items=[item.to_dict() for item in cached_filtered],
+                    source="html",
+                    capability="partial",
+                    freshness_mode="cache",
+                    cache_hit=True,
+                    stale=bool(cache_entry.get("stale")),
+                    fetched_at=_iso_from_epoch_seconds(cache_entry.get("stored_at")),
+                    expires_at=_iso_from_epoch_seconds(cache_entry.get("expires_at")),
+                    refresh_attempted=True,
+                    ok=True,
+                    warnings=tuple(warnings),
+                )
+            return ProviderLoad(
+                items=[],
+                source="html",
+                capability="degraded",
+                freshness_mode="live",
+                cache_hit=False,
+                stale=False,
+                fetched_at=None,
+                expires_at=None,
+                refresh_attempted=False,
+                ok=False,
+                warnings=(
+                    _provider_warning("LIVE_REFRESH_TIMEOUT", "Interactive refresh budget expired before notice refresh started."),
+                ),
+            )
+
+        try:
+            live_items = self._refresh_notice_items(
+                config=config,
+                auth_mode=auth_mode,
+                board_ids=board_ids,
+                max_pages=max_pages,
+                since_iso=since_iso,
+                limit=limit,
+                bootstrap=bootstrap,
+                deadline=deadline,
+            )
+        except TimeoutError:
+            if cache_entry is not None and cached_filtered:
+                warnings = [_provider_warning("LIVE_REFRESH_TIMEOUT", "Notice refresh exceeded the interactive deadline.")]
+                if bool(cache_entry.get("stale")):
+                    warnings.insert(0, _provider_warning("STALE_CACHE", "Returning stale notice cache because live refresh timed out."))
+                return ProviderLoad(
+                    items=[item.to_dict() for item in cached_filtered],
+                    source="html",
+                    capability="partial",
+                    freshness_mode="cache",
+                    cache_hit=True,
+                    stale=bool(cache_entry.get("stale")),
+                    fetched_at=_iso_from_epoch_seconds(cache_entry.get("stored_at")),
+                    expires_at=_iso_from_epoch_seconds(cache_entry.get("expires_at")),
+                    refresh_attempted=True,
+                    ok=True,
+                    warnings=tuple(warnings),
+                )
+            return ProviderLoad(
+                items=[],
+                source="html",
+                capability="degraded",
+                freshness_mode="live",
+                cache_hit=False,
+                stale=False,
+                fetched_at=None,
+                expires_at=None,
+                refresh_attempted=True,
+                ok=False,
+                warnings=(
+                    _provider_warning("LIVE_REFRESH_TIMEOUT", "Notice refresh exceeded the interactive deadline."),
+                ),
+            )
+        except CommandError:
+            raise
+        except Exception as exc:
+            if cache_entry is not None and cached_filtered:
+                warnings = [
+                    _provider_warning("LIVE_REFRESH_FAILED", "Notice refresh failed; returning cached notice data.", error=str(exc)),
+                ]
+                if bool(cache_entry.get("stale")):
+                    warnings.insert(0, _provider_warning("STALE_CACHE", "Returning stale notice cache because live refresh failed."))
+                return ProviderLoad(
+                    items=[item.to_dict() for item in cached_filtered],
+                    source="html",
+                    capability="partial",
+                    freshness_mode="cache",
+                    cache_hit=True,
+                    stale=bool(cache_entry.get("stale")),
+                    fetched_at=_iso_from_epoch_seconds(cache_entry.get("stored_at")),
+                    expires_at=_iso_from_epoch_seconds(cache_entry.get("expires_at")),
+                    refresh_attempted=True,
+                    ok=True,
+                    warnings=tuple(warnings),
+                )
+            return ProviderLoad(
+                items=[],
+                source="html",
+                capability="degraded",
+                freshness_mode="live",
+                cache_hit=False,
+                stale=False,
+                fetched_at=None,
+                expires_at=None,
+                refresh_attempted=True,
+                ok=False,
+                warnings=(
+                    _provider_warning("LIVE_REFRESH_FAILED", "Notice refresh failed.", error=str(exc)),
+                ),
+            )
+
+        live_filtered = _finalize_notice_items(live_items, since_iso=since_iso, limit=limit)
+        fresh_entry = load_cache_entry(self._paths, cache_key)
+        return ProviderLoad(
+            items=[item.to_dict() for item in live_filtered],
+            source="html",
+            capability="partial",
+            freshness_mode="live",
+            cache_hit=False,
+            stale=False,
+            fetched_at=_iso_from_epoch_seconds((fresh_entry or {}).get("stored_at")),
+            expires_at=_iso_from_epoch_seconds((fresh_entry or {}).get("expires_at")),
+            refresh_attempted=True,
+            ok=True,
+        )
+
+    def refresh_cache_with_context(
+        self,
+        *,
+        context: Any,
+        config: KlmsConfig,
+        auth_mode: str,
+        max_pages: int = 1,
+        bootstrap: KlmsSessionBootstrap | None = None,
+    ) -> ProviderLoad:
+        return self.load_for_dashboard(
+            context=context,
+            config=config,
+            auth_mode=auth_mode,
+            max_pages=max_pages,
+            bootstrap=bootstrap,
+            deadline=None,
+            prefer_cache=False,
+        )
+
+    def list(
+        self,
+        *,
+        notice_board_id: str | None = None,
+        max_pages: int = 1,
+        since_iso: str | None = None,
+        limit: int | None = None,
+    ) -> CommandResult:
+        config = load_config(self._paths)
+        max_pages = max(1, min(max_pages, 10))
+
+        def callback(context: Any, auth_mode: str) -> CommandResult:
+            return self.list_with_context(
+                context=context,
+                config=config,
+                auth_mode=auth_mode,
+                notice_board_id=notice_board_id,
+                max_pages=max_pages,
+                since_iso=since_iso,
+                limit=limit,
+            )
+
+        return self._auth.run_authenticated(
+            config=config,
+            headless=True,
+            accept_downloads=False,
+            timeout_seconds=10.0,
+            callback=callback,
+        )
+
+    def show(
+        self,
+        notice_id: str,
+        *,
+        notice_board_id: str | None = None,
+        max_pages: int = 3,
+        include_html: bool = False,
+    ) -> CommandResult:
+        config = load_config(self._paths)
+        target_notice_id = str(notice_id).strip()
+        if not target_notice_id:
+            raise CommandError(code="CONFIG_INVALID", message="Notice ID is required.", exit_code=40)
+
+        def callback(context: Any, auth_mode: str) -> CommandResult:
+            bootstrap = build_session_bootstrap(
+                self._paths,
+                context=context,
+                config=config,
+                auth_mode=auth_mode,
+            )
+            board_ids = self._resolve_notice_board_ids(
+                context=context,
+                config=config,
+                explicit_board_id=notice_board_id,
+                bootstrap=bootstrap,
+            )
+            if not board_ids:
+                raise CommandError(
+                    code="CONFIG_INVALID",
+                    message="No notice boards found.",
+                    hint="Configure notice_board_ids or let v2 discover boards from your course pages.",
+                    exit_code=40,
+                )
+
+            metadata_row = None
+            if notice_board_id is None:
+                rows = self._list_html(
+                    context=context,
+                    config=config,
+                    auth_mode=auth_mode,
+                    notice_board_id=None,
+                    max_pages=max_pages,
+                    since_iso=None,
+                    limit=None,
+                    bootstrap=bootstrap,
+                )
+                for row in rows:
+                    if str(row.id or "") == target_notice_id:
+                        metadata_row = row
+                        break
+
+            candidates: list[tuple[str, str, bool]] = []
+            if metadata_row and metadata_row.board_id and metadata_row.url:
+                ordered = [metadata_row.board_id] + [board_id for board_id in board_ids if board_id != metadata_row.board_id]
+                board_ids = ordered
+                candidates.append((str(metadata_row.url), str(metadata_row.board_id), False))
+
+            for board_id in board_ids:
+                candidates.append((abs_url(config.base_url, f"/mod/courseboard/article.php?id={board_id}&bwid={target_notice_id}"), board_id, True))
+
+            seen_urls: set[str] = set()
+            for url, board_id, strict in candidates:
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                page = context.new_page()
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                    html = page.content()
+                    final_url = page.url
+                except Exception:
+                    continue
+                finally:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+
+                if strict:
+                    lowered = final_url.lower()
+                    if "mod/courseboard/article.php" not in lowered or f"bwid={target_notice_id}" not in lowered:
+                        continue
+
+                detail = _parse_notice_detail_from_html(
+                    html,
+                    base_url=config.base_url,
+                    url=final_url,
+                    fallback_board_id=board_id,
+                    fallback_notice_id=target_notice_id,
+                    include_html=include_html,
+                    auth_mode=auth_mode,
+                )
+                if detail.id and detail.id != target_notice_id:
+                    continue
+                detail = Notice(**{**detail.to_dict(), "id": target_notice_id})
+                if metadata_row:
+                    merged = metadata_row.to_dict()
+                    merged.update(detail.to_dict())
+                    detail = Notice(
+                        board_id=merged.get("board_id"),
+                        id=merged.get("id"),
+                        title=merged.get("title") or "notice",
+                        url=merged.get("url"),
+                        posted_raw=merged.get("posted_raw"),
+                        posted_iso=merged.get("posted_iso"),
+                        author=merged.get("author"),
+                        body_text=merged.get("body_text"),
+                        body_html=merged.get("body_html"),
+                        attachments=tuple(merged.get("attachments") or ()),
+                        detail_available=bool(merged.get("detail_available")),
+                        source=str(merged.get("source") or "html:courseboard-article"),
+                        confidence=float(merged.get("confidence") or 0.0),
+                        auth_mode=merged.get("auth_mode"),
+                    )
+                return CommandResult(data=detail.to_dict(), source="html", capability="partial")
+
+            raise CommandError(code="NOT_FOUND", message=f"Notice not found: {notice_id}", exit_code=44)
+
+        return self._auth.run_authenticated(
+            config=config,
+            headless=True,
+            accept_downloads=False,
+            timeout_seconds=10.0,
+            callback=callback,
+        )
+
+    def _list_html(
+        self,
+        *,
+        context: Any,
+        config: KlmsConfig,
+        auth_mode: str,
+        notice_board_id: str | None,
+        max_pages: int,
+        since_iso: str | None,
+        limit: int | None,
+        bootstrap: KlmsSessionBootstrap | None = None,
+    ) -> list[Notice]:
+        bootstrap = bootstrap or build_session_bootstrap(
+            self._paths,
+            context=context,
+            config=config,
+            auth_mode=auth_mode,
+        )
+        board_ids = self._resolve_notice_board_ids(context=context, config=config, explicit_board_id=notice_board_id, bootstrap=bootstrap)
+        if not board_ids:
+            raise CommandError(
+                code="CONFIG_INVALID",
+                message="No notice boards found.",
+                hint="Configure notice_board_ids or let v2 discover boards from your course pages.",
+                exit_code=40,
+            )
+
+        cache_entry = self._load_notice_cache_entry(config=config, board_ids=board_ids, max_pages=max_pages)
+        cached_rows = cache_entry.get("value") if isinstance(cache_entry, dict) and not bool(cache_entry.get("stale")) else None
+        if isinstance(cached_rows, list):
+            cached_items = [Notice(**row) for row in cached_rows if isinstance(row, dict)]
+            return _finalize_notice_items(cached_items, since_iso=since_iso, limit=limit)
+
+        all_items = self._refresh_notice_items(
+            config=config,
+            auth_mode=auth_mode,
+            board_ids=board_ids,
+            max_pages=max_pages,
+            since_iso=since_iso,
+            limit=limit,
+            bootstrap=bootstrap,
+            deadline=None,
+        )
+        return _finalize_notice_items(all_items, since_iso=since_iso, limit=limit)
+
+    def _refresh_notice_items(
+        self,
+        *,
+        config: KlmsConfig,
+        auth_mode: str,
+        board_ids: list[str],
+        max_pages: int,
+        since_iso: str | None,
+        limit: int | None,
+        bootstrap: KlmsSessionBootstrap,
+        deadline: RefreshDeadline | None,
+    ) -> list[Notice]:
+        first_paths = [f"/mod/courseboard/view.php?id={board_id}" for board_id in board_ids]
+        first_responses = fetch_html_batch(
+            bootstrap.http,
+            first_paths,
+            deadline=deadline,
+            max_workers=MAX_NOTICE_HTTP_WORKERS,
+        )
+
+        all_items: list[Notice] = []
+        extra_paths: list[str] = []
+        by_board_id: dict[str, list[tuple[str, str]]] = {}
+        for board_id, first_path in zip(board_ids, first_paths):
+            response = first_responses.get(first_path)
+            if response is None:
+                continue
+            if looks_login_url(response.url) or looks_logged_out_html(response.text):
+                raise CommandError(
+                    code="AUTH_EXPIRED",
+                    message="Saved KLMS auth did not stay authenticated while loading notice boards.",
+                    hint="Run `kaist klms auth refresh` and try again.",
+                    exit_code=10,
+                    retryable=True,
+                )
+            first_soup = BeautifulSoup(response.text, "html.parser")
+            first_page_index, page_sequence = _plan_notice_page_sequence(first_soup, max_pages=max_pages)
+            by_board_id.setdefault(board_id, []).append((first_path, response.text))
+            for page_index in page_sequence:
+                if page_index == first_page_index:
+                    continue
+                extra_paths.append(f"/mod/courseboard/view.php?id={board_id}&page={page_index}")
+
+        if extra_paths and (deadline is None or not deadline.hard_expired()):
+            extra_responses = fetch_html_batch(
+                bootstrap.http,
+                extra_paths,
+                deadline=deadline,
+                max_workers=MAX_NOTICE_HTTP_WORKERS,
+            )
+            for path in extra_paths:
+                response = extra_responses.get(path)
+                if response is None:
+                    continue
+                if looks_login_url(response.url) or looks_logged_out_html(response.text):
+                    raise CommandError(
+                        code="AUTH_EXPIRED",
+                        message="Saved KLMS auth did not stay authenticated while loading notice pages.",
+                        hint="Run `kaist klms auth refresh` and try again.",
+                        exit_code=10,
+                        retryable=True,
+                    )
+                match = re.search(r"[?&]id=(\d+)", path)
+                if not match:
+                    continue
+                by_board_id.setdefault(match.group(1), []).append((path, response.text))
+
+        seen_keys: set[tuple[str, str, str]] = set()
+        for board_id in board_ids:
+            for page_path, page_html in by_board_id.get(board_id, []):
+                if deadline is not None and deadline.hard_expired():
+                    raise TimeoutError("Interactive notice refresh budget expired.")
+                page_soup = BeautifulSoup(page_html, "html.parser")
+                parsed = _parse_notice_items_from_soup(
+                    page_soup,
+                    board_id=board_id,
+                    base_url=config.base_url,
+                    fallback_url_path=page_path,
+                )
+                for item in parsed:
+                    key = (board_id, str(item.id or ""), str(item.url or ""))
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    all_items.append(
+                        Notice(
+                            board_id=item.board_id,
+                            id=item.id,
+                            title=item.title,
+                            url=item.url,
+                            posted_raw=item.posted_raw,
+                            posted_iso=item.posted_iso,
+                            source=item.source,
+                            confidence=item.confidence,
+                            auth_mode=auth_mode,
+                        )
+                    )
+                if limit is not None and _matching_notice_count(all_items, since_iso=since_iso) >= limit:
+                    break
+            if limit is not None and _matching_notice_count(all_items, since_iso=since_iso) >= limit:
+                break
+
+        save_cache_value(self._paths, self._notice_list_cache_key(config, board_ids, max_pages), [item.to_dict() for item in all_items], ttl_seconds=NOTICE_LIST_TTL_SECONDS)
+        return all_items
+
+    def _resolve_notice_board_ids(
+        self,
+        *,
+        context: Any,
+        config: KlmsConfig,
+        explicit_board_id: str | None,
+        bootstrap: KlmsSessionBootstrap | None = None,
+        deadline: RefreshDeadline | None = None,
+        allow_stale_cache: bool = False,
+    ) -> list[str]:
+        if explicit_board_id:
+            return [str(explicit_board_id).strip()]
+        if config.notice_board_ids:
+            return [str(board_id).strip() for board_id in config.notice_board_ids if str(board_id).strip()]
+
+        if bootstrap is None:
+            raise CommandError(
+                code="CONFIG_INVALID",
+                message="Notice board discovery requires a session bootstrap.",
+                exit_code=40,
+            )
+
+        course_ids = _extract_course_ids_from_dashboard(
+            bootstrap.dashboard_html,
+            base_url=config.base_url,
+            configured_ids=config.course_ids,
+            exclude_patterns=config.exclude_course_title_patterns,
+        )
+        cache_key = self._notice_board_cache_key(config, course_ids)
+        cache_entry = load_cache_entry(self._paths, cache_key)
+        cached_rows = cache_entry.get("value") if isinstance(cache_entry, dict) else None
+        cached_board_map = cached_rows if isinstance(cached_rows, dict) else {}
+
+        def flatten_board_map(board_map: dict[str, Any]) -> list[str]:
+            flattened: list[str] = []
+            for course_id in course_ids:
+                values = board_map.get(course_id)
+                if not isinstance(values, list):
+                    continue
+                flattened.extend(str(board_id).strip() for board_id in values if str(board_id).strip())
+            return list(dict.fromkeys(flattened))
+
+        cached_board_ids = flatten_board_map(cached_board_map)
+        if cached_board_ids and (not bool((cache_entry or {}).get("stale")) or allow_stale_cache):
+            return cached_board_ids
+        if deadline is not None and deadline.hard_expired():
+            return cached_board_ids if allow_stale_cache else []
+
+        board_map: dict[str, list[str]] = {}
+        paths = [f"/course/view.php?id={course_id}&section=0" for course_id in course_ids]
+        responses = fetch_html_batch(
+            bootstrap.http,
+            paths,
+            deadline=deadline,
+            max_workers=MAX_NOTICE_HTTP_WORKERS,
+        )
+        for course_id, path in zip(course_ids, paths):
+            response = responses.get(path)
+            if response is None:
+                continue
+            if looks_login_url(response.url) or looks_logged_out_html(response.text):
+                raise CommandError(
+                    code="AUTH_EXPIRED",
+                    message="Saved KLMS auth did not stay authenticated while discovering notice boards.",
+                    hint="Run `kaist klms auth refresh` and try again.",
+                    exit_code=10,
+                    retryable=True,
+                )
+            board_ids = _discover_notice_board_ids_from_course_page(response.text)
+            if board_ids:
+                board_map[course_id] = board_ids
+        resolved = flatten_board_map(board_map)
+        if resolved:
+            save_cache_value(self._paths, cache_key, board_map, ttl_seconds=NOTICE_BOARD_TTL_SECONDS)
+            return resolved
+        return cached_board_ids if allow_stale_cache else resolved

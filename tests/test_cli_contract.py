@@ -24,44 +24,46 @@ def run_cli(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_agent_success_envelope_for_config_set(tmp_path: Path) -> None:
-    cp = run_cli(tmp_path, "--agent", "klms", "config", "set", "--base-url", "https://example.com")
+def test_agent_success_envelope_for_auth_status(tmp_path: Path) -> None:
+    cp = run_cli(tmp_path, "--agent", "klms", "auth", "status")
     assert cp.returncode == 0, cp.stderr
     payload = json.loads(cp.stdout)
     assert payload["ok"] is True
-    assert payload["schema"] == "kaist.klms.config.set.v1"
+    assert payload["schema"] == "kaist.klms.auth.status.v1"
     assert isinstance(payload.get("generated_at"), str)
+    assert payload["meta"]["source"] == "bootstrap"
+    assert payload["meta"]["capability"] == "partial"
     assert "data" in payload
 
 
 def test_agent_error_envelope_and_exit_code(tmp_path: Path) -> None:
-    cp = run_cli(tmp_path, "--agent", "klms", "config", "set", "--base-url", "foo")
+    cp = run_cli(tmp_path, "--agent", "klms", "courses", "list")
     assert cp.returncode == 40
     payload = json.loads(cp.stdout)
     assert payload["ok"] is False
-    assert payload["schema"] == "kaist.klms.config.set.v1"
-    assert payload["error"]["code"] == "CONFIG_INVALID"
+    assert payload["schema"] == "kaist.klms.courses.list.v1"
+    assert payload["error"]["code"] == "CONFIG_MISSING"
 
 
 def test_human_error_format(tmp_path: Path) -> None:
-    cp = run_cli(tmp_path, "klms", "config", "set", "--base-url", "foo")
+    cp = run_cli(tmp_path, "klms", "courses", "list")
     assert cp.returncode == 40
-    assert "error [config_invalid]" in cp.stderr.lower()
+    assert "error [config_missing]" in cp.stderr.lower()
 
 
 def test_new_command_schema_for_list_courses_error(tmp_path: Path) -> None:
-    cp = run_cli(tmp_path, "--agent", "klms", "list", "courses", "--no-enrich")
-    assert cp.returncode == 10
+    cp = run_cli(tmp_path, "--agent", "klms", "courses", "list")
+    assert cp.returncode == 40
     payload = json.loads(cp.stdout)
-    assert payload["schema"] == "kaist.klms.courses.v1"
+    assert payload["schema"] == "kaist.klms.courses.list.v1"
     assert payload["ok"] is False
 
 
-def test_get_file_schema_is_stable(tmp_path: Path) -> None:
-    cp = run_cli(tmp_path, "--agent", "klms", "get", "file", "https://example.com/file.pdf")
-    assert cp.returncode == 10
+def test_files_pull_schema_is_stable(tmp_path: Path) -> None:
+    cp = run_cli(tmp_path, "--agent", "klms", "files", "pull")
+    assert cp.returncode == 40
     payload = json.loads(cp.stdout)
-    assert payload["schema"] == "kaist.klms.download.v1"
+    assert payload["schema"] == "kaist.klms.files.pull.v1"
     assert payload["ok"] is False
 
 
@@ -71,7 +73,9 @@ def test_sync_status_works_without_klms_config(tmp_path: Path) -> None:
     payload = json.loads(cp.stdout)
     assert payload["ok"] is True
     assert payload["schema"] == "kaist.klms.sync.status.v1"
-    assert payload["data"]["snapshot_exists"] is False
+    assert payload["data"]["providers"]["notice_board_ids"]["entry_count"] == 0
+    assert payload["data"]["providers"]["notices"]["entry_count"] == 0
+    assert payload["data"]["providers"]["files"]["entry_count"] == 0
 
 
 def test_portal_scaffold_command(tmp_path: Path) -> None:
@@ -93,6 +97,6 @@ def test_version_command_schema(tmp_path: Path) -> None:
 
 
 def test_legacy_flat_commands_are_removed(tmp_path: Path) -> None:
-    cp = run_cli(tmp_path, "klms", "courses")
+    cp = run_cli(tmp_path, "klms", "list", "courses")
     assert cp.returncode != 0
     assert "invalid choice" in cp.stderr.lower()

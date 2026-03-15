@@ -1,0 +1,802 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Literal
+
+from ..contracts import CommandError, CommandResult
+from .config import KlmsConfig, maybe_load_config, save_config
+from .paths import KlmsPaths, chmod_best_effort, configure_playwright_env, ensure_private_dirs
+
+
+AuthMode = Literal["profile", "storage_state", "none"]
+
+HTML_LOGIN_MARKERS = (
+    "notloggedin",
+    "page-login",
+    "ssologin",
+    "/local/applogin/",
+    "result_login_json.php",
+)
+
+URL_LOGIN_NEEDLES = (
+    "/login/",
+    "ssologin",
+    "oidc",
+    "sso",
+    "/local/applogin/",
+    "result_login_json.php",
+)
+
+APP_LOGIN_PATHS = (
+    "/local/applogin/result_login_json.php",
+    "/login/ssologin.php",
+)
+
+
+def epoch_to_iso_utc(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def has_profile_session(paths: KlmsPaths) -> bool:
+    if not paths.profile_dir.exists() or not paths.profile_dir.is_dir():
+        return False
+    try:
+        return any(paths.profile_dir.iterdir())
+    except OSError:
+        return False
+
+
+def has_storage_state_session(paths: KlmsPaths) -> bool:
+    return paths.storage_state_path.exists()
+
+
+def active_auth_mode(paths: KlmsPaths) -> AuthMode:
+    if has_profile_session(paths):
+        return "profile"
+    if has_storage_state_session(paths):
+        return "storage_state"
+    return "none"
+
+
+def looks_logged_out_html(html: str) -> bool:
+    text = html.lower()
+    return any(marker in text for marker in HTML_LOGIN_MARKERS)
+
+
+def looks_login_url(url: str) -> bool:
+    lowered = (url or "").lower()
+    return any(needle in lowered for needle in URL_LOGIN_NEEDLES)
+
+
+def extract_sesskey(html: str) -> str | None:
+    patterns = [
+        r'"sesskey"\s*:\s*"([^"]+)"',
+        r"sesskey=([A-Za-z0-9]+)",
+        r'name=["\']sesskey["\']\s+value=["\']([^"\']+)["\']',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html)
+        if match:
+            value = match.group(1).strip()
+            if value:
+                return value
+    return None
+
+
+def storage_state_cookie_stats(paths: KlmsPaths) -> dict[str, Any] | None:
+    if not paths.storage_state_path.exists():
+        return None
+    try:
+        raw = json.loads(paths.storage_state_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        return {"read_error": str(exc)}
+
+    cookies = raw.get("cookies") or []
+    now_epoch = time.time()
+    exp_epochs = [
+        float(cookie.get("expires"))
+        for cookie in cookies
+        if isinstance(cookie, dict)
+        and isinstance(cookie.get("expires"), (int, float))
+        and float(cookie.get("expires")) > 0
+    ]
+    if not exp_epochs:
+        return {
+            "cookie_count": len(cookies),
+            "expiring_cookie_count": 0,
+            "next_expiry_iso": None,
+            "next_expiry_in_hours": None,
+            "latest_expiry_iso": None,
+        }
+
+    next_expiry = min(exp_epochs)
+    latest_expiry = max(exp_epochs)
+    return {
+        "cookie_count": len(cookies),
+        "expiring_cookie_count": len(exp_epochs),
+        "next_expiry_iso": epoch_to_iso_utc(next_expiry),
+        "next_expiry_in_hours": round((next_expiry - now_epoch) / 3600, 2),
+        "latest_expiry_iso": epoch_to_iso_utc(latest_expiry),
+    }
+
+
+def _tail_text(text: str, *, max_lines: int = 20) -> str:
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    return "\n".join(lines[-max_lines:])
+
+
+def _is_missing_browser_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return (
+        "executable doesn't exist" in message
+        or "download new browsers" in message
+        or "playwright install" in message
+    )
+
+
+def _system_browser_channel_candidates() -> list[str]:
+    override = os.environ.get("KAIST_KLMS_BROWSER_CHANNEL", "").strip()
+    if override:
+        return [override]
+    return ["chrome", "msedge"]
+
+
+def _system_chromium_executable_candidates() -> list[Path]:
+    override = os.environ.get("KAIST_KLMS_BROWSER_EXECUTABLE", "").strip()
+    if override:
+        return [Path(override).expanduser()]
+
+    candidates: list[Path] = []
+    if sys.platform == "darwin":
+        candidates.extend(
+            [
+                Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                Path("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+                Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+                Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+                Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                Path.home() / "Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+                Path.home() / "Applications/Chromium.app/Contents/MacOS/Chromium",
+                Path.home() / "Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            ]
+        )
+    elif sys.platform.startswith("linux"):
+        for command in (
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            "brave-browser",
+            "microsoft-edge",
+            "msedge",
+        ):
+            resolved = shutil.which(command)
+            if resolved:
+                candidates.append(Path(resolved))
+
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def _resolve_system_chromium_executable() -> str | None:
+    for candidate in _system_chromium_executable_candidates():
+        try:
+            if candidate.exists() and candidate.is_file():
+                return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
+def _browser_override_launch_options() -> list[dict[str, Any]]:
+    options: list[dict[str, Any]] = []
+    for channel in _system_browser_channel_candidates():
+        options.append({"channel": channel, "_label": f"channel={channel}"})
+    executable_path = _resolve_system_chromium_executable()
+    if executable_path:
+        options.append({"executable_path": executable_path, "_label": f"executable_path={executable_path}"})
+    return options
+
+
+def _browser_fallback_error(prefix: str, errors: list[str]) -> RuntimeError:
+    detail = _tail_text("\n".join(errors), max_lines=16) or "unknown error"
+    return RuntimeError(f"{prefix}. Details:\n{detail}")
+
+
+def _playwright_install_cmd(paths: KlmsPaths) -> tuple[list[str], dict[str, str]]:
+    configure_playwright_env(paths)
+    from playwright._impl._driver import compute_driver_executable, get_driver_env  # type: ignore[import-untyped]
+
+    node_path, cli_path = compute_driver_executable()
+    env = os.environ.copy()
+    env.update(get_driver_env())
+    env["PLAYWRIGHT_BROWSERS_PATH"] = os.environ["PLAYWRIGHT_BROWSERS_PATH"]
+    return [node_path, cli_path], env
+
+
+def install_browser(paths: KlmsPaths, *, force: bool = False) -> dict[str, Any]:
+    browser_path = configure_playwright_env(paths)
+    driver_cmd, env = _playwright_install_cmd(paths)
+    command = [*driver_cmd, "install"]
+    if force:
+        command.append("--force")
+    command.append("chromium")
+    completed = subprocess.run(  # noqa: S603
+        command,
+        check=False,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    result = {
+        "ok": completed.returncode == 0,
+        "browser": "chromium",
+        "forced": force,
+        "install_dir": str(browser_path),
+        "command": command,
+    }
+    stdout_tail = _tail_text(completed.stdout)
+    stderr_tail = _tail_text(completed.stderr)
+    if stdout_tail:
+        result["stdout_tail"] = stdout_tail
+    if stderr_tail:
+        result["stderr_tail"] = stderr_tail
+    if completed.returncode != 0:
+        hint = "Run the same command again after fixing browser/runtime issues."
+        detail = stderr_tail or stdout_tail or f"exit code {completed.returncode}"
+        raise CommandError(
+            code="BROWSER_INSTALL_FAILED",
+            message=f"Failed to install Playwright Chromium ({detail}).",
+            hint=hint,
+            exit_code=50,
+        )
+    return result
+
+
+def _launch_chromium_persistent_context_sync(
+    playwright: Any,
+    *,
+    paths: KlmsPaths,
+    user_data_dir: str,
+    headless: bool,
+    accept_downloads: bool,
+) -> Any:
+    launch_kwargs = {
+        "user_data_dir": user_data_dir,
+        "headless": headless,
+        "accept_downloads": accept_downloads,
+    }
+    try:
+        return playwright.chromium.launch_persistent_context(**launch_kwargs)
+    except Exception as exc:  # noqa: BLE001
+        if not _is_missing_browser_error(exc):
+            raise
+        errors = [f"default bundled Chromium missing: {exc}"]
+
+    for option in _browser_override_launch_options():
+        kwargs = dict(launch_kwargs)
+        label = str(option.get("_label") or "override")
+        kwargs.update({key: value for key, value in option.items() if key != "_label"})
+        try:
+            return playwright.chromium.launch_persistent_context(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{label}: {exc}")
+
+    try:
+        install_browser(paths, force=False)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"playwright install chromium: {exc}")
+        raise _browser_fallback_error("Failed to launch browser and automatic install also failed", errors) from exc
+
+    try:
+        return playwright.chromium.launch_persistent_context(**launch_kwargs)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"after install retry: {exc}")
+        raise _browser_fallback_error("Failed to launch browser after installation retry", errors) from exc
+
+
+def _launch_chromium_browser_sync(playwright: Any, *, paths: KlmsPaths, headless: bool) -> Any:
+    launch_kwargs = {"headless": headless}
+    try:
+        return playwright.chromium.launch(**launch_kwargs)
+    except Exception as exc:  # noqa: BLE001
+        if not _is_missing_browser_error(exc):
+            raise
+        errors = [f"default bundled Chromium missing: {exc}"]
+
+    for option in _browser_override_launch_options():
+        kwargs = dict(launch_kwargs)
+        label = str(option.get("_label") or "override")
+        kwargs.update({key: value for key, value in option.items() if key != "_label"})
+        try:
+            return playwright.chromium.launch(**kwargs)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{label}: {exc}")
+
+    try:
+        install_browser(paths, force=False)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"playwright install chromium: {exc}")
+        raise _browser_fallback_error("Failed to launch browser and automatic install also failed", errors) from exc
+
+    try:
+        return playwright.chromium.launch(**launch_kwargs)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"after install retry: {exc}")
+        raise _browser_fallback_error("Failed to launch browser after installation retry", errors) from exc
+
+
+class AuthService:
+    def __init__(self, paths: KlmsPaths) -> None:
+        self._paths = paths
+
+    def _config_payload(self, config: KlmsConfig | None) -> dict[str, Any] | None:
+        if config is None:
+            return None
+        return {
+            "base_url": config.base_url,
+            "dashboard_path": config.dashboard_path,
+            "course_ids": list(config.course_ids),
+            "notice_board_ids": list(config.notice_board_ids),
+            "exclude_course_title_patterns": list(config.exclude_course_title_patterns),
+        }
+
+    def _recommended_action(self, *, config: KlmsConfig | None, mode: AuthMode) -> str:
+        if config is None:
+            return "Run `kaist klms auth login --base-url https://klms.kaist.ac.kr`."
+        if mode == "none":
+            return "Run `kaist klms auth login` to create a persistent browser profile."
+        return "Run `kaist klms auth refresh` if the saved session stops working."
+
+    def snapshot(self) -> dict[str, Any]:
+        ensure_private_dirs(self._paths)
+        config = maybe_load_config(self._paths)
+        mode = active_auth_mode(self._paths)
+        return {
+            "configured": config is not None,
+            "config_path": str(self._paths.config_path),
+            "profile_path": str(self._paths.profile_dir),
+            "storage_state_path": str(self._paths.storage_state_path),
+            "auth_mode": mode,
+            "session_artifacts": {
+                "profile": has_profile_session(self._paths),
+                "storage_state": has_storage_state_session(self._paths),
+            },
+            "storage_state_cookie_stats": storage_state_cookie_stats(self._paths),
+            "config": self._config_payload(config),
+            "validation_mode": "offline-only",
+            "login_detection": {
+                "html_markers": list(HTML_LOGIN_MARKERS),
+                "url_needles": list(URL_LOGIN_NEEDLES),
+                "app_login_paths": list(APP_LOGIN_PATHS),
+            },
+            "recommended_action": self._recommended_action(config=config, mode=mode),
+        }
+
+    def status(self) -> CommandResult:
+        return CommandResult(data=self.snapshot(), source="bootstrap", capability="partial")
+
+    def install_browser(self, *, force: bool = False) -> CommandResult:
+        return CommandResult(data=install_browser(self._paths, force=force), source="bootstrap", capability="partial")
+
+    def doctor(self) -> CommandResult:
+        snapshot = self.snapshot()
+        checks = [
+            {
+                "name": "private_root_exists",
+                "ok": self._paths.private_root.exists(),
+                "detail": str(self._paths.private_root),
+            },
+            {
+                "name": "config_exists",
+                "ok": self._paths.config_path.exists(),
+                "detail": str(self._paths.config_path),
+            },
+            {
+                "name": "profile_exists",
+                "ok": self._paths.profile_dir.exists(),
+                "detail": str(self._paths.profile_dir),
+            },
+            {
+                "name": "storage_state_exists",
+                "ok": self._paths.storage_state_path.exists(),
+                "detail": str(self._paths.storage_state_path),
+            },
+            {
+                "name": "app_login_detection_enabled",
+                "ok": True,
+                "detail": ", ".join(APP_LOGIN_PATHS),
+            },
+        ]
+
+        cookie_stats = snapshot.get("storage_state_cookie_stats")
+        if isinstance(cookie_stats, dict) and "read_error" in cookie_stats:
+            checks.append(
+                {
+                    "name": "storage_state_parseable",
+                    "ok": False,
+                    "detail": str(cookie_stats["read_error"]),
+                }
+            )
+        elif cookie_stats is not None:
+            checks.append(
+                {
+                    "name": "storage_state_parseable",
+                    "ok": True,
+                    "detail": json.dumps(cookie_stats, ensure_ascii=False),
+                }
+            )
+
+        ok_count = sum(1 for check in checks if bool(check["ok"]))
+        overall = "ok" if ok_count == len(checks) and snapshot["auth_mode"] != "none" else "warning"
+        report = {
+            "status": overall,
+            "checks": checks,
+            "auth_snapshot": snapshot,
+        }
+        return CommandResult(data=report, source="bootstrap", capability="partial")
+
+    def login(self, *, base_url: str | None = None, dashboard_path: str | None = None) -> CommandResult:
+        config = save_config(self._paths, base_url=base_url, dashboard_path=dashboard_path)
+        configure_playwright_env(self._paths)
+        self._paths.profile_dir.mkdir(parents=True, exist_ok=True)
+        chmod_best_effort(self._paths.profile_dir, 0o700)
+
+        from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
+
+        print(f"Opening browser to: {config.base_url}", file=sys.stderr)
+        print("Log in fully, navigate to a course page, then return here and press Enter.", file=sys.stderr)
+        with sync_playwright() as playwright:
+            context = _launch_chromium_persistent_context_sync(
+                playwright,
+                paths=self._paths,
+                user_data_dir=str(self._paths.profile_dir),
+                headless=False,
+                accept_downloads=False,
+            )
+            page = context.new_page()
+            page.goto(config.base_url, wait_until="domcontentloaded", timeout=30_000)
+            print("Press Enter to save session and exit... ", end="", file=sys.stderr, flush=True)
+            input()
+            context.storage_state(path=str(self._paths.storage_state_path))
+            context.close()
+
+        chmod_best_effort(self._paths.storage_state_path, 0o600)
+        return CommandResult(
+            data={
+                "ok": True,
+                "base_url": config.base_url,
+                "dashboard_path": config.dashboard_path,
+                "config_path": str(self._paths.config_path),
+                "profile_path": str(self._paths.profile_dir),
+                "storage_state_path": str(self._paths.storage_state_path),
+                "preferred_mode": "profile",
+            },
+            source="browser",
+            capability="full",
+        )
+
+    def refresh(self, *, base_url: str | None = None, dashboard_path: str | None = None) -> CommandResult:
+        return self.login(base_url=base_url, dashboard_path=dashboard_path)
+
+    def _context_dashboard_state(self, context: Any, *, config: KlmsConfig, timeout_ms: int) -> dict[str, Any]:
+        page = context.new_page()
+        try:
+            page.goto(config.base_url.rstrip("/") + config.dashboard_path, wait_until="domcontentloaded", timeout=timeout_ms)
+            html = page.content()
+            final_url = page.url
+        finally:
+            page.close()
+        return {
+            "final_url": final_url,
+            "html": html,
+            "authenticated": not looks_login_url(final_url) and not looks_logged_out_html(html),
+            "login_url_detected": looks_login_url(final_url),
+            "login_html_detected": looks_logged_out_html(html),
+        }
+
+    def run_authenticated(
+        self,
+        *,
+        config: KlmsConfig,
+        headless: bool,
+        accept_downloads: bool,
+        timeout_seconds: float,
+        callback: Any,
+    ) -> Any:
+        return self._run_authenticated_internal(
+            config=config,
+            headless=headless,
+            accept_downloads=accept_downloads,
+            timeout_seconds=timeout_seconds,
+            callback=callback,
+            include_dashboard_state=False,
+        )
+
+    def run_authenticated_with_state(
+        self,
+        *,
+        config: KlmsConfig,
+        headless: bool,
+        accept_downloads: bool,
+        timeout_seconds: float,
+        callback: Any,
+    ) -> Any:
+        return self._run_authenticated_internal(
+            config=config,
+            headless=headless,
+            accept_downloads=accept_downloads,
+            timeout_seconds=timeout_seconds,
+            callback=callback,
+            include_dashboard_state=True,
+        )
+
+    def _run_authenticated_internal(
+        self,
+        *,
+        config: KlmsConfig,
+        headless: bool,
+        accept_downloads: bool,
+        timeout_seconds: float,
+        callback: Any,
+        include_dashboard_state: bool,
+    ) -> Any:
+        if active_auth_mode(self._paths) == "none":
+            raise CommandError(
+                code="AUTH_MISSING",
+                message="No saved KLMS auth artifacts were found.",
+                hint="Run `kaist klms auth login --base-url https://klms.kaist.ac.kr` first.",
+                exit_code=10,
+                retryable=True,
+            )
+
+        timeout_ms = max(1_000, int(timeout_seconds * 1000))
+        attempts: list[dict[str, Any]] = []
+
+        from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
+
+        with sync_playwright() as playwright:
+            if has_profile_session(self._paths):
+                try:
+                    profile_context = _launch_chromium_persistent_context_sync(
+                        playwright,
+                        paths=self._paths,
+                        user_data_dir=str(self._paths.profile_dir),
+                        headless=headless,
+                        accept_downloads=accept_downloads,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    attempts.append({"auth_mode": "profile", "launch_error": str(exc)})
+                else:
+                    try:
+                        state = self._context_dashboard_state(profile_context, config=config, timeout_ms=timeout_ms)
+                        attempts.append({"auth_mode": "profile", **state})
+                        if state["authenticated"]:
+                            if include_dashboard_state:
+                                return callback(profile_context, "profile", state)
+                            return callback(profile_context, "profile")
+                    finally:
+                        profile_context.close()
+
+            if has_storage_state_session(self._paths):
+                try:
+                    browser = _launch_chromium_browser_sync(playwright, paths=self._paths, headless=headless)
+                    storage_context = browser.new_context(
+                        storage_state=str(self._paths.storage_state_path),
+                        accept_downloads=accept_downloads,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    attempts.append({"auth_mode": "storage_state", "launch_error": str(exc)})
+                else:
+                    try:
+                        state = self._context_dashboard_state(storage_context, config=config, timeout_ms=timeout_ms)
+                        attempts.append({"auth_mode": "storage_state", **state})
+                        if state["authenticated"]:
+                            if include_dashboard_state:
+                                return callback(storage_context, "storage_state", state)
+                            return callback(storage_context, "storage_state")
+                    finally:
+                        storage_context.close()
+                        browser.close()
+
+        attempt_summaries = [
+            (
+                f"{attempt['auth_mode']}: launch_error={attempt.get('launch_error')}"
+                if attempt.get("launch_error")
+                else f"{attempt['auth_mode']}: final_url={attempt.get('final_url')}"
+            )
+            for attempt in attempts
+        ]
+        detail = "; ".join(attempt_summaries) if attempt_summaries else "no attempts"
+        raise CommandError(
+            code="AUTH_EXPIRED",
+            message=f"Saved KLMS auth did not reach an authenticated dashboard session ({detail}).",
+            hint="Run `kaist klms auth refresh` and complete the login flow again.",
+            exit_code=10,
+            retryable=True,
+        )
+
+    def browser_probe(self, *, config: KlmsConfig, timeout_seconds: float, recent_courses_args: dict[str, Any] | None) -> dict[str, Any]:
+        configure_playwright_env(self._paths)
+        timeout_ms = max(1_000, int(timeout_seconds * 1000))
+
+        from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
+
+        def probe_context(context: Any, *, auth_mode: str) -> dict[str, Any]:
+            page = context.new_page()
+            try:
+                try:
+                    page.goto(config.base_url.rstrip("/") + config.dashboard_path, wait_until="domcontentloaded", timeout=timeout_ms)
+                    html = page.content()
+                    final_url = page.url
+                except Exception as exc:  # noqa: BLE001
+                    return {
+                        "auth_mode": auth_mode,
+                        "dashboard_authenticated": False,
+                        "status": "error",
+                        "error": str(exc),
+                        "sesskey_detected": False,
+                        "ajax_recent_courses": {
+                            "status": "skipped",
+                            "reason": "Dashboard load failed.",
+                        },
+                    }
+
+                authenticated = not looks_login_url(final_url) and not looks_logged_out_html(html)
+                result: dict[str, Any] = {
+                    "auth_mode": auth_mode,
+                    "dashboard_final_url": final_url,
+                    "dashboard_authenticated": authenticated,
+                    "dashboard_login_url_detected": looks_login_url(final_url),
+                    "dashboard_login_html_detected": looks_logged_out_html(html),
+                    "sesskey_detected": False,
+                    "ajax_recent_courses": {
+                        "status": "skipped",
+                        "reason": "No authenticated dashboard session.",
+                    },
+                }
+                if not authenticated:
+                    return result
+
+                sesskey = extract_sesskey(html)
+                result["sesskey_detected"] = bool(sesskey)
+                if not sesskey:
+                    result["ajax_recent_courses"] = {
+                        "status": "skipped",
+                        "reason": "Authenticated page did not expose sesskey.",
+                    }
+                    return result
+
+                args = dict(recent_courses_args or {})
+                payload = [{"index": 0, "methodname": "core_course_get_recent_courses", "args": args}]
+                ajax_url = f"{config.base_url.rstrip('/')}/lib/ajax/service.php?sesskey={sesskey}&info=core_course_get_recent_courses"
+                ajax_result = page.evaluate(
+                    """
+                    async ({url, payload}) => {
+                      const response = await fetch(url, {
+                        method: "POST",
+                        headers: {
+                          "Content-Type": "application/json",
+                          "X-Requested-With": "XMLHttpRequest",
+                          "Accept": "application/json, text/javascript, */*; q=0.01"
+                        },
+                        body: JSON.stringify(payload),
+                        credentials: "same-origin"
+                      });
+                      const text = await response.text();
+                      return {
+                        ok: response.ok,
+                        status: response.status,
+                        url: response.url,
+                        contentType: response.headers.get("content-type") || "",
+                        text
+                      };
+                    }
+                    """,
+                    {"url": ajax_url, "payload": payload},
+                )
+                ajax_text = str(ajax_result.get("text") or "")
+                ajax_report: dict[str, Any] = {
+                    "status": "ok" if ajax_result.get("ok") else "error",
+                    "http_status": ajax_result.get("status"),
+                    "final_url": ajax_result.get("url"),
+                    "content_type": ajax_result.get("contentType"),
+                    "preview": ajax_text[:400],
+                    "args_used": args,
+                }
+                try:
+                    parsed = json.loads(ajax_text)
+                except Exception as exc:  # noqa: BLE001
+                    ajax_report["json_parse_ok"] = False
+                    ajax_report["parse_error"] = str(exc)
+                else:
+                    ajax_report["json_parse_ok"] = True
+                    ajax_report["payload_kind"] = type(parsed).__name__
+                    if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                        ajax_report["ajax_error"] = bool(parsed[0].get("error"))
+                        data = parsed[0].get("data")
+                        if isinstance(data, list):
+                            ajax_report["course_count"] = len(data)
+                            if data and isinstance(data[0], dict):
+                                ajax_report["sample_course"] = {
+                                    "id": data[0].get("id"),
+                                    "fullname": data[0].get("fullname"),
+                                    "shortname": data[0].get("shortname"),
+                                    "viewurl": data[0].get("viewurl"),
+                                }
+                result["ajax_recent_courses"] = ajax_report
+                return result
+            finally:
+                page.close()
+
+        if active_auth_mode(self._paths) == "none":
+            return {
+                "enabled": True,
+                "status": "skipped",
+                "reason": "No saved auth artifacts available for browser-assisted probing.",
+            }
+
+        with sync_playwright() as playwright:
+            if has_profile_session(self._paths):
+                profile_context = _launch_chromium_persistent_context_sync(
+                    playwright,
+                    paths=self._paths,
+                    user_data_dir=str(self._paths.profile_dir),
+                    headless=True,
+                    accept_downloads=False,
+                )
+                try:
+                    profile_result = probe_context(profile_context, auth_mode="profile")
+                    if profile_result.get("dashboard_authenticated"):
+                        return {
+                            "enabled": True,
+                            "status": "ok",
+                            "attempts": [profile_result],
+                            "selected_auth_mode": "profile",
+                        }
+                finally:
+                    profile_context.close()
+            else:
+                profile_result = None
+
+            if has_storage_state_session(self._paths):
+                browser = _launch_chromium_browser_sync(playwright, paths=self._paths, headless=True)
+                storage_context = browser.new_context(
+                    storage_state=str(self._paths.storage_state_path),
+                    accept_downloads=False,
+                )
+                try:
+                    storage_result = probe_context(storage_context, auth_mode="storage_state")
+                    return {
+                        "enabled": True,
+                        "status": "ok" if storage_result.get("dashboard_authenticated") else "warning",
+                        "attempts": [attempt for attempt in [profile_result, storage_result] if attempt is not None],
+                        "selected_auth_mode": "storage_state" if storage_result.get("dashboard_authenticated") else None,
+                    }
+                finally:
+                    storage_context.close()
+                    browser.close()
+
+            return {
+                "enabled": True,
+                "status": "warning",
+                "attempts": [attempt for attempt in [profile_result] if attempt is not None],
+                "selected_auth_mode": None,
+            }

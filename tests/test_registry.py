@@ -20,10 +20,10 @@ def test_registry_registers_core_and_system_commands() -> None:
     assert args_portal.system == "portal"
     assert callable(args_portal.handler)
 
-    args_klms = parser.parse_args(["klms", "list", "courses"])
+    args_klms = parser.parse_args(["klms", "courses", "list"])
     assert args_klms.system == "klms"
-    assert args_klms.group == "list"
-    assert args_klms.resource == "courses"
+    assert args_klms.group == "courses"
+    assert args_klms.action == "list"
     assert callable(args_klms.handler)
 
     args_install_browser = parser.parse_args(["klms", "auth", "install-browser"])
@@ -36,4 +36,4 @@ def test_registry_registers_core_and_system_commands() -> None:
 def test_old_flat_klms_commands_are_not_parseable() -> None:
     parser = build_parser()
     with pytest.raises(SystemExit):
-        parser.parse_args(["klms", "courses"])
+        parser.parse_args(["klms", "list", "courses"])
