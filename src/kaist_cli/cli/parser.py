@@ -22,9 +22,9 @@ def build_parser() -> argparse.ArgumentParser:
             CLI for KAIST systems.
 
             KLMS quick start:
-              1) kaist klms config set --base-url https://klms.kaist.ac.kr
-              2) kaist klms auth login
-              3) kaist klms list courses
+              1) kaist klms auth login --base-url https://klms.kaist.ac.kr
+              2) kaist klms courses list
+              3) kaist klms today
             """
         ),
         formatter_class=HelpFormatter,

@@ -1,102 +1,52 @@
-# KAIST CLI Product Spec (KLMS)
+# KAIST CLI Product Spec
 
-## 1. Purpose
-Build a terminal interface for KLMS that is:
-- reliable for daily human use
-- deterministic for AI agent automation
-- resilient to KLMS frontend changes
-- fast enough for repeated sync/inbox workflows
+## Purpose
 
-This spec assumes read-only access to KLMS.
+Build a KLMS CLI that is:
+- fast for daily student use
+- deterministic for agent use
+- explicit about degraded capability and freshness
+- local-first instead of website-shaped
 
-## 2. User Personas
+## Current KLMS Information Architecture
 
-### 2.1 Human student user
-Needs:
-- low-friction daily checks (deadlines, notices, new files)
-- clear errors and recovery steps
-- fast commands with readable output
-
-### 2.2 Agent / automation runner
-Needs:
-- stable, versioned JSON contracts
-- strict stdout/stderr behavior
-- reliable exit codes and retry semantics
-- pagination/cursor support
-
-## 3. Product Principles
-1. API-first, browser-second
-2. Stable contracts before new features
-3. Explicit auth/session health
-4. Human and agent UX both first-class
-5. Fallback behavior must be visible in output
-
-## 4. Command Information Architecture (Target)
-
-Top-level stable groups:
-- `kaist klms auth`
-- `kaist klms list`
-- `kaist klms get`
-- `kaist klms sync`
+Task-first:
+- `kaist klms today`
 - `kaist klms inbox`
-- `kaist klms config`
+- `kaist klms sync`
 
-Experimental group:
-- `kaist klms dev`
+Resource-first:
+- `kaist klms courses list|show`
+- `kaist klms assignments list|show`
+- `kaist klms notices list|show`
+- `kaist klms files list|get|download|pull`
+- `kaist klms videos list|show`
 
-### 4.1 Auth
-- `auth login`
-- `auth status`
-- `auth refresh`
-- `auth doctor`
+Support:
+- `kaist klms auth login|install-browser|status|refresh|doctor`
+- `kaist klms dev plan|probe|discover`
 
-### 4.2 List
-- `list courses`
-- `list assignments`
-- `list notices`
-- `list files`
+## Product Principles
 
-Shared list options:
-- `--course-id`
-- `--notice-board-id`
-- `--since`
-- `--until`
-- `--limit`
-- `--cursor`
-- `--sort`
-- `--fields`
+1. API-first where KLMS exposes a usable interface.
+2. HTML is an acceptable contract when the site is server-rendered.
+3. Auth and degradation must be visible in output.
+4. Warm-path speed matters for daily use.
+5. Local cache and local files are first-class product assets.
 
-### 4.3 Get
-- `get course <id>`
-- `get assignment <id>`
-- `get notice <id>`
-- `get file <id-or-url>`
+## Output Contract
 
-### 4.4 Sync
-- `sync run`
-- `sync status`
-- `sync reset`
+All JSON commands use a versioned envelope:
 
-### 4.5 Inbox
-- `inbox` (priority-sorted blended feed)
-
-## 5. Output Contract
-
-## 5.1 Global output modes
-- `--format auto|json|table|text`
-- `--agent` implies machine-safe defaults:
-  - `--format json`
-  - no progress noise on stdout
-  - deterministic field ordering
-
-## 5.2 Envelope (all JSON commands)
 ```json
 {
-  "schema": "kaist.klms.<resource>.v1",
+  "schema": "kaist.klms.today.v1",
   "ok": true,
-  "generated_at": "2026-02-27T07:10:02Z",
+  "generated_at": "2026-03-16T00:00:00Z",
   "meta": {
-    "source": "api|html|mixed",
+    "command": "klms today",
+    "source": "mixed",
+    "capability": "degraded",
     "cursor": null,
     "next_cursor": null
   },
@@ -104,163 +54,81 @@ Shared list options:
 }
 ```
 
-## 5.3 Error envelope
+Errors use:
+
 ```json
 {
   "ok": false,
   "error": {
-    "code": "AUTH_EXPIRED",
-    "message": "Session is no longer valid.",
-    "retryable": true,
-    "hint": "kaist klms auth login"
+    "code": "AUTH_MISSING",
+    "message": "KLMS config not found.",
+    "retryable": false,
+    "hint": "Run `kaist klms auth login --base-url https://klms.kaist.ac.kr` first."
   }
 }
 ```
 
-## 5.4 Output channel rules
-- stdout: data only
-- stderr: diagnostics/progress/hints
-- no mixed human noise in JSON mode
+## Capability Model
 
-## 6. Error Code Registry (v1)
-- `AUTH_MISSING`
-- `AUTH_EXPIRED`
-- `AUTH_INVALID_ARTIFACT`
-- `NETWORK_TIMEOUT`
-- `NETWORK_UNAVAILABLE`
-- `PARSE_DRIFT`
-- `API_SHAPE_CHANGED`
-- `CONFIG_INVALID`
-- `NOT_FOUND`
-- `INTERNAL`
+Provider/source reporting should stay explicit:
+- `moodle_ajax`
+- `html`
+- `browser`
+- `cache`
+- `mixed`
 
-Exit code mapping:
-- `0` success
-- `10` auth errors
-- `20` network errors
-- `30` parse/api-shape errors
-- `40` config errors
-- `50` unknown internal errors
+Capability levels:
+- `full`
+- `partial`
+- `degraded`
 
-## 7. Data Model Contracts (v1)
-
-Entity schemas should be explicit (TypedDict or dataclass + serializer):
-- `Course`
-- `Assignment`
-- `Notice`
-- `Material`
-- `InboxItem`
-
-Required common fields:
-- `id` (string where available)
-- `title`
-- `url`
-- `source` (`api|html|fallback`)
-- `confidence` (`0.0..1.0`)
+`today` and `inbox` additionally report provider freshness:
+- `freshness_mode`
+- `cache_hit`
+- `stale`
 - `fetched_at`
+- `expires_at`
+- `refresh_attempted`
+- warning codes such as `STALE_CACHE` and `LIVE_REFRESH_TIMEOUT`
 
-## 8. Auth and Session UX
+## Auth Model
 
-### 8.1 Status semantics
-`auth status` should report:
-- active mode
-- validated boolean
-- final URL
-- cookie expiry windows
-- recommended next action
+KLMS auth is persisted under `~/.kaist-cli/private/klms/` using:
+- a Playwright profile
+- a storage-state export
+- cached browser runtime install
 
-### 8.2 Refresh semantics
-`auth refresh` should:
-- launch login flow if expired
-- regenerate storage state
-- verify dashboard access
-- return structured success/failure
+`auth status` and `auth doctor` must remain cheap and explicit.
 
-### 8.3 Doctor checks
-`auth doctor` should run:
-- artifact presence/permissions
-- online validation probe
-- cookie stats sanity
-- writeability checks under CLI home
+## Provider Strategy
 
-## 9. Architecture Plan
+Preferred order:
+1. Moodle-standard/API paths when actually usable on this KLMS instance
+2. Known KLMS AJAX methods
+3. HTML parsing
+4. Browser navigation only for auth/bootstrap or last resort
 
-Target module boundaries:
-- `auth.py`
-- `runtime.py`
-- `state_store.py`
-- `models.py`
-- `services/` (courses, assignments, notices, files, inbox, sync)
-- `discovery.py`
-- `dev_commands.py`
+## Performance Targets
 
-Rules:
-- browser only for login/bootstrap/discovery/fallback
-- API client first for data fetch paths
-- parser fallback must emit `source=fallback`
+Warm-path goals:
+- `today`: under 5 seconds
+- `inbox`: under 5 seconds
+- resource list/show commands: low single-digit seconds where feasible
 
-## 10. Performance Targets
+Cold-path behavior:
+- bounded live refresh
+- cache-first fallback for slow HTML-backed providers
+- partial results with explicit warnings instead of hanging
 
-SLO targets on warm session:
-- `list courses`: p95 < 2.0s
-- `inbox`: p95 < 4.0s
-- `sync run --dry-run`: p95 < 8.0s
+## Current Gaps
 
-Operational controls:
-- bounded concurrency
-- per-command timeout budget
-- retries with jitter for transient network errors
+Remaining major product work:
+- broader `courseboard` surface beyond notices
+- richer video actions such as open/download
+- optional local mirroring flows beyond `files pull`
 
-## 11. Testing and Reliability
+## Non-Goals
 
-Required test layers:
-1. contract tests for JSON envelopes and error shapes
-2. fixture parser tests from captured KLMS HTML
-3. service tests with mocked API payloads
-4. smoke workflow tests (`auth status`, `list`, `sync`) behind opt-in env flag
-
-Drift handling:
-- when parse/API shape mismatch occurs, write redacted debug artifact
-- return `PARSE_DRIFT` or `API_SHAPE_CHANGED` with hint
-
-## 12. Security and Safety
-- keep read-only default behavior
-- strict file permissions for session and state files
-- never log sensitive cookie payloads
-- avoid aggressive request rates
-
-## 13. Execution Roadmap
-
-### Phase A: Contracts and UX floor (1 week)
-- implement JSON envelope + error registry + exit codes
-- add `--agent` mode
-- enforce stdout/stderr contract
-
-### Phase B: Auth lifecycle (1 week)
-- implement `auth refresh`
-- implement `auth doctor`
-- add proactive expiry warnings
-
-### Phase C: API-first migration (2-3 weeks)
-- migrate notices to API-first
-- migrate assignments to API-first
-- keep HTML fallback with explicit source markers
-
-### Phase D: Daily usability (1 week)
-- implement `inbox`
-- standardize list filtering options
-- add shell completion and command examples
-
-### Phase E: Hardening (ongoing)
-- parser fixture corpus expansion
-- latency tracking and regression checks
-- automated smoke checks
-
-## 14. Definition of Done (v1)
-The CLI is considered v1-ready when:
-1. all stable commands emit versioned envelopes in JSON mode
-2. error codes and exit codes are fully implemented and documented
-3. auth refresh/doctor flows are working
-4. at least notices + assignments use API-first with reliable fallback
-5. inbox command is available and useful for daily workflow
-6. contract tests and smoke suite are green
+- backward compatibility with the removed legacy KLMS command grammar
+- pretending all KLMS surfaces have a clean hidden API
+- mutating workflows without an explicit product need
