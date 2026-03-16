@@ -272,6 +272,10 @@ def test_perform_self_update_switches_current_and_previous(tmp_path: Path, monke
     (install_root / "current").symlink_to(current_version)
     stale = install_root / "versions" / "v0.1.0"
     _populate_bundle_root(stale, "0.1.0")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    launcher_link = bin_dir / "kaist"
+    launcher_link.symlink_to(install_root / "current" / "bin" / "kaist")
 
     archive_path, checksums_path = _prepare_release_dir(tmp_path / "releases", "v0.1.5", bundle_mode="onedir")
     monkeypatch.setattr(updater, "platform_target", lambda: "darwin-arm64")
@@ -287,7 +291,7 @@ def test_perform_self_update_switches_current_and_previous(tmp_path: Path, monke
             ],
         },
     )
-    monkeypatch.setattr(updater, "_current_binary_path", lambda: install_root / "current" / "bin" / "kaist")
+    monkeypatch.setattr(updater, "_current_binary_path", lambda: launcher_link)
 
     def fake_download(url: str, destination: Path) -> None:
         if url == "archive-url":
@@ -309,6 +313,8 @@ def test_perform_self_update_switches_current_and_previous(tmp_path: Path, monke
     assert (install_root / "previous").resolve().name == "v0.1.4"
     assert not stale.exists()
     assert payload["binary_path"] == str(install_root / "current" / "bin" / "kaist" / "kaist")
+    assert payload["launcher_path"] == str(launcher_link)
+    assert launcher_link.resolve() == (install_root / "current" / "bin" / "kaist" / "kaist").resolve()
     assert json.loads((install_root / "mkt" / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"] == "0.1.5"
 
 

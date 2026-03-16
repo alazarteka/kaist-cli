@@ -309,6 +309,13 @@ def _managed_install_context(executable_path: Path) -> ManagedInstallContext | N
     )
 
 
+def _maybe_update_launcher_symlink(executable_path: Path, installed_binary_path: Path) -> str | None:
+    if executable_path.is_symlink() or not executable_path.exists():
+        _swap_symlink(executable_path, installed_binary_path)
+        return str(executable_path)
+    return None
+
+
 def _resolved_symlink(path: Path) -> Path | None:
     if not path.exists():
         return None
@@ -502,12 +509,19 @@ def perform_self_update() -> dict[str, Any]:
     current_bundle_root = ctx.current_link
     bundled_skill_path = current_bundle_root / manifest.skill_relpath
     installed_binary_path = current_bundle_root / manifest.binary_relpath
+    launcher_path: str | None = None
+    if ctx.install_root not in executable_path.parents:
+        try:
+            launcher_path = _maybe_update_launcher_symlink(executable_path, installed_binary_path)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"Could not update launcher symlink {executable_path}: {exc}")
 
     payload = {
         "ok": True,
         "updated": True,
         **check,
         "binary_path": str(installed_binary_path),
+        "launcher_path": launcher_path,
         "install_root": str(ctx.install_root),
         "bundled_skill_path": str(bundled_skill_path),
         "claude_marketplace_path": claude_marketplace_path,
