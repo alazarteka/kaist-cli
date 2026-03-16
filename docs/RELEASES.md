@@ -31,7 +31,7 @@ The archive must unpack to:
 
 The GitHub Actions workflow at `.github/workflows/release.yml`:
 
-1. Builds `kaist` with PyInstaller on `macos-14` for Apple silicon and `macos-13` for Intel.
+1. Builds `kaist` with PyInstaller on `macos-14` for Apple silicon and `macos-15-intel` for Intel.
 2. Calls `scripts/build_release_bundle.sh` to package one managed bundle archive per target.
 3. Generates a combined `checksums.txt` covering both release archives.
 4. Uploads both archives plus `checksums.txt` to the GitHub release for the tag.
