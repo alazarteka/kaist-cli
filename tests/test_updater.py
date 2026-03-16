@@ -196,7 +196,10 @@ def test_build_release_bundle_contains_skill_and_manifest(
         assert binary_relpath in names
         assert "skills/kaist-cli/SKILL.md" in names
         assert "skills/kaist-cli/agents/openai.yaml" in names
+        assert "skills/kaist-cli/.claude-plugin/plugin.json" in names
+        assert "skills/kaist-cli/.claude-plugin/marketplace.json" in names
         manifest = json.loads(tar.extractfile("bundle.json").read().decode("utf-8"))  # type: ignore[union-attr]
+        bundled_marketplace = json.loads(tar.extractfile("skills/kaist-cli/.claude-plugin/marketplace.json").read().decode("utf-8"))  # type: ignore[union-attr]
 
     assert manifest == {
         "version": "0.1.4",
@@ -205,6 +208,7 @@ def test_build_release_bundle_contains_skill_and_manifest(
         "binary_relpath": binary_relpath,
         "skill_relpath": "skills/kaist-cli",
     }
+    assert bundled_marketplace["plugins"][0]["version"] == "0.1.4"
 
 
 @pytest.mark.parametrize("target", ["darwin-arm64", "darwin-x86_64"])
@@ -240,6 +244,7 @@ def test_install_script_installs_managed_layout_and_rotates_previous(tmp_path: P
     assert (install_root / "current").resolve().name == "v0.1.4"
     assert not (install_root / "previous").exists()
     assert (install_root / "current" / "skills" / "kaist-cli" / "SKILL.md").exists()
+    assert json.loads((install_root / "current" / "skills" / "kaist-cli" / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"] == "0.1.4"
     assert json.loads((install_root / "mkt" / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"] == "0.1.4"
     assert (install_root / "mkt" / "plugins" / "kaist-cli" / "skills" / "kaist-cli").is_symlink()
     assert "Bundled skill:" in first.stdout
@@ -262,6 +267,7 @@ def test_install_script_installs_managed_layout_and_rotates_previous(tmp_path: P
     assert (install_root / "previous").resolve().name == "v0.1.4"
     assert not stale.exists()
     assert (bin_dir / "kaist").resolve() == (install_root / "current" / "bin" / "kaist" / "kaist").resolve()
+    assert json.loads((install_root / "current" / "skills" / "kaist-cli" / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"] == "0.1.5"
     assert json.loads((install_root / "mkt" / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"] == "0.1.5"
 
 

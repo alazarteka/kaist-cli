@@ -30,6 +30,7 @@ Use the installed `kaist` command as the primary automation surface for KLMS.
   - `kaist klms auth install-browser`
 - First-time login:
   - `kaist klms auth login --base-url https://klms.kaist.ac.kr`
+  - This is the interactive browser flow and is not suitable for headless or non-interactive shells.
 - Non-interactive Easy Login:
   - `kaist klms auth login --base-url https://klms.kaist.ac.kr --username KAIST_ID`
   - This uses KAIST SSO Easy Login and prints the approval number for the KAIST auth app.
@@ -55,6 +56,7 @@ Use the installed `kaist` command as the primary automation surface for KLMS.
   - `kaist klms sync run`
   - `kaist klms sync status`
   - `kaist klms sync reset`
+  - Use `sync run` before `today`/`inbox` when you want a warm cache for slower notice/file providers.
 - Drill-down surfaces:
   - `kaist klms courses list`
   - `kaist klms courses show ID`
@@ -113,5 +115,6 @@ Use the installed `kaist` command as the primary automation surface for KLMS.
 
 - KLMS state is stored under `~/.kaist-cli/`.
 - The CLI caches notices/files for faster warm-path reads.
+- Installed release bundles also include Claude metadata under `skills/kaist-cli/.claude-plugin/`.
 - Use the CLI’s own commands before falling back to browser automation or direct scraping.
 - `kaist --help` and `kaist --agent version` should report the bundled skill path when installed from a release bundle.

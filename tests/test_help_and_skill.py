@@ -52,6 +52,7 @@ def test_skill_mentions_agent_envelope_and_auth_setup() -> None:
         "`kaist --agent ...`",
         "`kaist klms auth install-browser`",
         "`kaist klms auth login --base-url https://klms.kaist.ac.kr --username KAIST_ID`",
+        "`kaist klms sync run`",
         "`--since`",
         "`courses show`",
         "`assignments show`",
@@ -60,3 +61,4 @@ def test_skill_mentions_agent_envelope_and_auth_setup() -> None:
         "`files get`",
     ):
         assert needle in body
+    assert "not suitable for headless or non-interactive shells" in body

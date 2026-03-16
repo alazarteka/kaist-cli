@@ -1,0 +1,7 @@
+{
+  "name": "kaist-cli",
+  "description": "Operate KLMS through the installed kaist CLI.",
+  "author": {
+    "name": "kaist-cli"
+  }
+}

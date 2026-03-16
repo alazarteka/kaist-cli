@@ -166,19 +166,24 @@ prune_versions() {
 sync_claude_marketplace() {
   local install_root="$1"
   local version="$2"
-  local marketplace_root plugin_root skill_target skill_link plugin_json marketplace_json
+  local marketplace_root plugin_root skill_target skill_link plugin_json marketplace_json source_plugin_json source_marketplace_json
   marketplace_root="$install_root/mkt"
   plugin_root="$marketplace_root/plugins/kaist-cli"
   skill_target="$install_root/current/skills/kaist-cli"
   skill_link="$plugin_root/skills/kaist-cli"
   plugin_json="$plugin_root/.claude-plugin/plugin.json"
   marketplace_json="$marketplace_root/.claude-plugin/marketplace.json"
+  source_plugin_json="$skill_target/.claude-plugin/plugin.json"
+  source_marketplace_json="$skill_target/.claude-plugin/marketplace.json"
 
   mkdir -p "$plugin_root/.claude-plugin" "$(dirname "$skill_link")" "$(dirname "$marketplace_json")"
   rm -rf "$skill_link"
   ln -sfn "$skill_target" "$skill_link"
 
-  cat >"$plugin_json" <<JSON
+  if [[ -f "$source_plugin_json" ]]; then
+    cp "$source_plugin_json" "$plugin_json"
+  else
+    cat >"$plugin_json" <<JSON
 {
   "name": "kaist-cli",
   "description": "Operate KLMS through the installed kaist CLI.",
@@ -187,8 +192,15 @@ sync_claude_marketplace() {
   }
 }
 JSON
+  fi
 
-  cat >"$marketplace_json" <<JSON
+  if [[ -f "$source_marketplace_json" ]]; then
+    cp "$source_marketplace_json" "$marketplace_json"
+    sed -i.bak "s/__KAIST_VERSION__/${version}/g" "$marketplace_json"
+    sed -i.bak 's#"source": "."#"source": "./plugins/kaist-cli"#' "$marketplace_json"
+    rm -f "$marketplace_json.bak"
+  else
+    cat >"$marketplace_json" <<JSON
 {
   "name": "kaist-cli",
   "owner": {
@@ -208,6 +220,7 @@ JSON
   ]
 }
 JSON
+  fi
 }
 
 REPO="${KAIST_RELEASE_REPO:-alazarteka/kaist-cli}"

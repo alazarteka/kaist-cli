@@ -449,6 +449,75 @@ def _provider_warning(code: str, message: str, **extra: Any) -> dict[str, Any]:
     return payload
 
 
+def _notice_detail_target(notice: Notice, *, base_url: str) -> str | None:
+    if notice.url:
+        return str(notice.url)
+    if notice.board_id and notice.id:
+        return abs_url(base_url, f"/mod/courseboard/article.php?id={notice.board_id}&bwid={notice.id}")
+    return None
+
+
+def _merge_notice_rows(list_row: Notice, detail_row: Notice, *, auth_mode: str) -> Notice:
+    return Notice(
+        board_id=detail_row.board_id or list_row.board_id,
+        id=detail_row.id or list_row.id,
+        title=detail_row.title or list_row.title,
+        url=detail_row.url or list_row.url,
+        posted_raw=detail_row.posted_raw or list_row.posted_raw,
+        posted_iso=detail_row.posted_iso or list_row.posted_iso,
+        author=detail_row.author or list_row.author,
+        body_text=detail_row.body_text or list_row.body_text,
+        body_html=detail_row.body_html or list_row.body_html,
+        attachments=detail_row.attachments or list_row.attachments,
+        detail_available=bool(detail_row.detail_available or list_row.detail_available),
+        source=detail_row.source or list_row.source,
+        confidence=max(float(detail_row.confidence or 0.0), float(list_row.confidence or 0.0)),
+        auth_mode=auth_mode or detail_row.auth_mode or list_row.auth_mode,
+    )
+
+
+def _enrich_notice_items_from_detail(
+    items: list[Notice],
+    *,
+    base_url: str,
+    auth_mode: str,
+    bootstrap: KlmsSessionBootstrap,
+    deadline: RefreshDeadline | None,
+) -> list[Notice]:
+    targets: dict[str, Notice] = {}
+    for notice in items:
+        target = _notice_detail_target(notice, base_url=base_url)
+        if target:
+            targets[target] = notice
+    if not targets:
+        return items
+
+    responses = fetch_html_batch(
+        bootstrap.http,
+        list(targets.keys()),
+        deadline=deadline,
+        max_workers=MAX_NOTICE_HTTP_WORKERS,
+    )
+    enriched: list[Notice] = []
+    for notice in items:
+        target = _notice_detail_target(notice, base_url=base_url)
+        response = responses.get(target or "")
+        if response is None or looks_login_url(response.url) or looks_logged_out_html(response.text) or looks_klms_error_html(response.text):
+            enriched.append(notice)
+            continue
+        detail = _parse_notice_detail_from_html(
+            response.text,
+            base_url=base_url,
+            url=response.url,
+            fallback_board_id=notice.board_id,
+            fallback_notice_id=notice.id,
+            include_html=False,
+            auth_mode=auth_mode,
+        )
+        enriched.append(_merge_notice_rows(notice, detail, auth_mode=auth_mode))
+    return enriched
+
+
 def _parse_notice_detail_from_html(
     html: str,
     *,
@@ -641,14 +710,15 @@ class NoticeService:
         cached_rows = cache_entry.get("value") if isinstance(cache_entry, dict) else None
         cached_items = [Notice(**row) for row in cached_rows if isinstance(row, dict)] if isinstance(cached_rows, list) else []
         cached_filtered = _finalize_notice_items(cached_items, since_iso=since_iso, limit=limit)
-        if prefer_cache and cache_entry is not None and not bool(cache_entry.get("stale")):
+        cache_fresh_enough = _cache_is_fresh_enough(cache_entry)
+        if prefer_cache and cache_entry is not None and (not bool(cache_entry.get("stale")) or cache_fresh_enough):
             return ProviderLoad(
                 items=[item.to_dict() for item in cached_filtered],
                 source="html",
                 capability="partial",
                 freshness_mode="cache",
                 cache_hit=True,
-                stale=False,
+                stale=bool(cache_entry.get("stale")),
                 fetched_at=_iso_from_epoch_seconds(cache_entry.get("stored_at")),
                 expires_at=_iso_from_epoch_seconds(cache_entry.get("expires_at")),
                 refresh_attempted=False,
@@ -1125,6 +1195,29 @@ class NoticeService:
                     break
             if limit is not None and _matching_notice_count(all_items, since_iso=since_iso) >= limit:
                 break
+
+        final_items = _finalize_notice_items(all_items, since_iso=since_iso, limit=limit)
+        final_keys = {
+            (str(item.board_id or ""), str(item.id or ""), str(item.url or ""))
+            for item in final_items
+        }
+        if final_items:
+            enriched = _enrich_notice_items_from_detail(
+                final_items,
+                base_url=config.base_url,
+                auth_mode=auth_mode,
+                bootstrap=bootstrap,
+                deadline=deadline,
+            )
+            enriched_map = {
+                (str(item.board_id or ""), str(item.id or ""), str(item.url or "")): item
+                for item in enriched
+            }
+            updated_items: list[Notice] = []
+            for item in all_items:
+                key = (str(item.board_id or ""), str(item.id or ""), str(item.url or ""))
+                updated_items.append(enriched_map.get(key, item) if key in final_keys else item)
+            all_items = updated_items
 
         save_cache_value(self._paths, self._notice_list_cache_key(config, board_ids, max_pages), [item.to_dict() for item in all_items], ttl_seconds=NOTICE_LIST_TTL_SECONDS)
         return all_items

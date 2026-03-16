@@ -95,7 +95,7 @@ wheels = [
 
 [[package]]
 name = "kaist-cli"
-version = "0.4.3"
+version = "0.4.5"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },

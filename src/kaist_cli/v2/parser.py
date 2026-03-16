@@ -45,13 +45,13 @@ def register_klms_parser(
 
     auth_login = auth_sub.add_parser(
         "login",
-        help="Create a new KLMS session via manual browser login or KAIST Easy Login push approval.",
-        description="Create a new KLMS session via manual browser login or KAIST Easy Login push approval.",
+        help="Create a new KLMS session via interactive browser login or non-interactive KAIST Easy Login push approval.",
+        description="Create a new KLMS session via interactive browser login or non-interactive KAIST Easy Login push approval.",
         formatter_class=_HelpFormatter,
     )
     auth_login.add_argument("--base-url", metavar="URL", help="Persist this KLMS base URL before opening the browser.")
     auth_login.add_argument("--dashboard-path", metavar="PATH", help="Optional dashboard path override, default /my/.")
-    auth_login.add_argument("--username", metavar="ID", help="Use KAIST SSO Easy Login with this KAIST account ID instead of the manual browser flow.")
+    auth_login.add_argument("--username", metavar="ID", help="Use the non-interactive KAIST SSO Easy Login push flow with this KAIST account ID instead of the manual browser flow.")
     auth_login.add_argument("--wait-seconds", type=float, default=180.0, metavar="N", help="Maximum time to wait for KAIST Easy Login approval.")
     _set_defaults(auth_login, schema_name=f"{schema_prefix}.auth.login.v1", command_path="klms auth login", handler=handler)
 
@@ -79,13 +79,13 @@ def register_klms_parser(
 
     auth_refresh = auth_sub.add_parser(
         "refresh",
-        help="Renew an existing KLMS session using saved config and saved Easy Login username when available.",
-        description="Renew an existing KLMS session using saved config and saved Easy Login username when available.",
+        help="Renew an existing KLMS session using saved config and the saved non-interactive Easy Login username when available.",
+        description="Renew an existing KLMS session using saved config and the saved non-interactive Easy Login username when available.",
         formatter_class=_HelpFormatter,
     )
     auth_refresh.add_argument("--base-url", metavar="URL", help="Optional base URL override before refreshing auth.")
     auth_refresh.add_argument("--dashboard-path", metavar="PATH", help="Optional dashboard path override, default /my/.")
-    auth_refresh.add_argument("--username", metavar="ID", help="Use KAIST SSO Easy Login with this KAIST account ID instead of the manual browser flow.")
+    auth_refresh.add_argument("--username", metavar="ID", help="Use the non-interactive KAIST SSO Easy Login push flow with this KAIST account ID instead of the manual browser flow.")
     auth_refresh.add_argument("--wait-seconds", type=float, default=180.0, metavar="N", help="Maximum time to wait for KAIST Easy Login approval.")
     _set_defaults(
         auth_refresh,

@@ -186,24 +186,28 @@ def _emit_sync_summary(data: dict[str, Any]) -> bool:
     providers = data.get("providers")
     if not isinstance(providers, dict):
         return False
-    print("Sync status:")
+    print("Sync summary:")
     for name in ("notice_board_ids", "notices", "files"):
         provider = providers.get(name)
         if not isinstance(provider, dict):
             continue
-        count = provider.get("count", provider.get("entry_count", 0))
-        source = provider.get("source")
-        freshness = provider.get("freshness_mode")
-        latest = provider.get("latest") if isinstance(provider.get("latest"), dict) else None
-        detail = []
-        if source:
-            detail.append(str(source))
-        if freshness:
-            detail.append(str(freshness))
-        if latest and latest.get("age_seconds") is not None:
-            detail.append(f"age={int(float(latest['age_seconds']))}s")
+        status = str(provider.get("status") or "unknown")
+        item_count = provider.get("item_count")
+        duration_ms = provider.get("duration_ms")
+        detail: list[str] = []
+        if item_count is not None:
+            noun = "item" if int(item_count) == 1 else "items"
+            detail.append(f"{int(item_count)} {noun}")
+        if provider.get("source"):
+            detail.append(str(provider.get("source")))
+        if provider.get("freshness_mode"):
+            detail.append(str(provider.get("freshness_mode")))
+        if duration_ms is not None:
+            detail.append(f"{int(duration_ms)}ms")
+        elif provider.get("age_seconds") is not None:
+            detail.append(f"age={int(float(provider['age_seconds']))}s")
         suffix = f" ({', '.join(detail)})" if detail else ""
-        print(f"- {name}: {count}{suffix}")
+        print(f"- {name}: {status}{suffix}")
     warnings = data.get("warnings") or []
     if warnings:
         print("")

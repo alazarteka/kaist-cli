@@ -5,8 +5,11 @@ import os
 import subprocess
 import sys
 import time
+from contextlib import redirect_stdout
 from datetime import datetime
+from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from bs4 import BeautifulSoup  # type: ignore[import-untyped]
@@ -15,20 +18,21 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from kaist_cli.v2.klms import auth as auth_module
+from kaist_cli.cli.output import emit_text
 from kaist_cli.v2.contracts import CommandError, CommandResult
 from kaist_cli.v2.klms.cache import load_cache_entry, load_cache_value, save_cache_value
 from kaist_cli.v2.klms import dashboard as dashboard_module
 from kaist_cli.v2.klms.auth import AuthService
 from kaist_cli.v2.klms.auth import _EasyLoginSignals, _extract_easy_login_error_message, _extract_easy_login_number, _extract_sso_login_view_url, looks_login_url
-from kaist_cli.v2.klms.assignments import _extract_assignment_detail_from_html, _extract_assignment_rows_from_calendar_data
-from kaist_cli.v2.klms.courses import _parse_recent_courses_payload
+from kaist_cli.v2.klms.assignments import _extract_assignment_detail_from_html, _extract_assignment_rows_from_calendar_data, _filter_assignments
+from kaist_cli.v2.klms.courses import _course_is_current_term, _parse_recent_courses_payload
 from kaist_cli.v2.klms.capture import _courseboard_runtime_capture_summary, _extract_courseboard_js_hints
 from kaist_cli.v2.klms.config import load_config
 from kaist_cli.v2.klms.dashboard import DashboardService, _build_inbox_items, _decorate_today_assignments, _filter_inbox_assignments, _select_recent_notices
 from kaist_cli.v2.klms.discovery import load_recent_courses_args, map_discovery_report
-from kaist_cli.v2.klms.files import _extract_file_items_from_course_contents, _extract_file_items_from_html, _pull_subdir_for_item, _sanitize_relpath, _synthesize_file_item_from_url, _unwrap_moodle_ajax_payload
-from kaist_cli.v2.klms.models import FileItem
-from kaist_cli.v2.klms.notices import _discover_notice_board_ids_from_course_page, _extract_course_ids_from_dashboard, _parse_notice_detail_from_html, _parse_notice_items_from_soup
+from kaist_cli.v2.klms.files import FileService, _extract_file_items_from_course_contents, _extract_file_items_from_html, _pull_subdir_for_item, _sanitize_relpath, _synthesize_file_item_from_url, _unwrap_moodle_ajax_payload
+from kaist_cli.v2.klms.models import Assignment, Course, FileItem
+from kaist_cli.v2.klms.notices import NoticeService, _discover_notice_board_ids_from_course_page, _extract_course_ids_from_dashboard, _parse_notice_detail_from_html, _parse_notice_items_from_soup
 from kaist_cli.v2.klms.paths import resolve_paths
 from kaist_cli.v2.klms.provider_state import ProviderLoad
 from kaist_cli.v2.klms.videos import _extract_video_items_from_html, _parse_video_detail_from_html, _parse_video_viewer_from_html
@@ -510,6 +514,31 @@ def test_wait_for_easy_login_approval_tolerates_page_content_error_during_naviga
     assert result.data["username"] == "student123"
 
 
+def test_manual_login_fails_early_without_interactive_stdin(tmp_path: Path, monkeypatch) -> None:
+    class FakeStdin:
+        def isatty(self) -> bool:
+            return False
+
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        auth = AuthService(paths)
+        config = load_config(paths)
+        monkeypatch.setattr(auth_module.sys, "stdin", FakeStdin())
+        with pytest.raises(CommandError) as excinfo:
+            auth._manual_login(config=config)
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert excinfo.value.code == "AUTH_FLOW_UNSUPPORTED"
+    assert "--username" in (excinfo.value.hint or "")
+
+
 def test_install_browser_reports_linux_dependency_hint(tmp_path: Path, monkeypatch) -> None:
     old_home = os.environ.get("KAIST_CLI_HOME")
     os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
@@ -603,6 +632,20 @@ def test_parse_recent_courses_payload_extracts_courses_and_term() -> None:
     assert courses[0].source == "ajax:core_course_get_recent_courses"
 
 
+def test_course_without_term_label_is_not_current_term() -> None:
+    course = Course(
+        id="147806",
+        title="기출문제은행",
+        url="https://klms.kaist.ac.kr/course/view.php?id=147806",
+        course_code=None,
+        course_code_base=None,
+        term_label=None,
+        source="html:dashboard",
+        confidence=0.5,
+    )
+    assert _course_is_current_term(course, "2026 Spring", include_past=False) is False
+
+
 def test_courses_list_requires_auth_artifact(tmp_path: Path) -> None:
     _write_config(tmp_path)
     cp = run_v2(tmp_path, "--json", "klms", "courses", "list")
@@ -645,6 +688,50 @@ def test_extract_assignment_rows_from_calendar_data_uses_nested_course() -> None
     assert assignments[0].course_code == "MAS101-(AP)"
     assert assignments[0].due_raw == "Friday, 24 March, 10:25"
     assert assignments[0].due_iso == "2023-03-24T01:25:00Z"
+
+
+def test_filter_assignments_defaults_to_current_term_course_ids() -> None:
+    assignments = [
+        Assignment(
+            id="1",
+            title="Current HW",
+            url=None,
+            due_raw=None,
+            due_iso="2026-03-17T14:59:00Z",
+            course_id="180871",
+            course_title="알고리즘 개론",
+            course_code="CS.30000_2026_1",
+            course_code_base="CS.30000",
+            source="api",
+            confidence=0.9,
+        ),
+        Assignment(
+            id="2",
+            title="Old HW",
+            url=None,
+            due_raw=None,
+            due_iso="2025-11-10T14:59:00Z",
+            course_id="170001",
+            course_title="Old Course",
+            course_code="CS.49200_2025_3",
+            course_code_base="CS.49200",
+            source="api",
+            confidence=0.9,
+        ),
+    ]
+
+    filtered = _filter_assignments(
+        assignments,
+        course_id=None,
+        course_query=None,
+        since_iso=None,
+        limit=None,
+        current_term_label="2026 Spring",
+        current_term_course_ids={"180871"},
+        include_past=False,
+    )
+
+    assert [assignment.id for assignment in filtered] == ["1"]
 
 
 def test_assignments_list_requires_auth_artifact(tmp_path: Path) -> None:
@@ -786,6 +873,72 @@ def test_parse_notice_detail_from_html_extracts_body_and_attachments() -> None:
     assert notice.author == "Prof. Kim"
     assert notice.detail_available is True
     assert notice.attachments[0]["filename"] == "file.pdf"
+
+
+def test_notice_refresh_enriches_returned_items_with_detail_timestamp(tmp_path: Path) -> None:
+    class FakeHttp:
+        def __init__(self, responses: dict[str, SimpleNamespace]) -> None:
+            self._responses = responses
+
+        def get_html(self, url_or_path: str, *, timeout_seconds: float = 20.0, context=None):  # type: ignore[no-untyped-def]
+            response = self._responses.get(url_or_path)
+            if response is None:
+                raise AssertionError(f"unexpected fetch: {url_or_path}")
+            return response
+
+    board_path = "/mod/courseboard/view.php?id=838536"
+    detail_path = "https://klms.kaist.ac.kr/mod/courseboard/article.php?id=838536&bwid=423326"
+    board_html = """
+    <html><body>
+      <table>
+        <tr><th>Title</th><th>Date</th></tr>
+        <tr><td><a href="/mod/courseboard/article.php?id=838536&bwid=423326">Exam notice</a></td><td>2026-03-16</td></tr>
+      </table>
+    </body></html>
+    """
+    detail_html = """
+    <html><body>
+      <h1>Exam notice</h1>
+      <table>
+        <tr><th>작성일</th><td>2026-03-16 09:57</td></tr>
+      </table>
+      <div class="article-content"><p>Details</p></div>
+    </body></html>
+    """
+
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        service = NoticeService(paths, AuthService(paths))
+        bootstrap = SimpleNamespace(
+            http=FakeHttp(
+                {
+                    board_path: SimpleNamespace(url=f"https://klms.kaist.ac.kr{board_path}", text=board_html, via="http"),
+                    detail_path: SimpleNamespace(url=detail_path, text=detail_html, via="http"),
+                }
+            )
+        )
+
+        notices = service._refresh_notice_items(
+            config=load_config(paths),
+            auth_mode="profile",
+            board_ids=["838536"],
+            max_pages=1,
+            since_iso=None,
+            limit=1,
+            bootstrap=bootstrap,
+            deadline=None,
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert len(notices) == 1
+    assert notices[0].posted_iso == "2026-03-16T00:57:00Z"
 
 
 def test_notices_list_requires_auth_artifact(tmp_path: Path) -> None:
@@ -1376,6 +1529,138 @@ def test_dashboard_today_parallelizes_provider_refresh(tmp_path: Path) -> None:
     assert result.data["providers"]["notices"]["ok"] is True
     assert result.data["providers"]["files"]["ok"] is True
     assert elapsed < 0.35
+
+
+def test_notice_dashboard_load_uses_recent_stale_cache_without_live_refresh(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        service = NoticeService(paths, AuthService(paths))
+        cache_key = service._notice_list_cache_key(config, ["838536"], 1)
+        save_cache_value(
+            paths,
+            cache_key,
+            [
+                {
+                    "board_id": "838536",
+                    "id": "423326",
+                    "title": "Exam notice",
+                    "url": "https://klms.kaist.ac.kr/mod/courseboard/article.php?id=838536&bwid=423326",
+                    "posted_raw": "2026-03-16 09:57",
+                    "posted_iso": "2026-03-16T00:57:00Z",
+                    "source": "html:courseboard",
+                    "confidence": 0.7,
+                }
+            ],
+            ttl_seconds=60,
+        )
+        payload = json.loads(paths.cache_path.read_text(encoding="utf-8"))
+        payload["entries"][cache_key]["expires_at"] = 1
+        payload["entries"][cache_key]["stored_at"] = time.time()
+        paths.cache_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        monkeypatch.setattr(service, "_resolve_notice_board_ids", lambda **kwargs: ["838536"])
+        monkeypatch.setattr(service, "_refresh_notice_items", lambda **kwargs: (_ for _ in ()).throw(AssertionError("live refresh should be skipped")))
+
+        result = service.load_for_dashboard(
+            context=object(),
+            config=config,
+            auth_mode="profile",
+            bootstrap=SimpleNamespace(),
+            prefer_cache=True,
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result.cache_hit is True
+    assert result.refresh_attempted is False
+    assert result.warnings == ()
+
+
+def test_file_dashboard_load_uses_recent_stale_cache_without_live_refresh(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        service = FileService(paths, AuthService(paths))
+        bootstrap = SimpleNamespace(
+            dashboard_html='<a href="/course/view.php?id=180871">Introduction to Algorithms(CS.30000_2026_1)</a>'
+        )
+        cache_key = service._file_list_cache_key(config, ["180871"])
+        save_cache_value(
+            paths,
+            cache_key,
+            [
+                {
+                    "id": "991",
+                    "title": "Week 1 Slides",
+                    "url": "https://klms.kaist.ac.kr/mod/resource/view.php?id=991",
+                    "download_url": "https://klms.kaist.ac.kr/pluginfile.php/123/week1.pdf?forcedownload=1",
+                    "filename": "week1.pdf",
+                    "kind": "file",
+                    "downloadable": True,
+                    "course_id": "180871",
+                    "course_title": "Introduction to Algorithms",
+                    "course_code": "CS.30000_2026_1",
+                    "course_code_base": "CS.30000",
+                    "source": "html:course-view",
+                    "confidence": 0.7,
+                }
+            ],
+            ttl_seconds=60,
+        )
+        payload = json.loads(paths.cache_path.read_text(encoding="utf-8"))
+        payload["entries"][cache_key]["expires_at"] = 1
+        payload["entries"][cache_key]["stored_at"] = time.time()
+        paths.cache_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        monkeypatch.setattr(service, "_refresh_file_items", lambda **kwargs: (_ for _ in ()).throw(AssertionError("live refresh should be skipped")))
+
+        result = service.load_for_dashboard(
+            context=object(),
+            config=config,
+            auth_mode="profile",
+            bootstrap=bootstrap,
+            prefer_cache=True,
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result.cache_hit is True
+    assert result.refresh_attempted is False
+    assert result.warnings == ()
+
+
+def test_sync_text_output_is_provider_summary() -> None:
+    buffer = StringIO()
+    with redirect_stdout(buffer):
+        emit_text(
+            {
+                "providers": {
+                    "notice_board_ids": {"status": "cache_hit", "item_count": 6, "age_seconds": 12},
+                    "notices": {"status": "refreshed", "item_count": 18, "duration_ms": 420, "source": "html"},
+                    "files": {"status": "cache_hit", "item_count": 4, "source": "html", "freshness_mode": "cache"},
+                },
+                "warnings": [],
+            },
+            command_path="klms sync run",
+        )
+    output = buffer.getvalue()
+    assert "Sync summary:" in output
+    assert "notices: refreshed" in output
+    assert "18 items" in output
+    assert "files: cache_hit" in output
 
 
 def test_today_requires_auth_artifact(tmp_path: Path) -> None:

@@ -96,6 +96,10 @@ if [[ ! -e "$stage_dir/$binary_relpath" ]]; then
 fi
 chmod +x "$stage_dir/$binary_relpath"
 cp -R "$skill_dir" "$stage_dir/skills/"
+if [[ -f "$stage_dir/skills/kaist-cli/.claude-plugin/marketplace.json" ]]; then
+  sed -i.bak "s/__KAIST_VERSION__/${version_no_v}/g" "$stage_dir/skills/kaist-cli/.claude-plugin/marketplace.json"
+  rm -f "$stage_dir/skills/kaist-cli/.claude-plugin/marketplace.json.bak"
+fi
 
 cat >"$stage_dir/bundle.json" <<EOF
 {

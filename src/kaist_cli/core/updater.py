@@ -373,6 +373,8 @@ def _sync_claude_plugin_metadata(install_root: Path, *, version: str) -> Path:
     plugin_manifest_path = plugin_root / ".claude-plugin" / "plugin.json"
     marketplace_manifest_path = marketplace_root / ".claude-plugin" / "marketplace.json"
     skill_target = install_root / "current" / "skills" / "kaist-cli"
+    source_plugin_manifest_path = skill_target / ".claude-plugin" / "plugin.json"
+    source_marketplace_manifest_path = skill_target / ".claude-plugin" / "marketplace.json"
     skill_link = plugin_root / "skills" / "kaist-cli"
 
     plugin_root.mkdir(parents=True, exist_ok=True)
@@ -381,31 +383,52 @@ def _sync_claude_plugin_metadata(install_root: Path, *, version: str) -> Path:
         _remove_path(skill_link)
     skill_link.symlink_to(skill_target, target_is_directory=True)
 
-    _write_json(
-        plugin_manifest_path,
-        {
-            "name": "kaist-cli",
-            "description": "Operate KLMS through the installed kaist CLI.",
-            "author": {"name": "kaist-cli"},
-        },
-    )
-    _write_json(
-        marketplace_manifest_path,
-        {
-            "name": "kaist-cli",
-            "owner": {"name": "kaist-cli"},
-            "plugins": [
-                {
-                    "name": "kaist-cli",
-                    "description": "Operate KLMS through the installed kaist CLI.",
-                    "version": str(version),
-                    "author": {"name": "kaist-cli"},
-                    "source": "./plugins/kaist-cli",
-                    "category": "productivity",
-                }
-            ],
-        },
-    )
+    plugin_payload = {
+        "name": "kaist-cli",
+        "description": "Operate KLMS through the installed kaist CLI.",
+        "author": {"name": "kaist-cli"},
+    }
+    if source_plugin_manifest_path.exists():
+        try:
+            raw_plugin_payload = json.loads(source_plugin_manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            raw_plugin_payload = None
+        if isinstance(raw_plugin_payload, dict):
+            plugin_payload = raw_plugin_payload
+    _write_json(plugin_manifest_path, plugin_payload)
+
+    marketplace_payload = {
+        "name": "kaist-cli",
+        "owner": {"name": "kaist-cli"},
+        "plugins": [
+            {
+                "name": "kaist-cli",
+                "description": "Operate KLMS through the installed kaist CLI.",
+                "version": str(version),
+                "author": {"name": "kaist-cli"},
+                "source": "./plugins/kaist-cli",
+                "category": "productivity",
+            }
+        ],
+    }
+    if source_marketplace_manifest_path.exists():
+        try:
+            raw_marketplace_payload = json.loads(source_marketplace_manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            raw_marketplace_payload = None
+        if isinstance(raw_marketplace_payload, dict):
+            marketplace_payload = raw_marketplace_payload
+    plugins = marketplace_payload.get("plugins")
+    if not isinstance(plugins, list) or not plugins:
+        plugins = [{}]
+        marketplace_payload["plugins"] = plugins
+    first = plugins[0]
+    if not isinstance(first, dict):
+        first = {}
+        plugins[0] = first
+    first["version"] = str(version)
+    first["source"] = "./plugins/kaist-cli"
+    _write_json(marketplace_manifest_path, marketplace_payload)
     return marketplace_manifest_path
 
 

@@ -24,11 +24,21 @@ class ProviderLoad:
         return CommandResult(data=self.items, source=self.source, capability=self.capability)
 
     def provider_status(self) -> dict[str, Any]:
+        if not self.ok:
+            status = "failed"
+        elif self.refresh_attempted:
+            status = "refreshed"
+        elif self.cache_hit:
+            status = "cache_hit"
+        else:
+            status = "skipped"
         payload: dict[str, Any] = {
             "ok": self.ok,
+            "status": status,
             "source": self.source,
             "capability": self.capability,
             "count": len(self.items),
+            "item_count": len(self.items),
             "freshness_mode": self.freshness_mode,
             "cache_hit": self.cache_hit,
             "stale": self.stale,
@@ -38,6 +48,7 @@ class ProviderLoad:
         }
         if self.warnings:
             payload["warning_codes"] = [str(warning.get("code") or "") for warning in self.warnings if str(warning.get("code") or "").strip()]
+            payload["warnings"] = [dict(warning) for warning in self.warnings]
         return payload
 
     def provider_warnings(self, provider: str) -> list[dict[str, Any]]:

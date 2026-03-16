@@ -81,7 +81,7 @@ def _course_is_current_term(course: Course, current_term_label: str | None, *, i
     if include_past or not current_term_label:
         return True
     if not course.term_label:
-        return True
+        return False
     return _norm_text(course.term_label).lower() == _norm_text(current_term_label).lower()
 
 
@@ -91,6 +91,7 @@ def _is_noise_course(title: str, exclude_patterns: tuple[str, ...]) -> bool:
         return True
     default_patterns = (
         r"^Exam Bank$",
+        r"^기출문제은행$",
         r"^Micro Learning$",
         r"^Teaching Skills$",
         r"^Learning Skills$",

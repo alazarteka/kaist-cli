@@ -1,0 +1,18 @@
+{
+  "name": "kaist-cli",
+  "owner": {
+    "name": "kaist-cli"
+  },
+  "plugins": [
+    {
+      "name": "kaist-cli",
+      "description": "Operate KLMS through the installed kaist CLI.",
+      "version": "__KAIST_VERSION__",
+      "author": {
+        "name": "kaist-cli"
+      },
+      "source": ".",
+      "category": "productivity"
+    }
+  ]
+}

@@ -732,6 +732,14 @@ class AuthService:
                 exit_code=10,
                 retryable=False,
             )
+        if not sys.stdin or not sys.stdin.isatty():
+            raise CommandError(
+                code="AUTH_FLOW_UNSUPPORTED",
+                message="Manual browser login requires an interactive terminal.",
+                hint="Use `kaist klms auth login --username <KAIST_ID>` in non-interactive or headless shells.",
+                exit_code=10,
+                retryable=False,
+            )
         print(f"Opening browser to: {config.base_url}", file=sys.stderr)
         print("Log in fully, navigate to a course page, then return here and press Enter.", file=sys.stderr)
         with sync_playwright() as playwright:
@@ -833,6 +841,7 @@ class AuthService:
             now = time.monotonic()
             current_url = str(page.url or "")
             current_html = _safe_page_content(page) if _looks_like_easy_login_page(current_url) else None
+            approved = False
 
             if current_html:
                 error_message = _extract_easy_login_error_message(current_html)
@@ -851,10 +860,12 @@ class AuthService:
 
             if signals.latest_mfa_payload is not None:
                 auth_state = _evaluate_easy_login_mfa_payload(signals.latest_mfa_payload)
-                if auth_state == "approved" and signals.latest_policy_payload is not None:
-                    policy_state = _evaluate_easy_login_policy_payload(signals.latest_policy_payload)
-                    if policy_state == "success" and policy_success_at is None:
-                        policy_success_at = now
+                if auth_state == "approved":
+                    approved = True
+                    if signals.latest_policy_payload is not None:
+                        policy_state = _evaluate_easy_login_policy_payload(signals.latest_policy_payload)
+                        if policy_state == "success" and policy_success_at is None:
+                            policy_success_at = now
 
             if (
                 policy_success_at is not None
@@ -864,6 +875,12 @@ class AuthService:
             ):
                 submitted_link_form = _submit_easy_login_link(page)
 
+            if approved and not _looks_like_easy_login_page(current_url):
+                state = self._context_dashboard_state(context, config=config, timeout_ms=5_000)
+                if state["authenticated"]:
+                    self._persist_context_state(context)
+                    return self._easy_login_success_result(config=config, username=username, login_number=printed_login_number)
+
             if now - last_auth_check >= EASY_LOGIN_POLL_SECONDS:
                 last_auth_check = now
                 state = self._context_dashboard_state(context, config=config, timeout_ms=5_000)
@@ -871,7 +888,14 @@ class AuthService:
                     self._persist_context_state(context)
                     return self._easy_login_success_result(config=config, username=username, login_number=printed_login_number)
 
-            page.wait_for_timeout(int(EASY_LOGIN_POLL_SECONDS * 1000))
+            try:
+                page.wait_for_timeout(int(EASY_LOGIN_POLL_SECONDS * 1000))
+            except Exception:
+                state = self._context_dashboard_state(context, config=config, timeout_ms=5_000)
+                if state["authenticated"]:
+                    self._persist_context_state(context)
+                    return self._easy_login_success_result(config=config, username=username, login_number=printed_login_number)
+                time.sleep(max(EASY_LOGIN_POLL_SECONDS, 0.1))
 
         detail = f" Login number: {printed_login_number}." if printed_login_number else ""
         raise CommandError(

@@ -19,6 +19,7 @@ from .courses import (
     _extract_current_term_from_dashboard,
     _is_noise_course,
     _norm_text,
+    _term_label_from_course_code,
 )
 from .deadline import RefreshDeadline
 from .discovery import load_json_summary
@@ -127,7 +128,8 @@ def _discover_current_term_course_ids_from_dashboard(
         if not _course_is_current_term(course, current_term_label, include_past=include_past):
             continue
         out.append(str(course.id).strip())
-    out.extend(str(course_id).strip() for course_id in configured_ids if str(course_id).strip())
+    if include_past:
+        out.extend(str(course_id).strip() for course_id in configured_ids if str(course_id).strip())
     seen: set[str] = set()
     deduped: list[str] = []
     for value in out:
@@ -160,7 +162,7 @@ def _assignment_is_current_term(assignment: Assignment, current_term_label: str 
             "title": assignment.course_title or "",
             "course_code": assignment.course_code,
             "course_code_base": assignment.course_code_base,
-            "term_label": None,
+            "term_label": _term_label_from_course_code(assignment.course_code),
         },
     )
     return _course_is_current_term(synthetic, current_term_label, include_past=include_past)
@@ -249,6 +251,7 @@ def _filter_assignments(
     since_iso: str | None,
     limit: int | None,
     current_term_label: str | None = None,
+    current_term_course_ids: set[str] | None = None,
     include_past: bool = False,
 ) -> list[Assignment]:
     filtered = assignments
@@ -257,11 +260,22 @@ def _filter_assignments(
         filtered = [assignment for assignment in filtered if str(assignment.course_id or "").strip() == target]
     if course_query:
         filtered = [assignment for assignment in filtered if _assignment_matches_course_query(assignment, course_query)]
-    filtered = [
-        assignment
-        for assignment in filtered
-        if _assignment_is_current_term(assignment, current_term_label, include_past=include_past)
-    ]
+    if not include_past and current_term_course_ids is not None:
+        filtered = [
+            assignment
+            for assignment in filtered
+            if str(assignment.course_id or "").strip() in current_term_course_ids
+            or (
+                not str(assignment.course_id or "").strip()
+                and _assignment_is_current_term(assignment, current_term_label, include_past=include_past)
+            )
+        ]
+    else:
+        filtered = [
+            assignment
+            for assignment in filtered
+            if _assignment_is_current_term(assignment, current_term_label, include_past=include_past)
+        ]
     if since_iso:
         floor = str(since_iso).strip()
         filtered = [assignment for assignment in filtered if assignment.due_iso and assignment.due_iso >= floor]
@@ -650,6 +664,19 @@ class AssignmentService:
         if not sesskey:
             return None
         current_term_label = _extract_current_term_from_dashboard(html)
+        current_term_course_ids = (
+            set(
+                _discover_current_term_course_ids_from_dashboard(
+                    html,
+                    base_url=config.base_url,
+                    configured_ids=config.course_ids,
+                    exclude_patterns=config.exclude_course_title_patterns,
+                    include_past=include_past,
+                )
+            )
+            if not include_past
+            else None
+        )
 
         methodnames = [
             "core_calendar_get_action_events_by_timesort",
@@ -721,6 +748,7 @@ class AssignmentService:
                     since_iso=since_iso,
                     limit=limit,
                     current_term_label=current_term_label,
+                    current_term_course_ids=current_term_course_ids,
                     include_past=include_past,
                 )
                 if filtered:
@@ -749,6 +777,19 @@ class AssignmentService:
                 dashboard_page.close()
 
         current_term_label = _extract_current_term_from_dashboard(dashboard_html)
+        current_term_course_ids = (
+            set(
+                _discover_current_term_course_ids_from_dashboard(
+                    dashboard_html,
+                    base_url=config.base_url,
+                    configured_ids=config.course_ids,
+                    exclude_patterns=config.exclude_course_title_patterns,
+                    include_past=include_past,
+                )
+            )
+            if not include_past
+            else None
+        )
         course_ids = [str(course_id).strip()] if course_id else _discover_current_term_course_ids_from_dashboard(
             dashboard_html,
             base_url=config.base_url,
@@ -776,6 +817,7 @@ class AssignmentService:
             since_iso=since_iso,
             limit=limit,
             current_term_label=current_term_label,
+            current_term_course_ids=current_term_course_ids,
             include_past=include_past,
         )
 

@@ -559,14 +559,15 @@ class FileService:
         cached_items.sort(key=lambda item: (item.course_title or "", item.kind, item.title.lower()))
         cached_limited = cached_items[: max(0, limit)] if limit is not None else cached_items
         cached_source = _file_provider_source(cached_limited)
-        if prefer_cache and cache_entry is not None and not bool(cache_entry.get("stale")):
+        cache_fresh_enough = _cache_is_fresh_enough(cache_entry)
+        if prefer_cache and cache_entry is not None and (not bool(cache_entry.get("stale")) or cache_fresh_enough):
             return ProviderLoad(
                 items=[item.to_dict() for item in cached_limited],
                 source=cached_source,
                 capability="partial",
                 freshness_mode="cache",
                 cache_hit=True,
-                stale=False,
+                stale=bool(cache_entry.get("stale")),
                 fetched_at=_iso_from_epoch_seconds(cache_entry.get("stored_at")),
                 expires_at=_iso_from_epoch_seconds(cache_entry.get("expires_at")),
                 refresh_attempted=False,

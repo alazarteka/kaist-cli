@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+from datetime import datetime, timezone
 from typing import Any
 
 from ..contracts import CommandResult
@@ -21,14 +23,19 @@ SYNC_CACHE_PREFIXES = (
 )
 
 
-def _entry_brief(entry: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "stale": bool(entry.get("stale")),
-        "stored_at": entry.get("stored_at"),
-        "expires_at": entry.get("expires_at"),
-        "age_seconds": entry.get("age_seconds"),
-        "ttl_remaining_seconds": entry.get("ttl_remaining_seconds"),
-    }
+def _entry_item_count(entry: dict[str, Any]) -> int | None:
+    value = entry.get("value")
+    if isinstance(value, list):
+        return len(value)
+    if isinstance(value, dict):
+        return len(value)
+    return None
+
+
+def _epoch_to_iso(value: Any) -> str | None:
+    if not isinstance(value, (int, float)):
+        return None
+    return datetime.fromtimestamp(float(value), tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _cache_group_name(key: str) -> str:
@@ -57,24 +64,61 @@ def _status_from_entries(entries: dict[str, dict[str, Any]]) -> dict[str, Any]:
         group = _cache_group_name(key)
         if group not in groups:
             continue
-        groups[group].append(
-            {
-                "key": key,
-                **_entry_brief(entry),
-            }
-        )
+        groups[group].append({"key": key, **entry})
 
     providers: dict[str, Any] = {}
     for group, items in groups.items():
         items.sort(key=lambda item: float(item.get("stored_at") or 0.0), reverse=True)
         latest = items[0] if items else None
+        if latest is None:
+            providers[group] = {
+                "provider": group,
+                "status": "skipped",
+                "item_count": 0,
+                "duration_ms": None,
+                "warnings": [],
+                "fetched_at": None,
+                "expires_at": None,
+                "cache_hit": False,
+                "stale": False,
+                "entry_count": 0,
+            }
+            continue
+        stale = bool(latest.get("stale"))
         providers[group] = {
+            "provider": group,
+            "status": "cache_hit" if not stale else "stale",
+            "item_count": _entry_item_count(latest),
+            "duration_ms": None,
+            "warnings": [],
+            "fetched_at": _epoch_to_iso(latest.get("stored_at")),
+            "expires_at": _epoch_to_iso(latest.get("expires_at")),
+            "cache_hit": not stale,
+            "stale": stale,
             "entry_count": len(items),
-            "has_fresh": any(not bool(item.get("stale")) for item in items),
-            "latest": latest,
-            "entries": items,
+            "age_seconds": latest.get("age_seconds"),
+            "ttl_remaining_seconds": latest.get("ttl_remaining_seconds"),
         }
     return {"providers": providers}
+
+
+def _provider_summary(name: str, payload: dict[str, Any], *, duration_ms: int) -> dict[str, Any]:
+    warnings = [dict(warning) for warning in payload.get("warnings") or [] if isinstance(warning, dict)]
+    return {
+        "provider": name,
+        "status": str(payload.get("status") or ("failed" if not payload.get("ok") else "refreshed")),
+        "item_count": payload.get("item_count", payload.get("count")),
+        "duration_ms": duration_ms,
+        "warnings": warnings,
+        "fetched_at": payload.get("fetched_at"),
+        "expires_at": payload.get("expires_at"),
+        "cache_hit": bool(payload.get("cache_hit")),
+        "stale": bool(payload.get("stale")),
+        "source": payload.get("source"),
+        "capability": payload.get("capability"),
+        "refresh_attempted": bool(payload.get("refresh_attempted")),
+        "ok": bool(payload.get("ok", True)),
+    }
 
 
 class SyncService:
@@ -103,6 +147,7 @@ class SyncService:
                 dashboard_url=str(dashboard_state.get("final_url") or ""),
                 dashboard_html=str(dashboard_state.get("html") or ""),
             )
+            notices_started = time.perf_counter()
             notices = self._notices.refresh_cache_with_context(
                 context=context,
                 config=config,
@@ -110,16 +155,19 @@ class SyncService:
                 max_pages=1,
                 bootstrap=bootstrap,
             )
+            notices_duration_ms = int((time.perf_counter() - notices_started) * 1000)
+            files_started = time.perf_counter()
             files = self._files.refresh_cache_with_context(
                 context=context,
                 config=config,
                 auth_mode=auth_mode,
                 bootstrap=bootstrap,
             )
+            files_duration_ms = int((time.perf_counter() - files_started) * 1000)
             warnings = notices.provider_warnings("notices") + files.provider_warnings("files")
             payload = _status_from_entries(list_cache_entries(self._paths, prefixes=SYNC_CACHE_PREFIXES))
-            payload["providers"]["notices"].update(notices.provider_status())
-            payload["providers"]["files"].update(files.provider_status())
+            payload["providers"]["notices"] = _provider_summary("notices", notices.provider_status(), duration_ms=notices_duration_ms)
+            payload["providers"]["files"] = _provider_summary("files", files.provider_status(), duration_ms=files_duration_ms)
             payload["warnings"] = warnings
             return CommandResult(
                 data=payload,
