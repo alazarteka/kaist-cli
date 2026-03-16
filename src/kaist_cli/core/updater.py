@@ -7,7 +7,6 @@ import platform
 import re
 import shutil
 import ssl
-import subprocess
 import tarfile
 import tempfile
 import urllib.error
@@ -86,11 +85,7 @@ def _platform_target(system_name: str, machine_name: str) -> str:
         if mach_l == "x86_64":
             return "darwin-x86_64"
     if sys_l == "linux":
-        if mach_l != "x86_64":
-            raise SelfUpdateError(f"Linux self-update is currently supported only for x86_64 musl builds, not {machine_name}.")
-        if _linux_is_musl():
-            return "linux-x86_64-musl"
-        raise SelfUpdateError("Linux self-update currently supports only the x86_64 musl release.")
+        raise SelfUpdateError("Published standalone bundles currently support only macOS arm64/x86_64.")
     raise SelfUpdateError(f"Unsupported platform for self-update: {system_name}/{machine_name}")
 
 
@@ -99,22 +94,6 @@ def platform_target() -> str:
     if override:
         return override
     return _platform_target(platform.system(), platform.machine())
-
-
-def _linux_is_musl() -> bool:
-    if os.path.exists("/lib/ld-musl-x86_64.so.1") or os.path.exists("/usr/glibc-compat/lib/ld-musl-x86_64.so.1"):
-        return True
-    try:
-        probe = subprocess.run(
-            ["ldd", "--version"],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-    except Exception:
-        return False
-    output = f"{probe.stdout}\n{probe.stderr}".lower()
-    return "musl" in output
 
 
 def _github_json(url: str) -> dict[str, Any]:

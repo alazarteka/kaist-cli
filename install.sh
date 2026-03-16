@@ -43,30 +43,15 @@ resolve_target() {
           printf 'darwin-x86_64'
           ;;
         *)
-          die "This installer currently supports macOS arm64/x86_64 and Linux x86_64 musl."
+          die "This installer currently supports macOS arm64/x86_64 standalone bundles."
           ;;
       esac
       ;;
     Linux)
-      case "$arch_name" in
-        x86_64|amd64)
-          if [[ -e /lib/ld-musl-x86_64.so.1 || -e /usr/glibc-compat/lib/ld-musl-x86_64.so.1 ]]; then
-            printf 'linux-x86_64-musl'
-            return
-          fi
-          if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
-            printf 'linux-x86_64-musl'
-            return
-          fi
-          die "Linux installs currently support only x86_64 musl builds. Set KAIST_PLATFORM_TARGET manually if you know the correct release target."
-          ;;
-        *)
-          die "Linux installs currently support only x86_64 musl builds."
-          ;;
-      esac
+      die "Published standalone bundles currently support only macOS arm64/x86_64. Linux release bundles are not published yet."
       ;;
     *)
-      die "This installer currently supports macOS arm64/x86_64 and Linux x86_64 musl."
+      die "This installer currently supports macOS arm64/x86_64 standalone bundles."
       ;;
   esac
 }
