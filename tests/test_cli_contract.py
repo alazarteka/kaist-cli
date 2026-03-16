@@ -94,6 +94,17 @@ def test_version_command_schema(tmp_path: Path) -> None:
     assert payload["ok"] is True
     assert payload["schema"] == "kaist.cli.version.v1"
     assert isinstance(payload["data"]["version"], str)
+    assert payload["data"]["distribution"] == "source"
+    assert payload["data"]["install_root"] == str(ROOT)
+    assert payload["data"]["bundled_skill_path"] == str(ROOT / "skills" / "kaist-cli")
+    assert payload["data"]["self_update_supported"] is False
+    assert payload["data"]["release_repo"] == "alazarteka/kaist-cli"
+
+
+def test_help_mentions_bundled_skill_path(tmp_path: Path) -> None:
+    cp = run_cli(tmp_path, "--help")
+    assert cp.returncode == 0
+    assert str(ROOT / "skills" / "kaist-cli") in cp.stdout
 
 
 def test_legacy_flat_commands_are_removed(tmp_path: Path) -> None:

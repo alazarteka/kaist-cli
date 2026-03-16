@@ -45,11 +45,12 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           TARGET="darwin-arm64"
+          scripts/build_release_bundle.sh \
+            --binary dist/kaist \
+            --version "${TAG}" \
+            --target "${TARGET}" \
+            --out-dir dist
           ASSET="kaist-${TAG}-${TARGET}.tar.gz"
-          mkdir -p dist/release
-          cp dist/kaist dist/release/kaist
-          chmod +x dist/release/kaist
-          tar -C dist/release -czf "dist/${ASSET}" kaist
           (cd dist && shasum -a 256 "${ASSET}" > checksums.txt)
 
       - name: Publish GitHub release assets

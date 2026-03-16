@@ -16,7 +16,24 @@ Current KLMS surface:
 - Release workflow: `docs/RELEASES.md`
 - Historical rewrite RFC: `docs/CLEAN_BREAK_RFC.md`
 
-## Quick Start
+## Install
+
+Managed release install on macOS arm64:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alazarteka/kaist-cli/main/install.sh | bash
+kaist version
+kaist --help
+```
+
+This installs:
+- `kaist` at `~/.local/bin/kaist`
+- managed release bundles under `~/.local/share/kaist-cli/`
+- a bundled agent skill at `~/.local/share/kaist-cli/current/skills/kaist-cli`
+
+Use `kaist update --check` and `kaist update` to manage release updates.
+
+## Source Quick Start
 
 ```bash
 uv sync
@@ -87,7 +104,7 @@ Operational controls:
 
 ## Release
 
-Standalone unsigned binaries are published through GitHub Releases.
+Managed standalone bundles are published through GitHub Releases.
 
 Check latest release:
 
@@ -95,7 +112,7 @@ Check latest release:
 kaist update --check
 ```
 
-Install update when running a standalone binary:
+Install update when running a managed standalone install:
 
 ```bash
 kaist update
