@@ -128,10 +128,23 @@ def _extract_easy_login_error_message(html: str) -> str | None:
 
 def _extract_easy_login_number(html: str) -> str | None:
     soup = BeautifulSoup(html, "html.parser")
+    for selector in (
+        ".auth_number .nember_wrap",
+        ".auth_number [aria-hidden='false']",
+        ".auth_number .sr-only",
+        "#authNumber",
+    ):
+        node = soup.select_one(selector)
+        if node is None:
+            continue
+        digits = re.sub(r"\D+", "", node.get_text("", strip=True))
+        if 2 <= len(digits) <= 8:
+            return digits
+
     text = " ".join(soup.get_text("\n", strip=True).split())
     patterns = (
-        r"(?:login|easy login|authentication|approval)\s*(?:number|code)?\s*[:：]?\s*([0-9]{4,8})",
-        r"(?:로그인|간편\s*로그인|인증|승인)\s*(?:번호|코드)?\s*[:：]?\s*([0-9]{4,8})",
+        r"(?:verification\s*code|login|easy login|authentication|approval)\s*(?:number|code)?\s*[:：]?\s*([0-9]{2,8})",
+        r"(?:인증\s*코드|로그인|간편\s*로그인|인증|승인)\s*(?:번호|코드)?\s*[:：]?\s*([0-9]{2,8})",
         r"(?:번호|number)\s*[:：]?\s*([0-9]{4,8})",
     )
     for pattern in patterns:

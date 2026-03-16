@@ -217,6 +217,22 @@ def test_extract_easy_login_number_and_error_message() -> None:
     assert _extract_easy_login_error_message(html) == "Easy Login app is not registered."
 
 
+def test_extract_easy_login_number_from_verification_widget() -> None:
+    html = """
+    <html><body>
+      <div class="auth_number">
+        <em></em>
+        <div class="nember_wrap">
+          <span>5</span>
+          <span>0</span>
+        </div>
+        <div style="font-size:0;" class="sr-only" aria-hidden="false" tabindex="0">50</div>
+      </div>
+    </body></html>
+    """
+    assert _extract_easy_login_number(html) == "50"
+
+
 def test_recent_courses_args_load_from_api_map(tmp_path: Path) -> None:
     private_root = tmp_path / "kaist-home" / "private" / "klms"
     private_root.mkdir(parents=True, exist_ok=True)

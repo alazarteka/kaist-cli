@@ -304,6 +304,53 @@ def _prune_versions(ctx: ManagedInstallContext, keep_roots: set[Path]) -> list[s
     return warnings
 
 
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _sync_claude_plugin_metadata(install_root: Path, *, version: str) -> Path:
+    marketplace_root = install_root / "mkt"
+    plugin_root = marketplace_root / "plugins" / "kaist-cli"
+    plugin_manifest_path = plugin_root / ".claude-plugin" / "plugin.json"
+    marketplace_manifest_path = marketplace_root / ".claude-plugin" / "marketplace.json"
+    skill_target = install_root / "current" / "skills" / "kaist-cli"
+    skill_link = plugin_root / "skills" / "kaist-cli"
+
+    plugin_root.mkdir(parents=True, exist_ok=True)
+    skill_link.parent.mkdir(parents=True, exist_ok=True)
+    if skill_link.exists() or skill_link.is_symlink():
+        _remove_path(skill_link)
+    skill_link.symlink_to(skill_target, target_is_directory=True)
+
+    _write_json(
+        plugin_manifest_path,
+        {
+            "name": "kaist-cli",
+            "description": "Operate KLMS through the installed kaist CLI.",
+            "author": {"name": "kaist-cli"},
+        },
+    )
+    _write_json(
+        marketplace_manifest_path,
+        {
+            "name": "kaist-cli",
+            "owner": {"name": "kaist-cli"},
+            "plugins": [
+                {
+                    "name": "kaist-cli",
+                    "description": "Operate KLMS through the installed kaist CLI.",
+                    "version": str(version),
+                    "author": {"name": "kaist-cli"},
+                    "source": "./plugins/kaist-cli",
+                    "category": "productivity",
+                }
+            ],
+        },
+    )
+    return marketplace_manifest_path
+
+
 def check_for_update() -> dict[str, Any]:
     current = version_string()
     target = platform_target()
@@ -395,6 +442,11 @@ def perform_self_update() -> dict[str, Any]:
     if previous_kept is not None:
         keep_roots.add(previous_kept)
     warnings = _prune_versions(ctx, keep_roots)
+    claude_marketplace_path: str | None = None
+    try:
+        claude_marketplace_path = str(_sync_claude_plugin_metadata(ctx.install_root, version=manifest.version))
+    except Exception as exc:  # noqa: BLE001
+        warnings.append(f"Could not sync Claude plugin marketplace: {exc}")
 
     current_bundle_root = ctx.current_link
     bundled_skill_path = current_bundle_root / manifest.skill_relpath
@@ -407,6 +459,7 @@ def perform_self_update() -> dict[str, Any]:
         "binary_path": str(installed_binary_path),
         "install_root": str(ctx.install_root),
         "bundled_skill_path": str(bundled_skill_path),
+        "claude_marketplace_path": claude_marketplace_path,
         "previous_version": previous_root.name if previous_root is not None else None,
         "message": "Update installed. Restart the kaist command.",
     }

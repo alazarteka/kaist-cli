@@ -203,6 +203,8 @@ def test_install_script_installs_managed_layout_and_rotates_previous(tmp_path: P
     assert (install_root / "current").resolve().name == "v0.1.4"
     assert not (install_root / "previous").exists()
     assert (install_root / "current" / "skills" / "kaist-cli" / "SKILL.md").exists()
+    assert json.loads((install_root / "mkt" / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"] == "0.1.4"
+    assert (install_root / "mkt" / "plugins" / "kaist-cli" / "skills" / "kaist-cli").is_symlink()
     assert "Bundled skill:" in first.stdout
 
     stale = install_root / "versions" / "v0.1.0"
@@ -222,6 +224,7 @@ def test_install_script_installs_managed_layout_and_rotates_previous(tmp_path: P
     assert (install_root / "previous").resolve().name == "v0.1.4"
     assert not stale.exists()
     assert (bin_dir / "kaist").resolve() == (install_root / "current" / "bin" / "kaist").resolve()
+    assert json.loads((install_root / "mkt" / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"] == "0.1.5"
 
 
 def test_perform_self_update_switches_current_and_previous(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -263,9 +266,11 @@ def test_perform_self_update_switches_current_and_previous(tmp_path: Path, monke
 
     assert payload["updated"] is True
     assert payload["bundled_skill_path"] == str(install_root / "current" / "skills" / "kaist-cli")
+    assert payload["claude_marketplace_path"] == str(install_root / "mkt" / ".claude-plugin" / "marketplace.json")
     assert (install_root / "current").resolve().name == "v0.1.5"
     assert (install_root / "previous").resolve().name == "v0.1.4"
     assert not stale.exists()
+    assert json.loads((install_root / "mkt" / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"] == "0.1.5"
 
 
 def test_prune_versions_returns_warning_on_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -109,6 +109,53 @@ prune_versions() {
   done
 }
 
+sync_claude_marketplace() {
+  local install_root="$1"
+  local version="$2"
+  local marketplace_root plugin_root skill_target skill_link plugin_json marketplace_json
+  marketplace_root="$install_root/mkt"
+  plugin_root="$marketplace_root/plugins/kaist-cli"
+  skill_target="$install_root/current/skills/kaist-cli"
+  skill_link="$plugin_root/skills/kaist-cli"
+  plugin_json="$plugin_root/.claude-plugin/plugin.json"
+  marketplace_json="$marketplace_root/.claude-plugin/marketplace.json"
+
+  mkdir -p "$plugin_root/.claude-plugin" "$(dirname "$skill_link")" "$(dirname "$marketplace_json")"
+  rm -rf "$skill_link"
+  ln -sfn "$skill_target" "$skill_link"
+
+  cat >"$plugin_json" <<JSON
+{
+  "name": "kaist-cli",
+  "description": "Operate KLMS through the installed kaist CLI.",
+  "author": {
+    "name": "kaist-cli"
+  }
+}
+JSON
+
+  cat >"$marketplace_json" <<JSON
+{
+  "name": "kaist-cli",
+  "owner": {
+    "name": "kaist-cli"
+  },
+  "plugins": [
+    {
+      "name": "kaist-cli",
+      "description": "Operate KLMS through the installed kaist CLI.",
+      "version": "${version}",
+      "author": {
+        "name": "kaist-cli"
+      },
+      "source": "./plugins/kaist-cli",
+      "category": "productivity"
+    }
+  ]
+}
+JSON
+}
+
 REPO="${KAIST_RELEASE_REPO:-alazarteka/kaist-cli}"
 VERSION_REQUEST="${KAIST_VERSION:-latest}"
 INSTALL_ROOT="${KAIST_INSTALL_ROOT:-$HOME/.local/share/kaist-cli}"
@@ -171,6 +218,7 @@ keep_previous="$(resolve_dir_link "$previous_link" || true)"
 prune_versions "$INSTALL_ROOT" "$keep_current" "$keep_previous"
 
 ln -sfn "$INSTALL_ROOT/current/bin/kaist" "$bin_link"
+sync_claude_marketplace "$INSTALL_ROOT" "${TAG#v}" || warn "Could not sync Claude plugin marketplace metadata."
 
 skill_path="$INSTALL_ROOT/current/skills/kaist-cli"
 printf 'Installed kaist %s to %s\n' "${TAG#v}" "$INSTALL_ROOT/current"
