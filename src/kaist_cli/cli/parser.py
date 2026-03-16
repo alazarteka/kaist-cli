@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import textwrap
 
+from ..core.distribution import discover_distribution_info
 from ..core.system_registry import default_registry
 
 
@@ -15,6 +16,16 @@ def _dedent(text: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    distribution = discover_distribution_info()
+    epilog = None
+    if distribution.bundled_skill_path is not None:
+        epilog = _dedent(
+            f"""
+            Bundled agent skill:
+              {distribution.bundled_skill_path}
+              Agents can install this skill directly from that path.
+            """
+        )
     parser = argparse.ArgumentParser(
         prog="kaist",
         description=_dedent(
@@ -27,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
               3) kaist klms today
             """
         ),
+        epilog=epilog,
         formatter_class=HelpFormatter,
     )
     parser.add_argument("--debug", action="store_true", help="Print traceback on failures.")

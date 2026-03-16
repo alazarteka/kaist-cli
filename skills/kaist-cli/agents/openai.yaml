@@ -1,0 +1,7 @@
+interface:
+  display_name: "KAIST CLI"
+  short_description: "Operate KLMS through the installed kaist CLI."
+  default_prompt: "Use $kaist-cli to inspect or operate KLMS through the installed kaist command."
+
+policy:
+  allow_implicit_invocation: true

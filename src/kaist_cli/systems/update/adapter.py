@@ -22,13 +22,13 @@ class UpdateAdapter(SystemAdapter):
     def register(self, top_subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
         update = top_subparsers.add_parser(
             "update",
-            help="Check and install latest GitHub release binary",
+            help="Check and install the latest managed GitHub release bundle",
             description=_dedent(
                 """
-                Self-update command for standalone kaist binaries.
+                Self-update command for managed standalone kaist installs.
 
                 For source-based runs (uv/pip editable), this command supports
-                --check but installation requires a standalone binary.
+                --check but installation requires an install created by install.sh.
 
                 Release source is fixed to: alazarteka/kaist-cli
                 """

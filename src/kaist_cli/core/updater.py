@@ -15,11 +15,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .distribution import BundleManifest, DistributionInfo, RELEASE_REPO, discover_distribution_info, load_bundle_manifest
 from .versioning import version_string
 
 
-RELEASE_REPO = "alazarteka/kaist-cli"
 GITHUB_API_BASE = "https://api.github.com"
+INSTALL_HINT = "Reinstall using `curl -fsSL https://raw.githubusercontent.com/alazarteka/kaist-cli/main/install.sh | bash`."
 
 
 class SelfUpdateError(RuntimeError):
@@ -31,6 +32,17 @@ class ReleaseAsset:
     name: str
     browser_download_url: str
     size: int
+
+
+@dataclass(frozen=True)
+class ManagedInstallContext:
+    distribution: DistributionInfo
+    install_root: Path
+    bundle_root: Path
+    manifest: BundleManifest
+    versions_dir: Path
+    current_link: Path
+    previous_link: Path
 
 
 def _urlopen(request: urllib.request.Request, *, timeout: int) -> Any:
@@ -189,20 +201,27 @@ def parse_checksums(text: str) -> dict[str, str]:
     return out
 
 
-def _extract_binary(archive_path: Path, destination_dir: Path) -> Path:
+def _extract_bundle_root(archive_path: Path, destination_dir: Path) -> BundleManifest:
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination_root = destination_dir.resolve()
     with tarfile.open(archive_path, "r:gz") as tar:
-        candidates = [member for member in tar.getmembers() if member.isfile() and Path(member.name).name == "kaist"]
-        if not candidates:
-            raise SelfUpdateError("Release archive does not contain 'kaist' binary")
-        member = sorted(candidates, key=lambda m: len(Path(m.name).parts))[0]
-        extracted = tar.extractfile(member)
-        if extracted is None:
-            raise SelfUpdateError("Failed to extract binary from archive")
-        out_path = destination_dir / "kaist"
-        with out_path.open("wb") as handle:
-            shutil.copyfileobj(extracted, handle)
-    os.chmod(out_path, 0o755)
-    return out_path
+        for member in tar.getmembers():
+            member_path = (destination_root / member.name).resolve()
+            if member_path != destination_root and destination_root not in member_path.parents:
+                raise SelfUpdateError(f"Archive member escapes bundle root: {member.name}")
+        try:
+            tar.extractall(destination_dir, filter="data")
+        except TypeError:
+            tar.extractall(destination_dir)
+
+    manifest = load_bundle_manifest(destination_dir)
+    if manifest is None:
+        raise SelfUpdateError("Release archive does not include a valid bundle.json")
+    binary_path = destination_dir / manifest.binary_relpath
+    if not binary_path.exists():
+        raise SelfUpdateError("Release archive does not contain bundled kaist binary")
+    os.chmod(binary_path, 0o755)
+    return manifest
 
 
 def _current_binary_path() -> Path:
@@ -210,10 +229,79 @@ def _current_binary_path() -> Path:
 
     if not bool(getattr(sys, "frozen", False)):
         raise SelfUpdateError(
-            "Self-update is only supported for standalone kaist binaries. "
-            "Current runtime is a Python environment (e.g. uv/pip/pipx source run)."
+            "Self-update installation is only supported for standalone kaist binaries. "
+            "Current runtime is a Python environment. "
+            f"{INSTALL_HINT}"
         )
-    return Path(sys.executable).resolve()
+    return Path(sys.executable)
+
+
+def _managed_install_context(executable_path: Path) -> ManagedInstallContext | None:
+    distribution = discover_distribution_info(executable=executable_path, frozen=True)
+    if distribution.distribution != "managed-release":
+        return None
+    if distribution.install_root is None or distribution.bundle_root is None or distribution.manifest is None:
+        return None
+    versions_dir = distribution.install_root / "versions"
+    current_link = distribution.install_root / "current"
+    previous_link = distribution.install_root / "previous"
+    if not versions_dir.exists():
+        return None
+    return ManagedInstallContext(
+        distribution=distribution,
+        install_root=distribution.install_root,
+        bundle_root=distribution.bundle_root,
+        manifest=distribution.manifest,
+        versions_dir=versions_dir,
+        current_link=current_link,
+        previous_link=previous_link,
+    )
+
+
+def _resolved_symlink(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    try:
+        return path.resolve()
+    except OSError:
+        return None
+
+
+def _swap_symlink(link_path: Path, target_path: Path) -> None:
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = link_path.parent / f".{link_path.name}.new"
+    if tmp_path.exists() or tmp_path.is_symlink():
+        tmp_path.unlink()
+    tmp_path.symlink_to(target_path)
+    os.replace(tmp_path, link_path)
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+
+
+def _prune_versions(ctx: ManagedInstallContext, keep_roots: set[Path]) -> list[str]:
+    warnings: list[str] = []
+    if not ctx.versions_dir.exists():
+        return warnings
+    resolved_keep = {root.resolve() for root in keep_roots}
+    for child in sorted(ctx.versions_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        try:
+            if child.resolve() in resolved_keep:
+                continue
+        except OSError:
+            pass
+        try:
+            shutil.rmtree(child)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"Could not prune {child}: {exc}")
+    return warnings
 
 
 def check_for_update() -> dict[str, Any]:
@@ -225,7 +313,7 @@ def check_for_update() -> dict[str, Any]:
     assets = _coerce_assets(release)
     archive_asset = select_archive_asset(assets, target)
     has_checksums = any(asset.name == "checksums.txt" for asset in assets)
-    return {
+    payload = {
         "ok": True,
         "repo": RELEASE_REPO,
         "current_version": current,
@@ -236,6 +324,8 @@ def check_for_update() -> dict[str, Any]:
         "archive_asset": archive_asset.name,
         "has_checksums": has_checksums,
     }
+    payload.update(discover_distribution_info().as_payload())
+    return payload
 
 
 def perform_self_update() -> dict[str, Any]:
@@ -248,7 +338,14 @@ def perform_self_update() -> dict[str, Any]:
             "message": "Already on latest version.",
         }
 
-    binary_path = _current_binary_path()
+    executable_path = _current_binary_path()
+    ctx = _managed_install_context(executable_path)
+    if ctx is None:
+        raise SelfUpdateError(
+            "Managed self-update is only supported for installs created by the bundled install.sh layout. "
+            + INSTALL_HINT
+        )
+
     release = fetch_latest_release()
     assets = _coerce_assets(release)
     target = str(check["platform_target"])
@@ -259,6 +356,7 @@ def perform_self_update() -> dict[str, Any]:
         tmp_dir = Path(tmp)
         archive_path = tmp_dir / archive_asset.name
         checksums_path = tmp_dir / checksums_asset.name
+        staged_bundle = tmp_dir / "bundle"
         _download_to_path(archive_asset.browser_download_url, archive_path)
         _download_to_path(checksums_asset.browser_download_url, checksums_path)
 
@@ -272,38 +370,46 @@ def perform_self_update() -> dict[str, Any]:
                 f"Checksum mismatch for {archive_asset.name}: expected {expected}, got {actual}"
             )
 
-        extracted_binary = _extract_binary(archive_path, tmp_dir)
-        staged_binary = binary_path.parent / f".{binary_path.name}.new"
-        backup_binary = binary_path.parent / f".{binary_path.name}.bak"
+        manifest = _extract_bundle_root(archive_path, staged_bundle)
+        version_tag = str(check.get("latest_tag") or f"v{check['latest_version']}")
+        version_dir = ctx.versions_dir / version_tag
+        temp_version_dir = ctx.versions_dir / f".{version_tag}.install"
 
-        if staged_binary.exists():
-            staged_binary.unlink()
-        if backup_binary.exists():
-            backup_binary.unlink()
+        if temp_version_dir.exists() or temp_version_dir.is_symlink():
+            _remove_path(temp_version_dir)
+        if version_dir.exists() or version_dir.is_symlink():
+            _remove_path(version_dir)
 
-        shutil.copy2(extracted_binary, staged_binary)
-        os.chmod(staged_binary, 0o755)
+        shutil.copytree(staged_bundle, temp_version_dir)
+        os.replace(temp_version_dir, version_dir)
 
-        had_existing = binary_path.exists()
-        if had_existing:
-            os.replace(binary_path, backup_binary)
-        try:
-            os.replace(staged_binary, binary_path)
-        except Exception as exc:
-            if had_existing and backup_binary.exists():
-                os.replace(backup_binary, binary_path)
-            raise SelfUpdateError(f"Failed to install updated binary: {exc}") from exc
-        finally:
-            if staged_binary.exists():
-                staged_binary.unlink()
+    previous_root = _resolved_symlink(ctx.current_link)
+    _swap_symlink(ctx.current_link, version_dir)
+    if previous_root is not None and previous_root != version_dir.resolve():
+        _swap_symlink(ctx.previous_link, previous_root)
+    elif ctx.previous_link.exists() or ctx.previous_link.is_symlink():
+        _remove_path(ctx.previous_link)
 
-        if backup_binary.exists():
-            backup_binary.unlink()
+    keep_roots = {version_dir}
+    previous_kept = _resolved_symlink(ctx.previous_link)
+    if previous_kept is not None:
+        keep_roots.add(previous_kept)
+    warnings = _prune_versions(ctx, keep_roots)
 
-    return {
+    current_bundle_root = ctx.current_link
+    bundled_skill_path = current_bundle_root / manifest.skill_relpath
+    installed_binary_path = current_bundle_root / manifest.binary_relpath
+
+    payload = {
         "ok": True,
         "updated": True,
         **check,
-        "binary_path": str(binary_path),
+        "binary_path": str(installed_binary_path),
+        "install_root": str(ctx.install_root),
+        "bundled_skill_path": str(bundled_skill_path),
+        "previous_version": previous_root.name if previous_root is not None else None,
         "message": "Update installed. Restart the kaist command.",
     }
+    if warnings:
+        payload["warnings"] = warnings
+    return payload
