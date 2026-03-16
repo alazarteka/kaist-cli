@@ -13,6 +13,7 @@ from .paths import KlmsPaths, ensure_private_dirs
 class KlmsConfig:
     base_url: str
     dashboard_path: str
+    auth_username: str | None
     course_ids: tuple[str, ...]
     notice_board_ids: tuple[str, ...]
     exclude_course_title_patterns: tuple[str, ...]
@@ -42,6 +43,11 @@ def _normalize_dashboard_path(value: str | None) -> str:
     if not dashboard_path.startswith("/"):
         dashboard_path = "/" + dashboard_path
     return dashboard_path
+
+
+def _normalize_auth_username(value: str | None) -> str | None:
+    username = (value or "").strip()
+    return username or None
 
 
 def _coerce_list(raw: Any, *, field_name: str) -> tuple[str, ...]:
@@ -86,6 +92,7 @@ def load_config(paths: KlmsPaths) -> KlmsConfig:
     return KlmsConfig(
         base_url=_normalize_base_url(str(data.get("base_url", ""))),
         dashboard_path=_normalize_dashboard_path(str(data.get("dashboard_path", "/my/"))),
+        auth_username=_normalize_auth_username(data.get("auth_username")),
         course_ids=_coerce_list(data.get("course_ids"), field_name="course_ids"),
         notice_board_ids=_coerce_list(data.get("notice_board_ids"), field_name="notice_board_ids"),
         exclude_course_title_patterns=_coerce_list(
@@ -107,11 +114,17 @@ def save_config(
     *,
     base_url: str | None = None,
     dashboard_path: str | None = None,
+    auth_username: str | None = None,
 ) -> KlmsConfig:
     ensure_private_dirs(paths)
     existing = maybe_load_config(paths)
     resolved_base_url = _normalize_base_url(base_url or (existing.base_url if existing else ""))
     resolved_dashboard_path = _normalize_dashboard_path(dashboard_path or (existing.dashboard_path if existing else "/my/"))
+    resolved_auth_username = (
+        _normalize_auth_username(auth_username)
+        if auth_username is not None
+        else (existing.auth_username if existing else None)
+    )
 
     course_ids = existing.course_ids if existing else ()
     notice_board_ids = existing.notice_board_ids if existing else ()
@@ -120,6 +133,7 @@ def save_config(
     lines = [
         f"base_url = {_toml_quote(resolved_base_url)}",
         f"dashboard_path = {_toml_quote(resolved_dashboard_path)}",
+        f"auth_username = {_toml_quote(resolved_auth_username or '')}",
         f"course_ids = {json.dumps(list(course_ids), ensure_ascii=False)}",
         f"notice_board_ids = {json.dumps(list(notice_board_ids), ensure_ascii=False)}",
         f"exclude_course_title_patterns = {json.dumps(list(exclude_course_title_patterns), ensure_ascii=False)}",
@@ -130,6 +144,7 @@ def save_config(
     return KlmsConfig(
         base_url=resolved_base_url,
         dashboard_path=resolved_dashboard_path,
+        auth_username=resolved_auth_username,
         course_ids=course_ids,
         notice_board_ids=notice_board_ids,
         exclude_course_title_patterns=exclude_course_title_patterns,

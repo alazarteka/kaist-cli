@@ -40,8 +40,20 @@ class KlmsFacade:
         self._courses = courses
         self._videos = videos
 
-    def auth_login(self, *, base_url: str | None = None, dashboard_path: str | None = None) -> CommandResult:
-        return self._auth.login(base_url=base_url, dashboard_path=dashboard_path)
+    def auth_login(
+        self,
+        *,
+        base_url: str | None = None,
+        dashboard_path: str | None = None,
+        username: str | None = None,
+        wait_seconds: float = 180.0,
+    ) -> CommandResult:
+        return self._auth.login(
+            base_url=base_url,
+            dashboard_path=dashboard_path,
+            username=username,
+            wait_seconds=wait_seconds,
+        )
 
     def auth_install_browser(self, *, force: bool = False) -> CommandResult:
         return self._auth.install_browser(force=force)
@@ -49,8 +61,20 @@ class KlmsFacade:
     def auth_status(self) -> CommandResult:
         return self._auth.status()
 
-    def auth_refresh(self, *, base_url: str | None = None, dashboard_path: str | None = None) -> CommandResult:
-        return self._auth.refresh(base_url=base_url, dashboard_path=dashboard_path)
+    def auth_refresh(
+        self,
+        *,
+        base_url: str | None = None,
+        dashboard_path: str | None = None,
+        username: str | None = None,
+        wait_seconds: float = 180.0,
+    ) -> CommandResult:
+        return self._auth.refresh(
+            base_url=base_url,
+            dashboard_path=dashboard_path,
+            username=username,
+            wait_seconds=wait_seconds,
+        )
 
     def auth_doctor(self) -> CommandResult:
         return self._auth.doctor()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html as _html
 import json
 import os
 import re
@@ -10,6 +11,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urljoin
+
+from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 
 from ..contracts import CommandError, CommandResult
 from .config import KlmsConfig, maybe_load_config, save_config
@@ -39,6 +43,11 @@ APP_LOGIN_PATHS = (
     "/local/applogin/result_login_json.php",
     "/login/ssologin.php",
 )
+
+EASY_LOGIN_VIEW_NEEDLE = "/auth/kaist/user/login/view"
+EASY_LOGIN_SUBMIT_NEEDLE = "/auth/twofactor/mfa/login2Factor"
+EASY_LOGIN_POLL_SECONDS = 1.0
+EASY_LOGIN_DEFAULT_WAIT_SECONDS = 180.0
 
 
 def epoch_to_iso_utc(epoch: float) -> str:
@@ -89,6 +98,67 @@ def extract_sesskey(html: str) -> str | None:
             if value:
                 return value
     return None
+
+
+def _extract_sso_login_view_url(current_url: str, html: str) -> str | None:
+    href_patterns = (
+        r'href=["\']([^"\']*sso\.kaist\.ac\.kr/auth/kaist/user/login/view[^"\']*)["\']',
+        r'href=["\']([^"\']*/auth/kaist/user/login/view[^"\']*)["\']',
+    )
+    for pattern in href_patterns:
+        match = re.search(pattern, html, flags=re.IGNORECASE)
+        if match:
+            href = _html.unescape(match.group(1)).strip()
+            if href:
+                return urljoin(current_url, href)
+    return None
+
+
+def _extract_easy_login_error_message(html: str) -> str | None:
+    soup = BeautifulSoup(html, "html.parser")
+    for selector in ("#mfaResultMsg", "#resultMsg"):
+        node = soup.select_one(selector)
+        if node is None:
+            continue
+        text = " ".join(node.get_text(" ", strip=True).split())
+        if text:
+            return text
+    return None
+
+
+def _extract_easy_login_number(html: str) -> str | None:
+    soup = BeautifulSoup(html, "html.parser")
+    text = " ".join(soup.get_text("\n", strip=True).split())
+    patterns = (
+        r"(?:login|easy login|authentication|approval)\s*(?:number|code)?\s*[:：]?\s*([0-9]{4,8})",
+        r"(?:로그인|간편\s*로그인|인증|승인)\s*(?:번호|코드)?\s*[:：]?\s*([0-9]{4,8})",
+        r"(?:번호|number)\s*[:：]?\s*([0-9]{4,8})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    for node in soup.find_all(attrs={"id": True}):
+        node_id = str(node.get("id") or "").lower()
+        if any(token in node_id for token in ("auth", "approve", "login", "number", "code")):
+            text = " ".join(node.get_text(" ", strip=True).split())
+            match = re.search(r"\b([0-9]{4,8})\b", text)
+            if match:
+                return match.group(1)
+    for node in soup.find_all(attrs={"class": True}):
+        classes = " ".join(str(value).lower() for value in (node.get("class") or []))
+        if any(token in classes for token in ("auth", "approve", "login", "number", "code")):
+            text = " ".join(node.get_text(" ", strip=True).split())
+            match = re.search(r"\b([0-9]{4,8})\b", text)
+            if match:
+                return match.group(1)
+    return None
+
+
+def _looks_like_easy_login_page(url: str) -> bool:
+    lowered = (url or "").lower()
+    return EASY_LOGIN_VIEW_NEEDLE in lowered or EASY_LOGIN_SUBMIT_NEEDLE in lowered
 
 
 def storage_state_cookie_stats(paths: KlmsPaths) -> dict[str, Any] | None:
@@ -353,6 +423,7 @@ class AuthService:
         return {
             "base_url": config.base_url,
             "dashboard_path": config.dashboard_path,
+            "auth_username": config.auth_username,
             "course_ids": list(config.course_ids),
             "notice_board_ids": list(config.notice_board_ids),
             "exclude_course_title_patterns": list(config.exclude_course_title_patterns),
@@ -453,12 +524,11 @@ class AuthService:
         }
         return CommandResult(data=report, source="bootstrap", capability="partial")
 
-    def login(self, *, base_url: str | None = None, dashboard_path: str | None = None) -> CommandResult:
-        config = save_config(self._paths, base_url=base_url, dashboard_path=dashboard_path)
-        configure_playwright_env(self._paths)
-        self._paths.profile_dir.mkdir(parents=True, exist_ok=True)
-        chmod_best_effort(self._paths.profile_dir, 0o700)
+    def _persist_context_state(self, context: Any) -> None:
+        context.storage_state(path=str(self._paths.storage_state_path))
+        chmod_best_effort(self._paths.storage_state_path, 0o600)
 
+    def _manual_login(self, *, config: KlmsConfig) -> CommandResult:
         from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
 
         print(f"Opening browser to: {config.base_url}", file=sys.stderr)
@@ -475,10 +545,9 @@ class AuthService:
             page.goto(config.base_url, wait_until="domcontentloaded", timeout=30_000)
             print("Press Enter to save session and exit... ", end="", file=sys.stderr, flush=True)
             input()
-            context.storage_state(path=str(self._paths.storage_state_path))
+            self._persist_context_state(context)
             context.close()
 
-        chmod_best_effort(self._paths.storage_state_path, 0o600)
         return CommandResult(
             data={
                 "ok": True,
@@ -488,13 +557,173 @@ class AuthService:
                 "profile_path": str(self._paths.profile_dir),
                 "storage_state_path": str(self._paths.storage_state_path),
                 "preferred_mode": "profile",
+                "login_strategy": "manual_browser",
             },
             source="browser",
             capability="full",
         )
 
-    def refresh(self, *, base_url: str | None = None, dashboard_path: str | None = None) -> CommandResult:
-        return self.login(base_url=base_url, dashboard_path=dashboard_path)
+    def _wait_for_easy_login_transition(self, page: Any, *, timeout_seconds: float) -> str:
+        deadline = time.monotonic() + max(1.0, timeout_seconds)
+        while time.monotonic() < deadline:
+            current_url = str(page.url or "")
+            html = page.content()
+            error_message = _extract_easy_login_error_message(html)
+            if error_message:
+                raise CommandError(
+                    code="AUTH_FAILED",
+                    message=f"KAIST Easy Login rejected the username ({error_message}).",
+                    hint="Check the KAIST account ID and confirm Easy Login is registered in the KAIST auth app.",
+                    exit_code=10,
+                    retryable=False,
+                )
+            if EASY_LOGIN_SUBMIT_NEEDLE in current_url or "/auth/twofactor/mfa/" in current_url:
+                return html
+            if not _looks_like_easy_login_page(current_url):
+                return html
+            page.wait_for_timeout(250)
+        raise CommandError(
+            code="AUTH_TIMEOUT",
+            message="Timed out waiting for KAIST Easy Login to initialize.",
+            hint="Try again, or fall back to `kaist klms auth login` without `--username`.",
+            exit_code=10,
+            retryable=True,
+        )
+
+    def _easy_login(self, *, config: KlmsConfig, username: str, wait_seconds: float) -> CommandResult:
+        from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
+
+        wait_seconds = max(15.0, min(float(wait_seconds), 600.0))
+        printed_login_number: str | None = None
+        with sync_playwright() as playwright:
+            context = _launch_chromium_persistent_context_sync(
+                playwright,
+                paths=self._paths,
+                user_data_dir=str(self._paths.profile_dir),
+                headless=True,
+                accept_downloads=False,
+            )
+            try:
+                page = context.new_page()
+                page.goto(config.base_url, wait_until="domcontentloaded", timeout=30_000)
+                html = page.content()
+                current_url = str(page.url or "")
+                sso_url = _extract_sso_login_view_url(current_url, html)
+                if not sso_url:
+                    if _looks_like_easy_login_page(current_url):
+                        sso_url = current_url
+                    else:
+                        raise CommandError(
+                            code="AUTH_FLOW_UNSUPPORTED",
+                            message="Could not locate the KAIST SSO Easy Login page from the KLMS login flow.",
+                            hint="Run `kaist klms auth login` without `--username` to use the manual browser flow.",
+                            exit_code=10,
+                            retryable=False,
+                        )
+                page.goto(sso_url, wait_until="networkidle", timeout=30_000)
+                page.fill("#login_id_mfa", username)
+                page.click("a.btn_login")
+                html = self._wait_for_easy_login_transition(page, timeout_seconds=12.0)
+                login_number = _extract_easy_login_number(html)
+                if login_number:
+                    printed_login_number = login_number
+                    print(f"KAIST SSO Easy Login number: {login_number}", file=sys.stderr)
+                    print("Approve this login in the KAIST auth app. Waiting for KLMS session...", file=sys.stderr)
+                else:
+                    print("KAIST SSO Easy Login initialized. Waiting for approval in the KAIST auth app...", file=sys.stderr)
+
+                auth_deadline = time.monotonic() + wait_seconds
+                last_auth_check = 0.0
+                while time.monotonic() < auth_deadline:
+                    now = time.monotonic()
+                    if now - last_auth_check >= EASY_LOGIN_POLL_SECONDS:
+                        last_auth_check = now
+                        state = self._context_dashboard_state(context, config=config, timeout_ms=5_000)
+                        if state["authenticated"]:
+                            self._persist_context_state(context)
+                            return CommandResult(
+                                data={
+                                    "ok": True,
+                                    "base_url": config.base_url,
+                                    "dashboard_path": config.dashboard_path,
+                                    "config_path": str(self._paths.config_path),
+                                    "profile_path": str(self._paths.profile_dir),
+                                    "storage_state_path": str(self._paths.storage_state_path),
+                                    "preferred_mode": "profile",
+                                    "login_strategy": "sso_easy_login",
+                                    "username": username,
+                                    "login_number": printed_login_number,
+                                },
+                                source="browser",
+                                capability="full",
+                            )
+
+                    current_html = page.content()
+                    current_url = str(page.url or "")
+                    error_message = _extract_easy_login_error_message(current_html)
+                    if error_message:
+                        raise CommandError(
+                            code="AUTH_FAILED",
+                            message=f"KAIST Easy Login failed after initialization ({error_message}).",
+                            hint="Try again, or fall back to `kaist klms auth login` without `--username`.",
+                            exit_code=10,
+                            retryable=False,
+                        )
+                    current_number = _extract_easy_login_number(current_html)
+                    if current_number and current_number != printed_login_number:
+                        printed_login_number = current_number
+                        print(f"KAIST SSO Easy Login number: {current_number}", file=sys.stderr)
+                    page.wait_for_timeout(int(EASY_LOGIN_POLL_SECONDS * 1000))
+
+                detail = f" Login number: {printed_login_number}." if printed_login_number else ""
+                raise CommandError(
+                    code="AUTH_TIMEOUT",
+                    message=f"Timed out waiting for KAIST Easy Login approval.{detail}",
+                    hint="Approve the request in the KAIST auth app faster, or use `kaist klms auth login` without `--username`.",
+                    exit_code=10,
+                    retryable=True,
+                )
+            finally:
+                context.close()
+
+    def login(
+        self,
+        *,
+        base_url: str | None = None,
+        dashboard_path: str | None = None,
+        username: str | None = None,
+        wait_seconds: float = EASY_LOGIN_DEFAULT_WAIT_SECONDS,
+    ) -> CommandResult:
+        normalized_username = str(username or "").strip()
+        config = save_config(
+            self._paths,
+            base_url=base_url,
+            dashboard_path=dashboard_path,
+            auth_username=normalized_username if normalized_username else None,
+        )
+        configure_playwright_env(self._paths)
+        self._paths.profile_dir.mkdir(parents=True, exist_ok=True)
+        chmod_best_effort(self._paths.profile_dir, 0o700)
+        if normalized_username:
+            return self._easy_login(config=config, username=normalized_username, wait_seconds=wait_seconds)
+        return self._manual_login(config=config)
+
+    def refresh(
+        self,
+        *,
+        base_url: str | None = None,
+        dashboard_path: str | None = None,
+        username: str | None = None,
+        wait_seconds: float = EASY_LOGIN_DEFAULT_WAIT_SECONDS,
+    ) -> CommandResult:
+        existing = maybe_load_config(self._paths)
+        resolved_username = str(username or "").strip() or (existing.auth_username if existing else None)
+        return self.login(
+            base_url=base_url,
+            dashboard_path=dashboard_path,
+            username=resolved_username,
+            wait_seconds=wait_seconds,
+        )
 
     def _context_dashboard_state(self, context: Any, *, config: KlmsConfig, timeout_ms: int) -> dict[str, Any]:
         page = context.new_page()

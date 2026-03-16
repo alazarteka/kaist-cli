@@ -34,15 +34,18 @@ resolve_target() {
   arch_name="$(uname -m)"
 
   if [[ "$os_name" != "Darwin" ]]; then
-    die "This installer currently supports macOS arm64 only."
+    die "This installer currently supports macOS arm64 and x86_64 only."
   fi
 
   case "$arch_name" in
     arm64|aarch64)
       printf 'darwin-arm64'
       ;;
+    x86_64|amd64)
+      printf 'darwin-x86_64'
+      ;;
     *)
-      die "This installer currently supports macOS arm64 only."
+      die "This installer currently supports macOS arm64 and x86_64 only."
       ;;
   esac
 }
@@ -111,10 +114,6 @@ VERSION_REQUEST="${KAIST_VERSION:-latest}"
 INSTALL_ROOT="${KAIST_INSTALL_ROOT:-$HOME/.local/share/kaist-cli}"
 BIN_DIR="${KAIST_BIN_DIR:-$HOME/.local/bin}"
 TARGET="$(resolve_target)"
-
-if [[ "$TARGET" != "darwin-arm64" ]]; then
-  die "This installer currently supports macOS arm64 only."
-fi
 
 if [[ "$VERSION_REQUEST" == "latest" ]]; then
   TAG="$(fetch_latest_tag "$REPO")"

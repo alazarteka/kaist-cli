@@ -18,7 +18,7 @@ Current KLMS surface:
 
 ## Install
 
-Managed release install on macOS arm64:
+Managed release install on macOS arm64 or x86_64:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/alazarteka/kaist-cli/main/install.sh | bash

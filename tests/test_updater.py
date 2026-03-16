@@ -59,11 +59,11 @@ def _write_fake_binary(path: Path) -> None:
     os.chmod(path, 0o755)
 
 
-def _prepare_release_dir(base_dir: Path, version: str) -> tuple[Path, Path]:
+def _prepare_release_dir(base_dir: Path, version: str, *, target: str = "darwin-arm64") -> tuple[Path, Path]:
     tag = version if version.startswith("v") else f"v{version}"
     release_dir = base_dir / tag
     release_dir.mkdir(parents=True, exist_ok=True)
-    binary_path = base_dir / f"kaist-{tag}"
+    binary_path = base_dir / f"kaist-{tag}-{target}"
     _write_fake_binary(binary_path)
     cp = subprocess.run(
         [
@@ -74,7 +74,7 @@ def _prepare_release_dir(base_dir: Path, version: str) -> tuple[Path, Path]:
             "--version",
             tag,
             "--target",
-            "darwin-arm64",
+            target,
             "--out-dir",
             str(release_dir),
         ],
@@ -84,7 +84,7 @@ def _prepare_release_dir(base_dir: Path, version: str) -> tuple[Path, Path]:
         check=False,
     )
     assert cp.returncode == 0, cp.stderr
-    archive_path = release_dir / f"kaist-{tag}-darwin-arm64.tar.gz"
+    archive_path = release_dir / f"kaist-{tag}-{target}.tar.gz"
     checksums_path = release_dir / "checksums.txt"
     checksums_path.write_text(
         f"{updater._sha256(archive_path)}  {archive_path.name}\n",
@@ -149,8 +149,9 @@ def test_check_for_update_includes_distribution_metadata(monkeypatch: pytest.Mon
     assert payload["self_update_supported"] is False
 
 
-def test_build_release_bundle_contains_skill_and_manifest(tmp_path: Path) -> None:
-    archive_path, _ = _prepare_release_dir(tmp_path / "releases", "v0.1.4")
+@pytest.mark.parametrize("target", ["darwin-arm64", "darwin-x86_64"])
+def test_build_release_bundle_contains_skill_and_manifest(tmp_path: Path, target: str) -> None:
+    archive_path, _ = _prepare_release_dir(tmp_path / "releases", "v0.1.4", target=target)
 
     with tarfile.open(archive_path, "r:gz") as tar:
         names = {name.lstrip("./") for name in tar.getnames()}
@@ -163,16 +164,17 @@ def test_build_release_bundle_contains_skill_and_manifest(tmp_path: Path) -> Non
     assert manifest == {
         "version": "0.1.4",
         "repo": updater.RELEASE_REPO,
-        "target": "darwin-arm64",
+        "target": target,
         "binary_relpath": "bin/kaist",
         "skill_relpath": "skills/kaist-cli",
     }
 
 
-def test_install_script_installs_managed_layout_and_rotates_previous(tmp_path: Path) -> None:
+@pytest.mark.parametrize("target", ["darwin-arm64", "darwin-x86_64"])
+def test_install_script_installs_managed_layout_and_rotates_previous(tmp_path: Path, target: str) -> None:
     downloads_dir = tmp_path / "downloads"
-    _prepare_release_dir(downloads_dir, "v0.1.4")
-    _prepare_release_dir(downloads_dir, "v0.1.5")
+    _prepare_release_dir(downloads_dir, "v0.1.4", target=target)
+    _prepare_release_dir(downloads_dir, "v0.1.5", target=target)
     latest_json = tmp_path / "latest.json"
     latest_json.write_text(json.dumps({"tag_name": "v0.1.4"}), encoding="utf-8")
 
@@ -185,7 +187,7 @@ def test_install_script_installs_managed_layout_and_rotates_previous(tmp_path: P
             "KAIST_DOWNLOAD_BASE_URL": downloads_dir.resolve().as_uri(),
             "KAIST_INSTALL_ROOT": str(install_root),
             "KAIST_BIN_DIR": str(bin_dir),
-            "KAIST_PLATFORM_TARGET": "darwin-arm64",
+            "KAIST_PLATFORM_TARGET": target,
         }
     )
 

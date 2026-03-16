@@ -7,6 +7,7 @@ This project ships managed standalone CLI bundles through GitHub Releases.
 Each release tag (for example `v0.2.0`) publishes:
 
 - `kaist-v0.2.0-darwin-arm64.tar.gz`
+- `kaist-v0.2.0-darwin-x86_64.tar.gz`
 - `checksums.txt`
 
 The archive must unpack to:
@@ -30,10 +31,10 @@ The archive must unpack to:
 
 The GitHub Actions workflow at `.github/workflows/release.yml`:
 
-1. Builds `kaist` with PyInstaller on `macos-14`.
-2. Calls `scripts/build_release_bundle.sh` to package the managed bundle archive.
-3. Generates `checksums.txt`.
-4. Uploads both assets to the GitHub release for the tag.
+1. Builds `kaist` with PyInstaller on `macos-14` for Apple silicon and `macos-13` for Intel.
+2. Calls `scripts/build_release_bundle.sh` to package one managed bundle archive per target.
+3. Generates a combined `checksums.txt` covering both release archives.
+4. Uploads both archives plus `checksums.txt` to the GitHub release for the tag.
 
 ## Installer Layout
 

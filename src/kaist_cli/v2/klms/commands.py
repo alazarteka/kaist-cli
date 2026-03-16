@@ -8,13 +8,23 @@ from .container import KlmsFacade
 
 def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
     if args.group == "auth" and args.action == "login":
-        return facade.auth_login(base_url=args.base_url, dashboard_path=args.dashboard_path)
+        return facade.auth_login(
+            base_url=args.base_url,
+            dashboard_path=args.dashboard_path,
+            username=args.username,
+            wait_seconds=args.wait_seconds,
+        )
     if args.group == "auth" and args.action == "install-browser":
         return facade.auth_install_browser(force=args.force)
     if args.group == "auth" and args.action == "status":
         return facade.auth_status()
     if args.group == "auth" and args.action == "refresh":
-        return facade.auth_refresh(base_url=args.base_url, dashboard_path=args.dashboard_path)
+        return facade.auth_refresh(
+            base_url=args.base_url,
+            dashboard_path=args.dashboard_path,
+            username=args.username,
+            wait_seconds=args.wait_seconds,
+        )
     if args.group == "auth" and args.action == "doctor":
         return facade.auth_doctor()
     if args.group == "today":
