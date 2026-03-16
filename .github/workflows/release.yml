@@ -9,8 +9,16 @@ permissions:
   contents: write
 
 jobs:
-  build-darwin-arm64:
-    runs-on: macos-14
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            runner: macos-14
+          - target: darwin-x86_64
+            runner: macos-13
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,18 +52,39 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          TARGET="darwin-arm64"
           scripts/build_release_bundle.sh \
             --binary dist/kaist \
             --version "${TAG}" \
-            --target "${TARGET}" \
+            --target "${{ matrix.target }}" \
             --out-dir dist
-          ASSET="kaist-${TAG}-${TARGET}.tar.gz"
-          (cd dist && shasum -a 256 "${ASSET}" > checksums.txt)
+
+      - name: Upload packaged bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/kaist-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+
+  publish-release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged bundles
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate combined checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          shasum -a 256 kaist-*.tar.gz > checksums.txt
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/kaist-${{ github.ref_name }}-darwin-arm64.tar.gz
+            dist/kaist-${{ github.ref_name }}-darwin-x86_64.tar.gz
             dist/checksums.txt

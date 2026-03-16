@@ -16,10 +16,12 @@ sys.path.insert(0, str(ROOT / "src"))
 from kaist_cli.v2.contracts import CommandResult
 from kaist_cli.v2.klms.cache import load_cache_entry, load_cache_value, save_cache_value
 from kaist_cli.v2.klms import dashboard as dashboard_module
-from kaist_cli.v2.klms.auth import looks_login_url
+from kaist_cli.v2.klms.auth import AuthService
+from kaist_cli.v2.klms.auth import _extract_easy_login_error_message, _extract_easy_login_number, _extract_sso_login_view_url, looks_login_url
 from kaist_cli.v2.klms.assignments import _extract_assignment_detail_from_html, _extract_assignment_rows_from_calendar_data
 from kaist_cli.v2.klms.courses import _parse_recent_courses_payload
 from kaist_cli.v2.klms.capture import _courseboard_runtime_capture_summary, _extract_courseboard_js_hints
+from kaist_cli.v2.klms.config import load_config
 from kaist_cli.v2.klms.dashboard import DashboardService, _build_inbox_items, _decorate_today_assignments, _filter_inbox_assignments, _select_recent_notices
 from kaist_cli.v2.klms.discovery import load_recent_courses_args, map_discovery_report
 from kaist_cli.v2.klms.files import _extract_file_items_from_course_contents, _extract_file_items_from_html, _pull_subdir_for_item, _sanitize_relpath, _synthesize_file_item_from_url, _unwrap_moodle_ajax_payload
@@ -44,7 +46,13 @@ def run_v2(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _write_config(tmp_path: Path, *, base_url: str = "https://klms.kaist.ac.kr", dashboard_path: str = "/my/") -> Path:
+def _write_config(
+    tmp_path: Path,
+    *,
+    base_url: str = "https://klms.kaist.ac.kr",
+    dashboard_path: str = "/my/",
+    auth_username: str | None = None,
+) -> Path:
     config_path = tmp_path / "kaist-home" / "private" / "klms" / "config.toml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
@@ -52,6 +60,7 @@ def _write_config(tmp_path: Path, *, base_url: str = "https://klms.kaist.ac.kr",
             [
                 f'base_url = "{base_url}"',
                 f'dashboard_path = "{dashboard_path}"',
+                f'auth_username = "{auth_username or ""}"',
                 "course_ids = []",
                 "notice_board_ids = []",
                 "exclude_course_title_patterns = []",
@@ -110,6 +119,45 @@ def test_auth_status_detects_storage_state_and_cookie_stats(tmp_path: Path) -> N
     assert payload["data"]["storage_state_cookie_stats"]["next_expiry_iso"] is not None
 
 
+def test_auth_status_includes_saved_auth_username(tmp_path: Path) -> None:
+    _write_config(tmp_path, auth_username="student123")
+
+    cp = run_v2(tmp_path, "--json", "klms", "auth", "status")
+    assert cp.returncode == 0, cp.stderr
+    payload = json.loads(cp.stdout)
+    assert payload["data"]["config"]["auth_username"] == "student123"
+
+
+def test_auth_refresh_uses_saved_auth_username(tmp_path: Path, monkeypatch) -> None:
+    _write_config(tmp_path, auth_username="student123")
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        auth = AuthService(resolve_paths())
+        calls: list[dict[str, object]] = []
+
+        def fake_login(*, base_url=None, dashboard_path=None, username=None, wait_seconds=180.0):
+            calls.append(
+                {
+                    "base_url": base_url,
+                    "dashboard_path": dashboard_path,
+                    "username": username,
+                    "wait_seconds": wait_seconds,
+                }
+            )
+            return CommandResult(data={"ok": True}, source="bootstrap", capability="partial")
+
+        monkeypatch.setattr(auth, "login", fake_login)
+        auth.refresh()
+        assert calls
+        assert calls[0]["username"] == "student123"
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+
 def test_dev_plan_json_envelope(tmp_path: Path) -> None:
     cp = run_v2(tmp_path, "--json", "klms", "dev", "plan")
     assert cp.returncode == 0, cp.stderr
@@ -145,6 +193,28 @@ def test_dev_probe_live_without_config_is_structured(tmp_path: Path) -> None:
 
 def test_custom_login_url_detection_is_enabled() -> None:
     assert looks_login_url("https://klms.kaist.ac.kr/local/applogin/result_login_json.php?userid=test")
+
+
+def test_extract_sso_login_view_url_from_klms_login_shell() -> None:
+    html = """
+    <html><body>
+      <a href="https://sso.kaist.ac.kr/auth/kaist/user/login/view?agt_id=kaist-prod-klms">Log in</a>
+    </body></html>
+    """
+    assert _extract_sso_login_view_url("https://klms.kaist.ac.kr/login/ssologin.php", html) == (
+        "https://sso.kaist.ac.kr/auth/kaist/user/login/view?agt_id=kaist-prod-klms"
+    )
+
+
+def test_extract_easy_login_number_and_error_message() -> None:
+    html = """
+    <html><body>
+      <div id="authNumber">Login Number: 482913</div>
+      <label id="mfaResultMsg">Easy Login app is not registered.</label>
+    </body></html>
+    """
+    assert _extract_easy_login_number(html) == "482913"
+    assert _extract_easy_login_error_message(html) == "Easy Login app is not registered."
 
 
 def test_recent_courses_args_load_from_api_map(tmp_path: Path) -> None:

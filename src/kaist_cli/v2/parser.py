@@ -41,6 +41,8 @@ def register_klms_parser(
     auth_login = auth_sub.add_parser("login", help="Interactive login bootstrap", formatter_class=_HelpFormatter)
     auth_login.add_argument("--base-url", metavar="URL", help="Persist this KLMS base URL before opening the browser.")
     auth_login.add_argument("--dashboard-path", metavar="PATH", help="Optional dashboard path override, default /my/.")
+    auth_login.add_argument("--username", metavar="ID", help="Use KAIST SSO Easy Login with this KAIST account ID instead of the manual browser flow.")
+    auth_login.add_argument("--wait-seconds", type=float, default=180.0, metavar="N", help="Maximum time to wait for KAIST Easy Login approval.")
     _set_defaults(auth_login, schema_name=f"{schema_prefix}.auth.login.v1", command_path="klms auth login", handler=handler)
 
     auth_install = auth_sub.add_parser(
@@ -62,6 +64,8 @@ def register_klms_parser(
     auth_refresh = auth_sub.add_parser("refresh", help="Refresh existing auth", formatter_class=_HelpFormatter)
     auth_refresh.add_argument("--base-url", metavar="URL", help="Optional base URL override before refreshing auth.")
     auth_refresh.add_argument("--dashboard-path", metavar="PATH", help="Optional dashboard path override, default /my/.")
+    auth_refresh.add_argument("--username", metavar="ID", help="Use KAIST SSO Easy Login with this KAIST account ID instead of the manual browser flow.")
+    auth_refresh.add_argument("--wait-seconds", type=float, default=180.0, metavar="N", help="Maximum time to wait for KAIST Easy Login approval.")
     _set_defaults(
         auth_refresh,
         schema_name=f"{schema_prefix}.auth.refresh.v1",
