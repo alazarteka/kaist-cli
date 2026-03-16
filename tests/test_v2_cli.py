@@ -369,7 +369,7 @@ def test_parse_assignment_detail_from_html_extracts_fields() -> None:
     assert assignment.title == "Written Assignment 1"
     assert assignment.course_id == "180871"
     assert assignment.course_title == "알고리즘 개론"
-    assert assignment.due_iso == "2026-03-17T23:59"
+    assert assignment.due_iso == "2026-03-17T14:59:00Z"
     assert assignment.body_text == "Submit the written assignment PDF."
     assert assignment.detail_available is True
 

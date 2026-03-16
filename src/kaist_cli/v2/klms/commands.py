@@ -43,16 +43,28 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
     if args.group == "sync" and args.action == "reset":
         return facade.sync_reset()
     if args.group == "courses" and args.action == "list":
-        return facade.list_courses(include_all=args.include_all, limit=args.limit)
+        return facade.list_courses(
+            include_all=args.include_all,
+            include_past=args.include_past,
+            limit=args.limit,
+            course_query=args.course,
+        )
     if args.group == "courses" and args.action == "show":
         return facade.show_course(args.course_id)
     if args.group == "assignments" and args.action == "list":
-        return facade.list_assignments(course_id=args.course_id, since_iso=args.since_iso, limit=args.limit)
+        return facade.list_assignments(
+            course_id=args.course_id,
+            course_query=args.course,
+            since_iso=args.since_iso,
+            limit=args.limit,
+            include_past=args.include_past,
+        )
     if args.group == "assignments" and args.action == "show":
         return facade.show_assignment(args.assignment_id, course_id_hint=args.course_id)
     if args.group == "notices" and args.action == "list":
         return facade.list_notices(
             notice_board_id=args.notice_board_id,
+            course_query=args.course,
             max_pages=args.max_pages,
             since_iso=args.since_iso,
             limit=args.limit,
@@ -61,11 +73,12 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
         return facade.show_notice(
             args.notice_id,
             notice_board_id=args.notice_board_id,
+            course_query=args.course,
             max_pages=args.max_pages,
             include_html=args.include_html,
         )
     if args.group == "files" and args.action == "list":
-        return facade.list_files(course_id=args.course_id, limit=args.limit)
+        return facade.list_files(course_id=args.course_id, course_query=args.course, limit=args.limit)
     if args.group == "files" and args.action == "get":
         return facade.get_file(args.file_id)
     if args.group == "files" and args.action == "download":
@@ -83,7 +96,7 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
             if_exists=args.if_exists,
         )
     if args.group == "videos" and args.action == "list":
-        return facade.list_videos(course_id=args.course_id, limit=args.limit)
+        return facade.list_videos(course_id=args.course_id, course_query=args.course, limit=args.limit, recent=args.recent)
     if args.group == "videos" and args.action == "show":
         return facade.show_video(args.video_id, course_id_hint=args.course_id)
     if args.group == "dev" and args.action == "plan":

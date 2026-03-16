@@ -10,10 +10,11 @@ from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 from ..contracts import CommandError, CommandResult
 from .auth import AuthService, looks_logged_out_html, looks_login_url
 from .config import KlmsConfig, abs_url, load_config
-from .courses import _course_code_base, _discover_courses_from_dashboard, _is_noise_course, _norm_text
+from .courses import _course_code_base, _course_is_current_term, _course_matches_query, _discover_courses_from_dashboard, _extract_current_term_from_dashboard, _is_noise_course, _norm_text
 from .models import Video
 from .paths import KlmsPaths
 from .session import KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
+from .validate import looks_klms_error_html
 
 MAX_VIDEO_HTTP_WORKERS = 4
 
@@ -47,6 +48,7 @@ def _course_map_from_dashboard(html: str, *, base_url: str, configured_ids: tupl
             "course_id": str(course.id),
             "course_title": course.title,
             "course_code": course.course_code,
+            "term_label": course.term_label,
         }
         for course in _discover_courses_from_dashboard(html, base_url=base_url)
     }
@@ -54,7 +56,7 @@ def _course_map_from_dashboard(html: str, *, base_url: str, configured_ids: tupl
         course_id = str(configured_id).strip()
         if not course_id:
             continue
-        courses.setdefault(course_id, {"course_id": course_id, "course_title": None, "course_code": None})
+        courses.setdefault(course_id, {"course_id": course_id, "course_title": None, "course_code": None, "term_label": None})
     return courses
 
 
@@ -216,7 +218,9 @@ class VideoService:
         config: KlmsConfig,
         auth_mode: str,
         course_id: str | None = None,
+        course_query: str | None = None,
         limit: int | None = None,
+        recent: bool = False,
         bootstrap: KlmsSessionBootstrap | None = None,
     ) -> CommandResult:
         bootstrap = bootstrap or build_session_bootstrap(
@@ -230,12 +234,21 @@ class VideoService:
             config=config,
             auth_mode=auth_mode,
             course_id=course_id,
+            course_query=course_query,
             limit=limit,
+            recent=recent,
             bootstrap=bootstrap,
         )
         return CommandResult(data=[item.to_dict() for item in items], source="html", capability="partial")
 
-    def list(self, *, course_id: str | None = None, limit: int | None = None) -> CommandResult:
+    def list(
+        self,
+        *,
+        course_id: str | None = None,
+        course_query: str | None = None,
+        limit: int | None = None,
+        recent: bool = False,
+    ) -> CommandResult:
         config = load_config(self._paths)
 
         def callback(context: Any, auth_mode: str) -> CommandResult:
@@ -244,7 +257,9 @@ class VideoService:
                 config=config,
                 auth_mode=auth_mode,
                 course_id=course_id,
+                course_query=course_query,
                 limit=limit,
+                recent=recent,
             )
 
         return self._auth.run_authenticated(
@@ -286,10 +301,17 @@ class VideoService:
         config: KlmsConfig,
         auth_mode: str,
         course_id: str | None,
+        course_query: str | None,
         limit: int | None,
+        recent: bool,
         bootstrap: KlmsSessionBootstrap,
     ) -> list[Video]:
-        course_map = self._course_map_for_request(bootstrap=bootstrap, config=config, course_id=course_id)
+        course_map = self._course_map_for_request(
+            bootstrap=bootstrap,
+            config=config,
+            course_id=course_id,
+            course_query=course_query,
+        )
         if not course_map:
             return []
 
@@ -377,7 +399,8 @@ class VideoService:
                 break
 
         deduped = _merge_videos(items)
-        deduped.sort(key=lambda item: (item.course_title or "", item.title.lower()))
+        if recent:
+            deduped.sort(key=lambda item: int(str(item.id or "0").strip() or "0"), reverse=True)
         if limit is not None:
             deduped = deduped[: max(0, limit)]
         return deduped
@@ -388,16 +411,44 @@ class VideoService:
         bootstrap: KlmsSessionBootstrap,
         config: KlmsConfig,
         course_id: str | None,
+        course_query: str | None = None,
     ) -> dict[str, dict[str, str | None]]:
         course_map = _course_map_from_dashboard(bootstrap.dashboard_html, base_url=config.base_url, configured_ids=config.course_ids)
+        current_term_label = _extract_current_term_from_dashboard(bootstrap.dashboard_html)
         if course_id:
             target = str(course_id).strip()
-            course_meta = course_map.get(target) or {"course_id": target, "course_title": None, "course_code": None}
+            course_meta = course_map.get(target) or {"course_id": target, "course_title": None, "course_code": None, "term_label": None}
             return {target: course_meta}
         return {
             key: value
             for key, value in course_map.items()
             if not _is_noise_course(str(value.get("course_title") or ""), config.exclude_course_title_patterns)
+            and _course_matches_query(
+                type(
+                    "_CourseQueryCarrier",
+                    (),
+                    {
+                        "title": str(value.get("course_title") or ""),
+                        "course_code": value.get("course_code"),
+                        "course_code_base": _course_code_base(str(value.get("course_code") or "").strip() or None),
+                    },
+                ),
+                course_query,
+            )
+            and _course_is_current_term(
+                type(
+                    "_CourseTermCarrier",
+                    (),
+                    {
+                        "title": str(value.get("course_title") or ""),
+                        "course_code": value.get("course_code"),
+                        "course_code_base": _course_code_base(str(value.get("course_code") or "").strip() or None),
+                        "term_label": value.get("term_label"),
+                    },
+                ),
+                current_term_label,
+                include_past=False,
+            )
         }
 
     def _resolve_target_video(
@@ -439,7 +490,9 @@ class VideoService:
                 config=config,
                 auth_mode=auth_mode,
                 course_id=course_id_hint,
+                course_query=None,
                 limit=None,
+                recent=False,
                 bootstrap=bootstrap,
             )
             for item in items:
@@ -481,6 +534,13 @@ class VideoService:
                 exit_code=10,
                 retryable=True,
             )
+        if error_text := looks_klms_error_html(detail_response.text):
+            raise CommandError(
+                code="NOT_FOUND",
+                message=f"Video not found: {item.id or detail_url}",
+                hint=f"KLMS returned an error page for the video target: {error_text}",
+                exit_code=44,
+            )
         detail = _parse_video_detail_from_html(detail_response.text, base_url=config.base_url, fallback_id=item.id)
         viewer_url = detail.get("viewer_url") or item.viewer_url
         title = detail.get("title") or item.title
@@ -490,6 +550,13 @@ class VideoService:
         if viewer_url:
             viewer_response = bootstrap.http.get_html(viewer_url, context=context, timeout_seconds=20.0)
             if not looks_login_url(viewer_response.url) and not looks_logged_out_html(viewer_response.text):
+                if error_text := looks_klms_error_html(viewer_response.text):
+                    raise CommandError(
+                        code="NOT_FOUND",
+                        message=f"Video not found: {item.id or viewer_url}",
+                        hint=f"KLMS returned an error page for the VOD viewer: {error_text}",
+                        exit_code=44,
+                    )
                 viewer = _parse_video_viewer_from_html(viewer_response.text, base_url=config.base_url)
                 title = viewer.get("title") or title
                 stream_url = viewer.get("stream_url") or stream_url

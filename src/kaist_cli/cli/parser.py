@@ -36,6 +36,10 @@ def build_parser() -> argparse.ArgumentParser:
               1) kaist klms auth login --base-url https://klms.kaist.ac.kr
               2) kaist klms courses list
               3) kaist klms today
+
+            Global machine mode:
+              kaist --agent klms today
+              kaist --agent version
             """
         ),
         epilog=epilog,
@@ -51,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--agent",
         action="store_true",
-        help="Agent mode. Forces strict JSON envelopes and deterministic key ordering.",
+        help="Global agent mode. Forces strict JSON envelopes and deterministic key ordering; use it before the command, e.g. `kaist --agent klms today`.",
     )
 
     top = parser.add_subparsers(dest="system", required=True, title="Commands", metavar="COMMAND")

@@ -12,12 +12,13 @@ from .auth import AuthService, looks_logged_out_html, looks_login_url
 from .cache import list_cache_entries, load_cache_entry, save_cache_value
 from .assignments import _attachment_filename_from_url, _looks_like_attachment_url, _parse_datetime_guess
 from .config import KlmsConfig, abs_url, load_config
-from .courses import _discover_courses_from_dashboard, _is_noise_course, _norm_text
+from .courses import _course_is_current_term, _course_matches_query, _discover_courses_from_dashboard, _extract_current_term_from_dashboard, _is_noise_course, _norm_text
 from .deadline import RefreshDeadline
 from .models import Notice
 from .paths import KlmsPaths
 from .provider_state import ProviderLoad
 from .session import KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
+from .validate import looks_klms_error_html
 
 NOTICE_BOARD_TTL_SECONDS = 6 * 3600
 NOTICE_LIST_TTL_SECONDS = 5 * 60
@@ -30,10 +31,16 @@ def _extract_course_ids_from_dashboard(
     base_url: str,
     configured_ids: tuple[str, ...],
     exclude_patterns: tuple[str, ...],
+    course_query: str | None = None,
 ) -> list[str]:
     out: list[str] = []
+    current_term_label = _extract_current_term_from_dashboard(html)
     for course in _discover_courses_from_dashboard(html, base_url=base_url):
         if _is_noise_course(course.title, exclude_patterns):
+            continue
+        if not _course_is_current_term(course, current_term_label, include_past=False):
+            continue
+        if not _course_matches_query(course, course_query):
             continue
         out.append(str(course.id).strip())
     out.extend(str(course_id).strip() for course_id in configured_ids if str(course_id).strip())
@@ -406,6 +413,18 @@ def _iso_from_epoch_seconds(value: float | int | None) -> str | None:
         return None
 
 
+def _cache_is_fresh_enough(entry: dict[str, Any] | None, *, max_age_seconds: int = 3600) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    age_seconds = entry.get("age_seconds")
+    if isinstance(age_seconds, (int, float)):
+        return float(age_seconds) <= float(max_age_seconds)
+    stored_at = entry.get("stored_at")
+    if isinstance(stored_at, (int, float)):
+        return (datetime.now(timezone.utc).timestamp() - float(stored_at)) <= float(max_age_seconds)
+    return False
+
+
 def _finalize_notice_items(items: list[Notice], *, since_iso: str | None, limit: int | None) -> list[Notice]:
     filtered = items
     if since_iso:
@@ -542,6 +561,7 @@ class NoticeService:
         config: KlmsConfig,
         auth_mode: str,
         notice_board_id: str | None = None,
+        course_query: str | None = None,
         max_pages: int = 1,
         since_iso: str | None = None,
         limit: int | None = None,
@@ -558,6 +578,7 @@ class NoticeService:
             config=config,
             auth_mode=auth_mode,
             notice_board_id=notice_board_id,
+            course_query=course_query,
             max_pages=max_pages,
             since_iso=since_iso,
             limit=limit,
@@ -572,6 +593,7 @@ class NoticeService:
         config: KlmsConfig,
         auth_mode: str,
         notice_board_id: str | None = None,
+        course_query: str | None = None,
         max_pages: int = 1,
         since_iso: str | None = None,
         limit: int | None = None,
@@ -589,6 +611,7 @@ class NoticeService:
             context=context,
             config=config,
             explicit_board_id=notice_board_id,
+            course_query=course_query,
             bootstrap=bootstrap,
             deadline=deadline,
             allow_stale_cache=True,
@@ -634,7 +657,9 @@ class NoticeService:
 
         if deadline is not None and deadline.hard_expired():
             if cache_entry is not None and cached_filtered:
-                warnings = [_provider_warning("LIVE_REFRESH_TIMEOUT", "Interactive refresh budget expired before notice refresh completed.")]
+                warnings: list[dict[str, Any]] = []
+                if not _cache_is_fresh_enough(cache_entry):
+                    warnings.append(_provider_warning("LIVE_REFRESH_TIMEOUT", "Interactive refresh budget expired before notice refresh completed."))
                 if bool(cache_entry.get("stale")):
                     warnings.insert(0, _provider_warning("STALE_CACHE", "Returning stale notice cache because live refresh could not finish in time."))
                 return ProviderLoad(
@@ -679,7 +704,9 @@ class NoticeService:
             )
         except TimeoutError:
             if cache_entry is not None and cached_filtered:
-                warnings = [_provider_warning("LIVE_REFRESH_TIMEOUT", "Notice refresh exceeded the interactive deadline.")]
+                warnings: list[dict[str, Any]] = []
+                if not _cache_is_fresh_enough(cache_entry):
+                    warnings.append(_provider_warning("LIVE_REFRESH_TIMEOUT", "Notice refresh exceeded the interactive deadline."))
                 if bool(cache_entry.get("stale")):
                     warnings.insert(0, _provider_warning("STALE_CACHE", "Returning stale notice cache because live refresh timed out."))
                 return ProviderLoad(
@@ -714,9 +741,9 @@ class NoticeService:
             raise
         except Exception as exc:
             if cache_entry is not None and cached_filtered:
-                warnings = [
-                    _provider_warning("LIVE_REFRESH_FAILED", "Notice refresh failed; returning cached notice data.", error=str(exc)),
-                ]
+                warnings: list[dict[str, Any]] = []
+                if not _cache_is_fresh_enough(cache_entry):
+                    warnings.append(_provider_warning("LIVE_REFRESH_FAILED", "Notice refresh failed; returning cached notice data.", error=str(exc)))
                 if bool(cache_entry.get("stale")):
                     warnings.insert(0, _provider_warning("STALE_CACHE", "Returning stale notice cache because live refresh failed."))
                 return ProviderLoad(
@@ -786,6 +813,7 @@ class NoticeService:
         self,
         *,
         notice_board_id: str | None = None,
+        course_query: str | None = None,
         max_pages: int = 1,
         since_iso: str | None = None,
         limit: int | None = None,
@@ -799,6 +827,7 @@ class NoticeService:
                 config=config,
                 auth_mode=auth_mode,
                 notice_board_id=notice_board_id,
+                course_query=course_query,
                 max_pages=max_pages,
                 since_iso=since_iso,
                 limit=limit,
@@ -817,6 +846,7 @@ class NoticeService:
         notice_id: str,
         *,
         notice_board_id: str | None = None,
+        course_query: str | None = None,
         max_pages: int = 3,
         include_html: bool = False,
     ) -> CommandResult:
@@ -836,6 +866,7 @@ class NoticeService:
                 context=context,
                 config=config,
                 explicit_board_id=notice_board_id,
+                course_query=course_query,
                 bootstrap=bootstrap,
             )
             if not board_ids:
@@ -853,6 +884,7 @@ class NoticeService:
                     config=config,
                     auth_mode=auth_mode,
                     notice_board_id=None,
+                    course_query=course_query,
                     max_pages=max_pages,
                     since_iso=None,
                     limit=None,
@@ -894,6 +926,8 @@ class NoticeService:
                     lowered = final_url.lower()
                     if "mod/courseboard/article.php" not in lowered or f"bwid={target_notice_id}" not in lowered:
                         continue
+                if looks_klms_error_html(html):
+                    continue
 
                 detail = _parse_notice_detail_from_html(
                     html,
@@ -945,6 +979,7 @@ class NoticeService:
         config: KlmsConfig,
         auth_mode: str,
         notice_board_id: str | None,
+        course_query: str | None,
         max_pages: int,
         since_iso: str | None,
         limit: int | None,
@@ -956,7 +991,13 @@ class NoticeService:
             config=config,
             auth_mode=auth_mode,
         )
-        board_ids = self._resolve_notice_board_ids(context=context, config=config, explicit_board_id=notice_board_id, bootstrap=bootstrap)
+        board_ids = self._resolve_notice_board_ids(
+            context=context,
+            config=config,
+            explicit_board_id=notice_board_id,
+            course_query=course_query,
+            bootstrap=bootstrap,
+        )
         if not board_ids:
             raise CommandError(
                 code="CONFIG_INVALID",
@@ -1094,6 +1135,7 @@ class NoticeService:
         context: Any,
         config: KlmsConfig,
         explicit_board_id: str | None,
+        course_query: str | None = None,
         bootstrap: KlmsSessionBootstrap | None = None,
         deadline: RefreshDeadline | None = None,
         allow_stale_cache: bool = False,
@@ -1115,6 +1157,7 @@ class NoticeService:
             base_url=config.base_url,
             configured_ids=config.course_ids,
             exclude_patterns=config.exclude_course_title_patterns,
+            course_query=course_query,
         )
         cache_key = self._notice_board_cache_key(config, course_ids)
         cache_entry = load_cache_entry(self._paths, cache_key)

@@ -174,6 +174,13 @@ def _looks_like_easy_login_page(url: str) -> bool:
     return EASY_LOGIN_VIEW_NEEDLE in lowered or EASY_LOGIN_SUBMIT_NEEDLE in lowered
 
 
+def _safe_page_content(page: Any) -> str | None:
+    try:
+        return str(page.content() or "")
+    except Exception:
+        return None
+
+
 def storage_state_cookie_stats(paths: KlmsPaths) -> dict[str, Any] | None:
     if not paths.storage_state_path.exists():
         return None
@@ -544,6 +551,14 @@ class AuthService:
     def _manual_login(self, *, config: KlmsConfig) -> CommandResult:
         from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
 
+        if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+            raise CommandError(
+                code="AUTH_FLOW_UNSUPPORTED",
+                message="Manual browser login is not supported on headless Linux without a display server.",
+                hint="Use `kaist klms auth login --username <KAIST_ID>` on headless Linux hosts.",
+                exit_code=10,
+                retryable=False,
+            )
         print(f"Opening browser to: {config.base_url}", file=sys.stderr)
         print("Log in fully, navigate to a course page, then return here and press Enter.", file=sys.stderr)
         with sync_playwright() as playwright:
@@ -580,20 +595,21 @@ class AuthService:
         deadline = time.monotonic() + max(1.0, timeout_seconds)
         while time.monotonic() < deadline:
             current_url = str(page.url or "")
-            html = page.content()
-            error_message = _extract_easy_login_error_message(html)
-            if error_message:
-                raise CommandError(
-                    code="AUTH_FAILED",
-                    message=f"KAIST Easy Login rejected the username ({error_message}).",
-                    hint="Check the KAIST account ID and confirm Easy Login is registered in the KAIST auth app.",
-                    exit_code=10,
-                    retryable=False,
-                )
+            html = _safe_page_content(page)
+            if html:
+                error_message = _extract_easy_login_error_message(html)
+                if error_message:
+                    raise CommandError(
+                        code="AUTH_FAILED",
+                        message=f"KAIST Easy Login rejected the username ({error_message}).",
+                        hint="Check the KAIST account ID and confirm Easy Login is registered in the KAIST auth app.",
+                        exit_code=10,
+                        retryable=False,
+                    )
             if EASY_LOGIN_SUBMIT_NEEDLE in current_url or "/auth/twofactor/mfa/" in current_url:
-                return html
+                return html or ""
             if not _looks_like_easy_login_page(current_url):
-                return html
+                return html or ""
             page.wait_for_timeout(250)
         raise CommandError(
             code="AUTH_TIMEOUT",
@@ -671,21 +687,23 @@ class AuthService:
                                 capability="full",
                             )
 
-                    current_html = page.content()
                     current_url = str(page.url or "")
-                    error_message = _extract_easy_login_error_message(current_html)
-                    if error_message:
-                        raise CommandError(
-                            code="AUTH_FAILED",
-                            message=f"KAIST Easy Login failed after initialization ({error_message}).",
-                            hint="Try again, or fall back to `kaist klms auth login` without `--username`.",
-                            exit_code=10,
-                            retryable=False,
-                        )
-                    current_number = _extract_easy_login_number(current_html)
-                    if current_number and current_number != printed_login_number:
-                        printed_login_number = current_number
-                        print(f"KAIST SSO Easy Login number: {current_number}", file=sys.stderr)
+                    if _looks_like_easy_login_page(current_url) or EASY_LOGIN_SUBMIT_NEEDLE in current_url or "/auth/twofactor/mfa/" in current_url:
+                        current_html = _safe_page_content(page)
+                        if current_html:
+                            error_message = _extract_easy_login_error_message(current_html)
+                            if error_message:
+                                raise CommandError(
+                                    code="AUTH_FAILED",
+                                    message=f"KAIST Easy Login failed after initialization ({error_message}).",
+                                    hint="Try again, or fall back to `kaist klms auth login` without `--username`.",
+                                    exit_code=10,
+                                    retryable=False,
+                                )
+                            current_number = _extract_easy_login_number(current_html)
+                            if current_number and current_number != printed_login_number:
+                                printed_login_number = current_number
+                                print(f"KAIST SSO Easy Login number: {current_number}", file=sys.stderr)
                     page.wait_for_timeout(int(EASY_LOGIN_POLL_SECONDS * 1000))
 
                 detail = f" Login number: {printed_login_number}." if printed_login_number else ""

@@ -15,12 +15,22 @@ from ..contracts import CommandError, CommandResult
 from .auth import AuthService, looks_logged_out_html, looks_login_url
 from .cache import load_cache_entry, load_cache_value, save_cache_value
 from .config import KlmsConfig, abs_url, load_config
-from .courses import _course_code_base, _discover_courses_from_dashboard, _extract_course_code_from_resource_index, _is_noise_course, _norm_text
+from .courses import (
+    _course_code_base,
+    _course_is_current_term,
+    _course_matches_query,
+    _discover_courses_from_dashboard,
+    _extract_course_code_from_resource_index,
+    _extract_current_term_from_dashboard,
+    _is_noise_course,
+    _norm_text,
+)
 from .deadline import RefreshDeadline
 from .models import FileItem
 from .paths import KlmsPaths
 from .provider_state import ProviderLoad
 from .session import KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
+from .validate import looks_klms_error_html
 
 ALLOWED_MODULES = {"resource", "folder", "url", "page"}
 DOWNLOADABLE_MODULES = {"resource"}
@@ -144,6 +154,7 @@ def _course_map_from_dashboard(html: str, *, base_url: str, configured_ids: tupl
             "course_id": str(course.id),
             "course_title": course.title,
             "course_code": course.course_code,
+            "term_label": course.term_label,
         }
         for course in _discover_courses_from_dashboard(html, base_url=base_url)
     }
@@ -151,7 +162,7 @@ def _course_map_from_dashboard(html: str, *, base_url: str, configured_ids: tupl
         course_id = str(configured_id).strip()
         if not course_id:
             continue
-        courses.setdefault(course_id, {"course_id": course_id, "course_title": None, "course_code": None})
+        courses.setdefault(course_id, {"course_id": course_id, "course_title": None, "course_code": None, "term_label": None})
     return courses
 
 
@@ -342,6 +353,18 @@ def _iso_from_epoch_seconds(value: float | int | None) -> str | None:
         return None
 
 
+def _cache_is_fresh_enough(entry: dict[str, Any] | None, *, max_age_seconds: int = 3600) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    age_seconds = entry.get("age_seconds")
+    if isinstance(age_seconds, (int, float)):
+        return float(age_seconds) <= float(max_age_seconds)
+    stored_at = entry.get("stored_at")
+    if isinstance(stored_at, (int, float)):
+        return (datetime.now(timezone.utc).timestamp() - float(stored_at)) <= float(max_age_seconds)
+    return False
+
+
 def _provider_warning(code: str, message: str, **extra: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {"code": code, "message": message}
     payload.update(extra)
@@ -488,6 +511,7 @@ class FileService:
         config: KlmsConfig,
         auth_mode: str,
         course_id: str | None = None,
+        course_query: str | None = None,
         limit: int | None = None,
         bootstrap: KlmsSessionBootstrap | None = None,
     ) -> CommandResult:
@@ -502,6 +526,7 @@ class FileService:
             config=config,
             auth_mode=auth_mode,
             course_id=course_id,
+            course_query=course_query,
             limit=limit,
             bootstrap=bootstrap,
         )
@@ -514,6 +539,7 @@ class FileService:
         config: KlmsConfig,
         auth_mode: str,
         course_id: str | None = None,
+        course_query: str | None = None,
         limit: int | None = None,
         bootstrap: KlmsSessionBootstrap | None = None,
         deadline: RefreshDeadline | None = None,
@@ -525,7 +551,7 @@ class FileService:
             config=config,
             auth_mode=auth_mode,
         )
-        course_map = self._course_map_for_request(bootstrap=bootstrap, config=config, course_id=course_id)
+        course_map = self._course_map_for_request(bootstrap=bootstrap, config=config, course_id=course_id, course_query=course_query)
         cache_key = self._file_list_cache_key(config, list(course_map.keys()))
         cache_entry = load_cache_entry(self._paths, cache_key)
         cached_rows = cache_entry.get("value") if isinstance(cache_entry, dict) else None
@@ -549,7 +575,9 @@ class FileService:
 
         if deadline is not None and deadline.hard_expired():
             if cache_entry is not None and cached_limited:
-                warnings = [_provider_warning("LIVE_REFRESH_TIMEOUT", "Interactive refresh budget expired before file refresh completed.")]
+                warnings: list[dict[str, Any]] = []
+                if not _cache_is_fresh_enough(cache_entry):
+                    warnings.append(_provider_warning("LIVE_REFRESH_TIMEOUT", "Interactive refresh budget expired before file refresh completed."))
                 if bool(cache_entry.get("stale")):
                     warnings.insert(0, _provider_warning("STALE_CACHE", "Returning stale file cache because live refresh could not finish in time."))
                 return ProviderLoad(
@@ -592,7 +620,9 @@ class FileService:
             )
         except TimeoutError:
             if cache_entry is not None and cached_limited:
-                warnings = [_provider_warning("LIVE_REFRESH_TIMEOUT", "File refresh exceeded the interactive deadline.")]
+                warnings: list[dict[str, Any]] = []
+                if not _cache_is_fresh_enough(cache_entry):
+                    warnings.append(_provider_warning("LIVE_REFRESH_TIMEOUT", "File refresh exceeded the interactive deadline."))
                 if bool(cache_entry.get("stale")):
                     warnings.insert(0, _provider_warning("STALE_CACHE", "Returning stale file cache because live refresh timed out."))
                 return ProviderLoad(
@@ -627,9 +657,9 @@ class FileService:
             raise
         except Exception as exc:
             if cache_entry is not None and cached_limited:
-                warnings = [
-                    _provider_warning("LIVE_REFRESH_FAILED", "File refresh failed; returning cached file data.", error=str(exc)),
-                ]
+                warnings: list[dict[str, Any]] = []
+                if not _cache_is_fresh_enough(cache_entry):
+                    warnings.append(_provider_warning("LIVE_REFRESH_FAILED", "File refresh failed; returning cached file data.", error=str(exc)))
                 if bool(cache_entry.get("stale")):
                     warnings.insert(0, _provider_warning("STALE_CACHE", "Returning stale file cache because live refresh failed."))
                 return ProviderLoad(
@@ -695,7 +725,7 @@ class FileService:
             prefer_cache=False,
         )
 
-    def list(self, *, course_id: str | None = None, limit: int | None = None) -> CommandResult:
+    def list(self, *, course_id: str | None = None, course_query: str | None = None, limit: int | None = None) -> CommandResult:
         config = load_config(self._paths)
 
         def callback(context: Any, auth_mode: str) -> CommandResult:
@@ -704,6 +734,7 @@ class FileService:
                 config=config,
                 auth_mode=auth_mode,
                 course_id=course_id,
+                course_query=course_query,
                 limit=limit,
             )
 
@@ -799,6 +830,7 @@ class FileService:
                 config=config,
                 auth_mode=auth_mode,
                 course_id=course_id,
+                course_query=None,
                 limit=limit,
                 bootstrap=bootstrap,
             )
@@ -911,6 +943,7 @@ class FileService:
         config: KlmsConfig,
         auth_mode: str,
         course_id: str | None,
+        course_query: str | None,
         limit: int | None,
         bootstrap: KlmsSessionBootstrap | None = None,
     ) -> list[FileItem]:
@@ -920,7 +953,7 @@ class FileService:
             config=config,
             auth_mode=auth_mode,
         )
-        course_map = self._course_map_for_request(bootstrap=bootstrap, config=config, course_id=course_id)
+        course_map = self._course_map_for_request(bootstrap=bootstrap, config=config, course_id=course_id, course_query=course_query)
         if not course_map:
             return []
 
@@ -951,16 +984,44 @@ class FileService:
         bootstrap: KlmsSessionBootstrap,
         config: KlmsConfig,
         course_id: str | None,
+        course_query: str | None = None,
     ) -> dict[str, dict[str, str | None]]:
         course_map = _course_map_from_dashboard(bootstrap.dashboard_html, base_url=config.base_url, configured_ids=config.course_ids)
+        current_term_label = _extract_current_term_from_dashboard(bootstrap.dashboard_html)
         if course_id:
             target = str(course_id).strip()
-            course_meta = course_map.get(target) or {"course_id": target, "course_title": None, "course_code": None}
+            course_meta = course_map.get(target) or {"course_id": target, "course_title": None, "course_code": None, "term_label": None}
             return {target: course_meta}
         return {
             key: value
             for key, value in course_map.items()
             if not _is_noise_course(str(value.get("course_title") or ""), config.exclude_course_title_patterns)
+            and _course_matches_query(
+                type(
+                    "_CourseQueryCarrier",
+                    (),
+                    {
+                        "title": str(value.get("course_title") or ""),
+                        "course_code": value.get("course_code"),
+                        "course_code_base": _course_code_base(str(value.get("course_code") or "").strip() or None),
+                    },
+                ),
+                course_query,
+            )
+            and _course_is_current_term(
+                type(
+                    "_CourseTermCarrier",
+                    (),
+                    {
+                        "title": str(value.get("course_title") or ""),
+                        "course_code": value.get("course_code"),
+                        "course_code_base": _course_code_base(str(value.get("course_code") or "").strip() or None),
+                        "term_label": value.get("term_label"),
+                    },
+                ),
+                current_term_label,
+                include_past=False,
+            )
         }
 
     def _refresh_file_items(
@@ -1235,7 +1296,14 @@ class FileService:
         auth_mode: str,
         target: str,
     ) -> FileItem:
-        items = self._list_html(context=context, config=config, auth_mode=auth_mode, course_id=None, limit=None)
+        items = self._list_html(
+            context=context,
+            config=config,
+            auth_mode=auth_mode,
+            course_id=None,
+            course_query=None,
+            limit=None,
+        )
         normalized_url = abs_url(config.base_url, target) if _looks_like_url_candidate(target) else None
         selected = None
         if normalized_url is not None:
@@ -1313,6 +1381,13 @@ class FileService:
                 hint="Run `kaist klms auth refresh` and try again.",
                 exit_code=10,
                 retryable=True,
+            )
+        if error_text := looks_klms_error_html(html):
+            raise CommandError(
+                code="NOT_FOUND",
+                message=f"File not found: {item.id or item.url or item.title}",
+                hint=f"KLMS returned an error page while resolving the file target: {error_text}",
+                exit_code=44,
             )
 
         title = item.title

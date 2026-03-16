@@ -16,8 +16,19 @@ from kaist_cli.core.distribution import BundleManifest, DistributionInfo
 def test_platform_target_mapping() -> None:
     assert updater._platform_target("Darwin", "arm64") == "darwin-arm64"  # type: ignore[attr-defined]
     assert updater._platform_target("darwin", "x86_64") == "darwin-x86_64"  # type: ignore[attr-defined]
-    assert updater._platform_target("Linux", "aarch64") == "linux-arm64"  # type: ignore[attr-defined]
-    assert updater._platform_target("linux", "amd64") == "linux-x86_64"  # type: ignore[attr-defined]
+
+
+def test_platform_target_mapping_linux_musl(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(updater, "_linux_is_musl", lambda: True)
+    assert updater._platform_target("linux", "amd64") == "linux-x86_64-musl"  # type: ignore[attr-defined]
+
+
+def test_platform_target_mapping_linux_non_musl_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(updater, "_linux_is_musl", lambda: False)
+    with pytest.raises(updater.SelfUpdateError):
+        updater._platform_target("Linux", "aarch64")  # type: ignore[attr-defined]
+    with pytest.raises(updater.SelfUpdateError):
+        updater._platform_target("linux", "amd64")  # type: ignore[attr-defined]
 
 
 def test_platform_target_unsupported_raises() -> None:
@@ -149,7 +160,7 @@ def test_check_for_update_includes_distribution_metadata(monkeypatch: pytest.Mon
     assert payload["self_update_supported"] is False
 
 
-@pytest.mark.parametrize("target", ["darwin-arm64", "darwin-x86_64"])
+@pytest.mark.parametrize("target", ["darwin-arm64", "darwin-x86_64", "linux-x86_64-musl"])
 def test_build_release_bundle_contains_skill_and_manifest(tmp_path: Path, target: str) -> None:
     archive_path, _ = _prepare_release_dir(tmp_path / "releases", "v0.1.4", target=target)
 
@@ -170,7 +181,7 @@ def test_build_release_bundle_contains_skill_and_manifest(tmp_path: Path, target
     }
 
 
-@pytest.mark.parametrize("target", ["darwin-arm64", "darwin-x86_64"])
+@pytest.mark.parametrize("target", ["darwin-arm64", "darwin-x86_64", "linux-x86_64-musl"])
 def test_install_script_installs_managed_layout_and_rotates_previous(tmp_path: Path, target: str) -> None:
     downloads_dir = tmp_path / "downloads"
     _prepare_release_dir(downloads_dir, "v0.1.4", target=target)

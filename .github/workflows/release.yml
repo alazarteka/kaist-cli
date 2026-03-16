@@ -18,22 +18,27 @@ jobs:
             runner: macos-14
           - target: darwin-x86_64
             runner: macos-15-intel
+          - target: linux-x86_64-musl
+            runner: ubuntu-latest
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
+        if: ${{ matrix.target != 'linux-x86_64-musl' }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install build dependencies
+        if: ${{ matrix.target != 'linux-x86_64-musl' }}
         run: |
           python -m pip install --upgrade pip
           python -m pip install . pyinstaller
 
       - name: Build standalone binary
+        if: ${{ matrix.target != 'linux-x86_64-musl' }}
         run: |
           pyinstaller \
             --name kaist \
@@ -46,6 +51,32 @@ jobs:
             --collect-submodules playwright \
             --collect-data playwright \
             scripts/pyinstaller_entrypoint.py
+
+      - name: Build standalone binary (linux musl)
+        if: ${{ matrix.target == 'linux-x86_64-musl' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            alpine:3.20 \
+            sh -euxc '
+              apk add --no-cache bash build-base linux-headers python3 py3-pip libffi-dev openssl-dev zlib-dev xz
+              python3 -m pip install --break-system-packages --upgrade pip
+              python3 -m pip install --break-system-packages . pyinstaller
+              pyinstaller \
+                --name kaist \
+                --onefile \
+                --console \
+                --clean \
+                --paths src \
+                --hidden-import playwright.async_api \
+                --hidden-import playwright.sync_api \
+                --collect-submodules playwright \
+                --collect-data playwright \
+                scripts/pyinstaller_entrypoint.py
+            '
 
       - name: Package release assets
         shell: bash
@@ -87,4 +118,5 @@ jobs:
           files: |
             dist/kaist-${{ github.ref_name }}-darwin-arm64.tar.gz
             dist/kaist-${{ github.ref_name }}-darwin-x86_64.tar.gz
+            dist/kaist-${{ github.ref_name }}-linux-x86_64-musl.tar.gz
             dist/checksums.txt

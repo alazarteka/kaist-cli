@@ -133,8 +133,15 @@ class KlmsFacade:
             manual_courseboard_seconds=manual_courseboard_seconds,
         )
 
-    def list_courses(self, *, include_all: bool = False, limit: int | None = None) -> CommandResult:
-        return self._courses.list(include_all=include_all, limit=limit)
+    def list_courses(
+        self,
+        *,
+        include_all: bool = False,
+        include_past: bool = False,
+        limit: int | None = None,
+        course_query: str | None = None,
+    ) -> CommandResult:
+        return self._courses.list(include_all=include_all, include_past=include_past, limit=limit, course_query=course_query)
 
     def show_course(self, course_id: str) -> CommandResult:
         return self._courses.show(course_id)
@@ -143,10 +150,18 @@ class KlmsFacade:
         self,
         *,
         course_id: str | None = None,
+        course_query: str | None = None,
         since_iso: str | None = None,
         limit: int | None = None,
+        include_past: bool = False,
     ) -> CommandResult:
-        return self._assignments.list(course_id=course_id, since_iso=since_iso, limit=limit)
+        return self._assignments.list(
+            course_id=course_id,
+            course_query=course_query,
+            since_iso=since_iso,
+            limit=limit,
+            include_past=include_past,
+        )
 
     def show_assignment(self, assignment_id: str, *, course_id_hint: str | None = None) -> CommandResult:
         return self._assignments.show(assignment_id, course_id_hint=course_id_hint)
@@ -155,12 +170,14 @@ class KlmsFacade:
         self,
         *,
         notice_board_id: str | None = None,
+        course_query: str | None = None,
         max_pages: int = 1,
         since_iso: str | None = None,
         limit: int | None = None,
     ) -> CommandResult:
         return self._notices.list(
             notice_board_id=notice_board_id,
+            course_query=course_query,
             max_pages=max_pages,
             since_iso=since_iso,
             limit=limit,
@@ -171,18 +188,20 @@ class KlmsFacade:
         notice_id: str,
         *,
         notice_board_id: str | None = None,
+        course_query: str | None = None,
         max_pages: int = 3,
         include_html: bool = False,
     ) -> CommandResult:
         return self._notices.show(
             notice_id,
             notice_board_id=notice_board_id,
+            course_query=course_query,
             max_pages=max_pages,
             include_html=include_html,
         )
 
-    def list_files(self, *, course_id: str | None = None, limit: int | None = None) -> CommandResult:
-        return self._files.list(course_id=course_id, limit=limit)
+    def list_files(self, *, course_id: str | None = None, course_query: str | None = None, limit: int | None = None) -> CommandResult:
+        return self._files.list(course_id=course_id, course_query=course_query, limit=limit)
 
     def get_file(self, file_id_or_url: str) -> CommandResult:
         return self._files.get(file_id_or_url)
@@ -207,8 +226,15 @@ class KlmsFacade:
     ) -> CommandResult:
         return self._files.pull(course_id=course_id, limit=limit, subdir=subdir, if_exists=if_exists)
 
-    def list_videos(self, *, course_id: str | None = None, limit: int | None = None) -> CommandResult:
-        return self._videos.list(course_id=course_id, limit=limit)
+    def list_videos(
+        self,
+        *,
+        course_id: str | None = None,
+        course_query: str | None = None,
+        limit: int | None = None,
+        recent: bool = False,
+    ) -> CommandResult:
+        return self._videos.list(course_id=course_id, course_query=course_query, limit=limit, recent=recent)
 
     def show_video(self, video_id_or_url: str, *, course_id_hint: str | None = None) -> CommandResult:
         return self._videos.show(video_id_or_url, course_id_hint=course_id_hint)

@@ -23,7 +23,7 @@ def main(argv: list[str] | None = None) -> int:
         if json_mode:
             emit_json(success_envelope(args, result), sort_keys=args.agent)
         else:
-            emit_human_output(result, output_format)
+            emit_human_output(result, output_format, command_path=getattr(args, "command_path", None))
         return 0
     except KeyboardInterrupt:
         if json_mode:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from bs4 import BeautifulSoup  # type: ignore[import-untyped]
@@ -11,13 +11,25 @@ from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 from ..contracts import CommandError, CommandResult
 from .auth import AuthService, extract_sesskey, looks_logged_out_html, looks_login_url
 from .config import KlmsConfig, abs_url, load_config
-from .courses import _course_code_base, _is_noise_course, _norm_text
+from .courses import (
+    _course_code_base,
+    _course_is_current_term,
+    _course_matches_query,
+    _discover_courses_from_dashboard,
+    _extract_current_term_from_dashboard,
+    _is_noise_course,
+    _norm_text,
+)
 from .deadline import RefreshDeadline
 from .discovery import load_json_summary
 from .models import Assignment
 from .paths import KlmsPaths
 from .provider_state import ProviderLoad
 from .session import KlmsSessionBootstrap, build_session_bootstrap
+from .validate import looks_klms_error_html
+
+
+KAIST_LOCAL_TZ = timezone(timedelta(hours=9))
 
 
 def _strip_html_text(raw: str | None) -> str | None:
@@ -37,8 +49,8 @@ def _parse_datetime_guess(raw: str) -> str | None:
     moodle_raw = re.sub(r"^[A-Za-z]+,\s*", "", text).replace(",", "")
     for fmt in ("%d %B %Y %I:%M %p", "%d %B %Y %H:%M"):
         try:
-            dt = datetime.strptime(moodle_raw, fmt)
-            return dt.isoformat(timespec="minutes")
+            dt = datetime.strptime(moodle_raw, fmt).replace(tzinfo=KAIST_LOCAL_TZ)
+            return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         except ValueError:
             pass
 
@@ -51,8 +63,8 @@ def _parse_datetime_guess(raw: str) -> str | None:
         "%Y.%m.%d",
     ):
         try:
-            dt = datetime.strptime(text, fmt)
-            return dt.isoformat(timespec="minutes")
+            dt = datetime.strptime(text, fmt).replace(tzinfo=KAIST_LOCAL_TZ)
+            return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         except ValueError:
             continue
     return None
@@ -96,6 +108,62 @@ def _discover_course_ids_from_dashboard(html: str, *, configured_ids: tuple[str,
         seen.add(value)
         deduped.append(value)
     return deduped
+
+
+def _discover_current_term_course_ids_from_dashboard(
+    html: str,
+    *,
+    base_url: str,
+    configured_ids: tuple[str, ...],
+    exclude_patterns: tuple[str, ...],
+    include_past: bool,
+) -> list[str]:
+    current_term_label = _extract_current_term_from_dashboard(html)
+    discovered = _discover_courses_from_dashboard(html, base_url=base_url)
+    out: list[str] = []
+    for course in discovered:
+        if _is_noise_course(course.title, exclude_patterns):
+            continue
+        if not _course_is_current_term(course, current_term_label, include_past=include_past):
+            continue
+        out.append(str(course.id).strip())
+    out.extend(str(course_id).strip() for course_id in configured_ids if str(course_id).strip())
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in out:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _assignment_matches_course_query(assignment: Assignment, query: str | None) -> bool:
+    needle = _norm_text(str(query or "")).lower()
+    if not needle:
+        return True
+    haystacks = (
+        assignment.course_title,
+        assignment.course_code,
+        assignment.course_code_base,
+    )
+    return any(needle in _norm_text(value or "").lower() for value in haystacks if value)
+
+
+def _assignment_is_current_term(assignment: Assignment, current_term_label: str | None, *, include_past: bool) -> bool:
+    if include_past or not current_term_label:
+        return True
+    synthetic = type(
+        "_CourseTermCarrier",
+        (),
+        {
+            "title": assignment.course_title or "",
+            "course_code": assignment.course_code,
+            "course_code_base": assignment.course_code_base,
+            "term_label": None,
+        },
+    )
+    return _course_is_current_term(synthetic, current_term_label, include_past=include_past)
 
 
 def _recommended_methodnames(paths: KlmsPaths, *categories: str) -> list[str]:
@@ -177,13 +245,23 @@ def _filter_assignments(
     assignments: list[Assignment],
     *,
     course_id: str | None,
+    course_query: str | None,
     since_iso: str | None,
     limit: int | None,
+    current_term_label: str | None = None,
+    include_past: bool = False,
 ) -> list[Assignment]:
     filtered = assignments
     if course_id:
         target = str(course_id).strip()
         filtered = [assignment for assignment in filtered if str(assignment.course_id or "").strip() == target]
+    if course_query:
+        filtered = [assignment for assignment in filtered if _assignment_matches_course_query(assignment, course_query)]
+    filtered = [
+        assignment
+        for assignment in filtered
+        if _assignment_is_current_term(assignment, current_term_label, include_past=include_past)
+    ]
     if since_iso:
         floor = str(since_iso).strip()
         filtered = [assignment for assignment in filtered if assignment.due_iso and assignment.due_iso >= floor]
@@ -353,8 +431,10 @@ class AssignmentService:
         config: KlmsConfig,
         auth_mode: str,
         course_id: str | None = None,
+        course_query: str | None = None,
         since_iso: str | None = None,
         limit: int | None = None,
+        include_past: bool = False,
         bootstrap: KlmsSessionBootstrap | None = None,
     ) -> CommandResult:
         bootstrap = bootstrap or build_session_bootstrap(
@@ -368,8 +448,10 @@ class AssignmentService:
             config=config,
             auth_mode=auth_mode,
             course_id=course_id,
+            course_query=course_query,
             since_iso=since_iso,
             limit=limit,
+            include_past=include_past,
             bootstrap=bootstrap,
         )
         if api_assignments is not None:
@@ -383,8 +465,10 @@ class AssignmentService:
             context=context,
             config=config,
             course_id=course_id,
+            course_query=course_query,
             since_iso=since_iso,
             limit=limit,
+            include_past=include_past,
             bootstrap=bootstrap,
         )
         return CommandResult(
@@ -397,8 +481,10 @@ class AssignmentService:
         self,
         *,
         course_id: str | None = None,
+        course_query: str | None = None,
         since_iso: str | None = None,
         limit: int | None = None,
+        include_past: bool = False,
     ) -> CommandResult:
         config = load_config(self._paths)
 
@@ -408,8 +494,10 @@ class AssignmentService:
                 config=config,
                 auth_mode=auth_mode,
                 course_id=course_id,
+                course_query=course_query,
                 since_iso=since_iso,
                 limit=limit,
+                include_past=include_past,
             )
 
         return self._auth.run_authenticated(
@@ -500,6 +588,13 @@ class AssignmentService:
                     exit_code=10,
                     retryable=True,
                 )
+            if error_text := looks_klms_error_html(html):
+                raise CommandError(
+                    code="NOT_FOUND",
+                    message=f"Assignment not found: {target_id}",
+                    hint=f"KLMS returned an error page for assignment {target_id}: {error_text}",
+                    exit_code=44,
+                )
 
             assignment = _extract_assignment_detail_from_html(
                 html,
@@ -532,8 +627,10 @@ class AssignmentService:
         config: KlmsConfig,
         auth_mode: str,
         course_id: str | None,
+        course_query: str | None,
         since_iso: str | None,
         limit: int | None,
+        include_past: bool,
         bootstrap: KlmsSessionBootstrap | None = None,
     ) -> list[Assignment] | None:
         html = bootstrap.dashboard_html if bootstrap is not None else None
@@ -552,6 +649,7 @@ class AssignmentService:
             return None
         if not sesskey:
             return None
+        current_term_label = _extract_current_term_from_dashboard(html)
 
         methodnames = [
             "core_calendar_get_action_events_by_timesort",
@@ -616,7 +714,15 @@ class AssignmentService:
                     base_url=config.base_url,
                     auth_mode=auth_mode,
                 )
-                filtered = _filter_assignments(assignments, course_id=course_id, since_iso=since_iso, limit=limit)
+                filtered = _filter_assignments(
+                    assignments,
+                    course_id=course_id,
+                    course_query=course_query,
+                    since_iso=since_iso,
+                    limit=limit,
+                    current_term_label=current_term_label,
+                    include_past=include_past,
+                )
                 if filtered:
                     return filtered
         return None
@@ -627,8 +733,10 @@ class AssignmentService:
         context: Any,
         config: KlmsConfig,
         course_id: str | None,
+        course_query: str | None,
         since_iso: str | None,
         limit: int | None,
+        include_past: bool,
         bootstrap: KlmsSessionBootstrap | None = None,
     ) -> list[Assignment]:
         dashboard_html = bootstrap.dashboard_html if bootstrap is not None else None
@@ -640,9 +748,13 @@ class AssignmentService:
             finally:
                 dashboard_page.close()
 
-        course_ids = [str(course_id).strip()] if course_id else _discover_course_ids_from_dashboard(
+        current_term_label = _extract_current_term_from_dashboard(dashboard_html)
+        course_ids = [str(course_id).strip()] if course_id else _discover_current_term_course_ids_from_dashboard(
             dashboard_html,
+            base_url=config.base_url,
             configured_ids=config.course_ids,
+            exclude_patterns=config.exclude_course_title_patterns,
+            include_past=include_past,
         )
         out: list[Assignment] = []
         for course in course_ids:
@@ -657,7 +769,15 @@ class AssignmentService:
                     page.close()
             out.extend(_extract_assignments_from_index_html(html, base_url=config.base_url, course_id=course))
 
-        return _filter_assignments(out, course_id=course_id, since_iso=since_iso, limit=limit)
+        return _filter_assignments(
+            out,
+            course_id=course_id,
+            course_query=course_query,
+            since_iso=since_iso,
+            limit=limit,
+            current_term_label=current_term_label,
+            include_past=include_past,
+        )
 
     @staticmethod
     def _unwrap_moodle_ajax_data(text: str) -> Any | None:

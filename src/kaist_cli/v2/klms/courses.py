@@ -12,6 +12,16 @@ from .config import KlmsConfig, abs_url, load_config
 from .discovery import load_recent_courses_args
 from .models import Course
 from .paths import KlmsPaths
+from .session import build_session_bootstrap, fetch_html_batch
+from .validate import looks_klms_error_html
+
+
+SEMESTER_LABELS = {
+    "1": "Spring",
+    "2": "Summer",
+    "3": "Fall",
+    "4": "Winter",
+}
 
 
 def _norm_text(value: str) -> str:
@@ -23,6 +33,56 @@ def _course_code_base(course_code: str | None) -> str | None:
         return None
     normalized = re.sub(r"_20\d{2}_\d+\s*$", "", course_code.strip())
     return normalized or None
+
+
+def _extract_course_code_from_text(text: str | None) -> str | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    patterns = (
+        r"\(([A-Z]{2,}[A-Z0-9_.()-]*_20\d{2}_\d+)\)",
+        r"\b([A-Z]{2,}[A-Z0-9_.()-]*_20\d{2}_\d+)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, raw)
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def _term_label_from_course_code(course_code: str | None) -> str | None:
+    text = str(course_code or "").strip()
+    match = re.search(r"_((?:20)?\d{2,4})_(\d+)\s*$", text)
+    if not match:
+        return None
+    year = match.group(1)
+    semester = match.group(2)
+    if len(year) == 2:
+        year = f"20{year}"
+    season = SEMESTER_LABELS.get(semester)
+    if not season:
+        return None
+    return f"{year} {season}"
+
+
+def _course_matches_query(course: Course, query: str | None) -> bool:
+    needle = _norm_text(str(query or "")).lower()
+    if not needle:
+        return True
+    haystacks = (
+        course.title,
+        course.course_code,
+        course.course_code_base,
+    )
+    return any(needle in _norm_text(value or "").lower() for value in haystacks if value)
+
+
+def _course_is_current_term(course: Course, current_term_label: str | None, *, include_past: bool) -> bool:
+    if include_past or not current_term_label:
+        return True
+    if not course.term_label:
+        return True
+    return _norm_text(course.term_label).lower() == _norm_text(current_term_label).lower()
 
 
 def _is_noise_course(title: str, exclude_patterns: tuple[str, ...]) -> bool:
@@ -81,13 +141,14 @@ def _discover_courses_from_dashboard(html: str, *, base_url: str) -> list[Course
             continue
         course_id = match.group(1)
         title = _norm_text(anchor.get_text(" ", strip=True)) or f"course-{course_id}"
+        course_code = _extract_course_code_from_text(title)
         courses[course_id] = Course(
             id=course_id,
             title=title,
             url=abs_url(base_url, href),
-            course_code=None,
-            course_code_base=None,
-            term_label=None,
+            course_code=course_code,
+            course_code_base=_course_code_base(course_code),
+            term_label=_term_label_from_course_code(course_code),
             source="html:dashboard",
             confidence=0.72,
         )
@@ -172,9 +233,14 @@ def _parse_recent_courses_payload(
     auth_mode: str,
     exclude_patterns: tuple[str, ...],
     include_all: bool,
+    include_past: bool = False,
     limit: int | None,
+    current_term_label: str | None = None,
     term_label: str | None = None,
+    course_query: str | None = None,
 ) -> list[Course]:
+    if current_term_label is None:
+        current_term_label = term_label
     try:
         payload = json.loads(payload_text)
     except Exception as exc:  # noqa: BLE001
@@ -224,23 +290,29 @@ def _parse_recent_courses_payload(
         if not include_all and _is_noise_course(title, exclude_patterns):
             continue
         course_code = str(row.get("shortname") or "").strip() or None
-        view_url = row.get("viewurl")
-        courses.append(
-            Course(
-                id=course_id,
-                title=title,
-                url=str(view_url).strip() if isinstance(view_url, str) and view_url.strip() else abs_url(base_url, f"/course/view.php?id={course_id}"),
-                course_code=course_code,
-                course_code_base=_course_code_base(course_code),
-                term_label=term_label,
-                source="ajax:core_course_get_recent_courses",
-                confidence=0.9,
-                auth_mode=auth_mode,
-            )
+        course = Course(
+            id=course_id,
+            title=title,
+            url=str(view_url).strip() if isinstance((view_url := row.get("viewurl")), str) and str(view_url).strip() else abs_url(base_url, f"/course/view.php?id={course_id}"),
+            course_code=course_code,
+            course_code_base=_course_code_base(course_code),
+            term_label=_term_label_from_course_code(course_code),
+            source="ajax:core_course_get_recent_courses",
+            confidence=0.9,
+            auth_mode=auth_mode,
         )
+        if not _course_is_current_term(course, current_term_label, include_past=include_past):
+            continue
+        if not _course_matches_query(course, course_query):
+            continue
+        courses.append(course)
     if limit is not None:
         courses = courses[: max(0, limit)]
     return courses
+
+
+def _course_page_path(course_id: str) -> str:
+    return f"/course/view.php?id={course_id}&section=0"
 
 
 class CourseService:
@@ -248,7 +320,17 @@ class CourseService:
         self._paths = paths
         self._auth = auth
 
-    def _list_courses_ajax(self, *, context: Any, config: KlmsConfig, auth_mode: str, include_all: bool, limit: int | None) -> list[Course] | None:
+    def _list_courses_ajax(
+        self,
+        *,
+        context: Any,
+        config: KlmsConfig,
+        auth_mode: str,
+        include_all: bool,
+        include_past: bool,
+        limit: int | None,
+        course_query: str | None,
+    ) -> list[Course] | None:
         page = context.new_page()
         try:
             page.goto(config.base_url.rstrip("/") + config.dashboard_path, wait_until="domcontentloaded", timeout=30_000)
@@ -259,7 +341,7 @@ class CourseService:
             sesskey = extract_sesskey(html)
             if not sesskey:
                 return None
-            term_label = _extract_current_term_from_dashboard(html)
+            current_term_label = _extract_current_term_from_dashboard(html)
             args = load_recent_courses_args(self._paths, limit=limit)
             payload = [{"index": 0, "methodname": "core_course_get_recent_courses", "args": args}]
             ajax_url = f"{config.base_url.rstrip('/')}/lib/ajax/service.php?sesskey={sesskey}&info=core_course_get_recent_courses"
@@ -300,11 +382,71 @@ class CourseService:
             auth_mode=auth_mode,
             exclude_patterns=config.exclude_course_title_patterns,
             include_all=include_all,
+            include_past=include_past,
             limit=limit,
-            term_label=term_label,
+            current_term_label=current_term_label,
+            course_query=course_query,
         )
 
-    def _list_courses_html(self, *, context: Any, config: KlmsConfig, auth_mode: str, include_all: bool, limit: int | None) -> list[Course]:
+    def _enrich_course_professors(
+        self,
+        *,
+        context: Any,
+        config: KlmsConfig,
+        auth_mode: str,
+        courses: list[Course],
+    ) -> list[Course]:
+        targets = [course for course in courses if not course.professors][:12]
+        if not targets:
+            return courses
+        bootstrap = build_session_bootstrap(
+            self._paths,
+            context=context,
+            config=config,
+            auth_mode=auth_mode,
+        )
+        response_map = fetch_html_batch(
+            bootstrap.http,
+            [_course_page_path(course.id) for course in targets],
+            max_workers=min(4, len(targets)),
+        )
+        professors_by_id: dict[str, tuple[str, ...]] = {}
+        for course in targets:
+            response = response_map.get(_course_page_path(course.id))
+            if response is None:
+                continue
+            if looks_login_url(response.url) or looks_logged_out_html(response.text):
+                continue
+            professors = _extract_professors_from_course_page(response.text)
+            if professors:
+                professors_by_id[course.id] = professors
+        return [
+            Course(
+                id=course.id,
+                title=course.title,
+                url=course.url,
+                course_code=course.course_code,
+                course_code_base=course.course_code_base,
+                term_label=course.term_label,
+                professors=professors_by_id.get(course.id, course.professors),
+                source=course.source,
+                confidence=course.confidence,
+                auth_mode=course.auth_mode,
+            )
+            for course in courses
+        ]
+
+    def _list_courses_html(
+        self,
+        *,
+        context: Any,
+        config: KlmsConfig,
+        auth_mode: str,
+        include_all: bool,
+        include_past: bool,
+        limit: int | None,
+        course_query: str | None,
+    ) -> list[Course]:
         page = context.new_page()
         try:
             page.goto(config.base_url.rstrip("/") + config.dashboard_path, wait_until="domcontentloaded", timeout=30_000)
@@ -312,30 +454,40 @@ class CourseService:
         finally:
             page.close()
 
-        term_label = _extract_current_term_from_dashboard(html)
+        current_term_label = _extract_current_term_from_dashboard(html)
         courses = _discover_courses_from_dashboard(html, base_url=config.base_url)
         out: list[Course] = []
         for course in courses:
             if not include_all and _is_noise_course(course.title, config.exclude_course_title_patterns):
                 continue
-            out.append(
-                Course(
-                    id=course.id,
-                    title=course.title,
-                    url=course.url,
-                    course_code=course.course_code,
-                    course_code_base=course.course_code_base,
-                    term_label=term_label,
-                    source="html:dashboard",
-                    confidence=0.72,
-                    auth_mode=auth_mode,
-                )
+            resolved = Course(
+                id=course.id,
+                title=course.title,
+                url=course.url,
+                course_code=course.course_code,
+                course_code_base=course.course_code_base,
+                term_label=course.term_label,
+                source="html:dashboard",
+                confidence=0.72,
+                auth_mode=auth_mode,
             )
+            if not _course_is_current_term(resolved, current_term_label, include_past=include_past):
+                continue
+            if not _course_matches_query(resolved, course_query):
+                continue
+            out.append(resolved)
         if limit is not None:
             out = out[: max(0, limit)]
         return out
 
-    def list(self, *, include_all: bool = False, limit: int | None = None) -> CommandResult:
+    def list(
+        self,
+        *,
+        include_all: bool = False,
+        include_past: bool = False,
+        limit: int | None = None,
+        course_query: str | None = None,
+    ) -> CommandResult:
         config = load_config(self._paths)
 
         def callback(context: Any, auth_mode: str) -> CommandResult:
@@ -344,9 +496,17 @@ class CourseService:
                 config=config,
                 auth_mode=auth_mode,
                 include_all=include_all,
+                include_past=include_past,
                 limit=limit,
+                course_query=course_query,
             )
             if ajax_courses:
+                ajax_courses = self._enrich_course_professors(
+                    context=context,
+                    config=config,
+                    auth_mode=auth_mode,
+                    courses=ajax_courses,
+                )
                 return CommandResult(
                     data=[course.to_dict() for course in ajax_courses],
                     source="moodle_ajax",
@@ -358,7 +518,15 @@ class CourseService:
                 config=config,
                 auth_mode=auth_mode,
                 include_all=include_all,
+                include_past=include_past,
                 limit=limit,
+                course_query=course_query,
+            )
+            html_courses = self._enrich_course_professors(
+                context=context,
+                config=config,
+                auth_mode=auth_mode,
+                courses=html_courses,
             )
             return CommandResult(
                 data=[course.to_dict() for course in html_courses],
@@ -385,6 +553,7 @@ class CourseService:
             try:
                 page.goto(abs_url(config.base_url, f"/course/view.php?id={target_id}&section=0"), wait_until="domcontentloaded", timeout=30_000)
                 course_html = page.content()
+                course_url = page.url
             finally:
                 page.close()
 
@@ -395,16 +564,24 @@ class CourseService:
             finally:
                 page.close()
 
+            if error_text := looks_klms_error_html(course_html):
+                raise CommandError(
+                    code="NOT_FOUND",
+                    message=f"Course not found: {target_id}",
+                    hint=f"KLMS returned an error page for course {target_id}: {error_text}",
+                    exit_code=44,
+                )
+
             title = _extract_title_from_course_page(course_html) or f"course-{target_id}"
             course_code = _extract_course_code_from_resource_index(files_html)
             professors = _extract_professors_from_course_page(course_html)
             course = Course(
                 id=target_id,
                 title=title,
-                url=abs_url(config.base_url, f"/course/view.php?id={target_id}"),
+                url=course_url,
                 course_code=course_code,
                 course_code_base=_course_code_base(course_code),
-                term_label=None,
+                term_label=_term_label_from_course_code(course_code),
                 professors=professors,
                 source="html:course-page",
                 confidence=0.78,
