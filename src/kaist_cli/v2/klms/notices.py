@@ -33,16 +33,22 @@ def _extract_course_ids_from_dashboard(
     exclude_patterns: tuple[str, ...],
     course_query: str | None = None,
 ) -> list[str]:
-    out: list[str] = []
+    current_term_ids: list[str] = []
+    termless_ids: list[str] = []
     current_term_label = _extract_current_term_from_dashboard(html)
     for course in _discover_courses_from_dashboard(html, base_url=base_url):
         if _is_noise_course(course.title, exclude_patterns):
             continue
-        if not _course_is_current_term(course, current_term_label, include_past=False):
-            continue
         if not _course_matches_query(course, course_query):
             continue
-        out.append(str(course.id).strip())
+        course_id = str(course.id).strip()
+        if not course_id:
+            continue
+        if _course_is_current_term(course, current_term_label, include_past=False):
+            current_term_ids.append(course_id)
+        elif not course.term_label:
+            termless_ids.append(course_id)
+    out = current_term_ids or termless_ids
     out.extend(str(course_id).strip() for course_id in configured_ids if str(course_id).strip())
     seen: set[str] = set()
     deduped: list[str] = []
@@ -585,6 +591,40 @@ class NoticeService:
                 ",".join(course_ids),
             ]
         )
+
+    @staticmethod
+    def _fallback_notice_board_ids_from_cache(paths: KlmsPaths, config: KlmsConfig) -> list[str]:
+        prefix = f"notice-board-map-v2::{config.base_url.rstrip('/')}::{config.dashboard_path}::"
+        candidates = list_cache_entries(paths, prefixes=(prefix,))
+        if not candidates:
+            return []
+        newest = sorted(candidates.values(), key=lambda entry: float(entry.get("stored_at") or 0.0), reverse=True)
+        ordered_keys = [
+            key
+            for key, _entry in sorted(
+                candidates.items(),
+                key=lambda item: float(item[1].get("stored_at") or 0.0),
+                reverse=True,
+            )
+        ]
+        for cache_key, entry in zip(ordered_keys, newest, strict=False):
+            value = entry.get("value")
+            if not isinstance(value, dict):
+                continue
+            course_order = [segment.strip() for segment in str(cache_key).split("::")[-1].split(",") if segment.strip()]
+            board_ids: list[str] = []
+            for course_id in course_order:
+                rows = value.get(course_id)
+                if isinstance(rows, list):
+                    board_ids.extend(str(board_id).strip() for board_id in rows if str(board_id).strip())
+            for course_id, rows in value.items():
+                if course_id in course_order or not isinstance(rows, list):
+                    continue
+                if isinstance(rows, list):
+                    board_ids.extend(str(board_id).strip() for board_id in rows if str(board_id).strip())
+            if board_ids:
+                return list(dict.fromkeys(board_ids))
+        return []
 
     @staticmethod
     def _notice_list_cache_key(config: KlmsConfig, board_ids: list[str], max_pages: int) -> str:
@@ -1252,6 +1292,10 @@ class NoticeService:
             exclude_patterns=config.exclude_course_title_patterns,
             course_query=course_query,
         )
+        if not course_ids:
+            cached_board_ids = self._fallback_notice_board_ids_from_cache(self._paths, config)
+            if cached_board_ids:
+                return cached_board_ids
         cache_key = self._notice_board_cache_key(config, course_ids)
         cache_entry = load_cache_entry(self._paths, cache_key)
         cached_rows = cache_entry.get("value") if isinstance(cache_entry, dict) else None

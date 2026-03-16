@@ -664,8 +664,9 @@ class AssignmentService:
         if not sesskey:
             return None
         current_term_label = _extract_current_term_from_dashboard(html)
-        current_term_course_ids = (
-            set(
+        current_term_course_ids = None
+        if not include_past:
+            discovered_current_ids = set(
                 _discover_current_term_course_ids_from_dashboard(
                     html,
                     base_url=config.base_url,
@@ -674,9 +675,7 @@ class AssignmentService:
                     include_past=include_past,
                 )
             )
-            if not include_past
-            else None
-        )
+            current_term_course_ids = discovered_current_ids or None
 
         methodnames = [
             "core_calendar_get_action_events_by_timesort",
@@ -777,8 +776,9 @@ class AssignmentService:
                 dashboard_page.close()
 
         current_term_label = _extract_current_term_from_dashboard(dashboard_html)
-        current_term_course_ids = (
-            set(
+        current_term_course_ids = None
+        if not include_past:
+            discovered_current_ids = set(
                 _discover_current_term_course_ids_from_dashboard(
                     dashboard_html,
                     base_url=config.base_url,
@@ -787,9 +787,7 @@ class AssignmentService:
                     include_past=include_past,
                 )
             )
-            if not include_past
-            else None
-        )
+            current_term_course_ids = discovered_current_ids or None
         course_ids = [str(course_id).strip()] if course_id else _discover_current_term_course_ids_from_dashboard(
             dashboard_html,
             base_url=config.base_url,

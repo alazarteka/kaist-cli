@@ -25,7 +25,7 @@ from kaist_cli.v2.klms import dashboard as dashboard_module
 from kaist_cli.v2.klms.auth import AuthService
 from kaist_cli.v2.klms.auth import _EasyLoginSignals, _extract_easy_login_error_message, _extract_easy_login_number, _extract_sso_login_view_url, looks_login_url
 from kaist_cli.v2.klms.assignments import _extract_assignment_detail_from_html, _extract_assignment_rows_from_calendar_data, _filter_assignments
-from kaist_cli.v2.klms.courses import _course_is_current_term, _parse_recent_courses_payload
+from kaist_cli.v2.klms.courses import _course_is_current_term, _discover_courses_from_dashboard, _parse_recent_courses_payload
 from kaist_cli.v2.klms.capture import _courseboard_runtime_capture_summary, _extract_courseboard_js_hints
 from kaist_cli.v2.klms.config import load_config
 from kaist_cli.v2.klms.dashboard import DashboardService, _build_inbox_items, _decorate_today_assignments, _filter_inbox_assignments, _select_recent_notices
@@ -646,6 +646,21 @@ def test_course_without_term_label_is_not_current_term() -> None:
     assert _course_is_current_term(course, "2026 Spring", include_past=False) is False
 
 
+def test_discover_courses_from_dashboard_extracts_course_code_from_parent_card() -> None:
+    html = """
+    <html><body>
+      <div class="course-card">
+        <div>CS.30000 Introduction to Algorithms 165 Attendees 3.0 Credit Professors Sunghee Choi</div>
+        <a href="/course/view.php?id=180871">Introduction to Algorithms</a>
+      </div>
+    </body></html>
+    """
+    courses = _discover_courses_from_dashboard(html, base_url="https://klms.kaist.ac.kr")
+    assert len(courses) == 1
+    assert courses[0].course_code == "CS.30000"
+    assert courses[0].term_label is None
+
+
 def test_courses_list_requires_auth_artifact(tmp_path: Path) -> None:
     _write_config(tmp_path)
     cp = run_v2(tmp_path, "--json", "klms", "courses", "list")
@@ -728,6 +743,50 @@ def test_filter_assignments_defaults_to_current_term_course_ids() -> None:
         limit=None,
         current_term_label="2026 Spring",
         current_term_course_ids={"180871"},
+        include_past=False,
+    )
+
+    assert [assignment.id for assignment in filtered] == ["1"]
+
+
+def test_filter_assignments_falls_back_to_course_code_term_when_current_course_ids_empty() -> None:
+    assignments = [
+        Assignment(
+            id="1",
+            title="Current HW",
+            url=None,
+            due_raw=None,
+            due_iso="2026-03-17T14:59:00Z",
+            course_id="180871",
+            course_title="알고리즘 개론",
+            course_code="CS.30000_2026_1",
+            course_code_base="CS.30000",
+            source="api",
+            confidence=0.9,
+        ),
+        Assignment(
+            id="2",
+            title="Old HW",
+            url=None,
+            due_raw=None,
+            due_iso="2025-11-10T14:59:00Z",
+            course_id="170001",
+            course_title="Old Course",
+            course_code="CS492(C)_2025_3",
+            course_code_base="CS492(C)",
+            source="api",
+            confidence=0.9,
+        ),
+    ]
+
+    filtered = _filter_assignments(
+        assignments,
+        course_id=None,
+        course_query=None,
+        since_iso=None,
+        limit=None,
+        current_term_label="2026 Spring",
+        current_term_course_ids=None,
         include_past=False,
     )
 
@@ -1581,6 +1640,36 @@ def test_notice_dashboard_load_uses_recent_stale_cache_without_live_refresh(tmp_
     assert result.cache_hit is True
     assert result.refresh_attempted is False
     assert result.warnings == ()
+
+
+def test_notice_board_resolution_falls_back_to_recent_cached_board_map(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        service = NoticeService(paths, AuthService(paths))
+        save_cache_value(
+            paths,
+            service._notice_board_cache_key(config, ["180871", "178434"]),
+            {"180871": ["838536"], "178434": ["947531"]},
+            ttl_seconds=3600,
+        )
+        resolved = service._resolve_notice_board_ids(
+            context=object(),
+            config=config,
+            explicit_board_id=None,
+            bootstrap=SimpleNamespace(dashboard_html="<html></html>", http=None),
+            allow_stale_cache=True,
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert resolved == ["838536", "947531"]
 
 
 def test_file_dashboard_load_uses_recent_stale_cache_without_live_refresh(tmp_path: Path, monkeypatch) -> None:

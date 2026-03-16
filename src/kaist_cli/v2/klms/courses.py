@@ -47,6 +47,14 @@ def _extract_course_code_from_text(text: str | None) -> str | None:
         match = re.search(pattern, raw)
         if match:
             return match.group(1).strip()
+    fallback_patterns = (
+        r"\b([A-Z]{2,}\.[A-Z0-9()_-]+)\b",
+        r"\b([A-Z]{2,}[A-Z0-9_.()-]*_[0-9]{2,}_[0-9]+)\b",
+    )
+    for pattern in fallback_patterns:
+        match = re.search(pattern, raw)
+        if match:
+            return match.group(1).strip()
     return None
 
 
@@ -141,8 +149,20 @@ def _discover_courses_from_dashboard(html: str, *, base_url: str) -> list[Course
         if not match:
             continue
         course_id = match.group(1)
-        title = _norm_text(anchor.get_text(" ", strip=True)) or f"course-{course_id}"
-        course_code = _extract_course_code_from_text(title)
+        anchor_title = _norm_text(anchor.get_text(" ", strip=True))
+        course_code = _extract_course_code_from_text(anchor_title)
+        title = anchor_title or f"course-{course_id}"
+        if not course_code:
+            current = anchor.parent
+            for _ in range(4):
+                if current is None:
+                    break
+                block_text = _norm_text(current.get_text(" ", strip=True))
+                if block_text:
+                    course_code = _extract_course_code_from_text(block_text)
+                    if course_code:
+                        break
+                current = current.parent
         courses[course_id] = Course(
             id=course_id,
             title=title,
