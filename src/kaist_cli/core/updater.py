@@ -7,6 +7,7 @@ import platform
 import re
 import shutil
 import ssl
+import subprocess
 import tarfile
 import tempfile
 import urllib.error
@@ -85,8 +86,61 @@ def _platform_target(system_name: str, machine_name: str) -> str:
         if mach_l == "x86_64":
             return "darwin-x86_64"
     if sys_l == "linux":
-        raise SelfUpdateError("Published standalone bundles currently support only macOS arm64/x86_64.")
-    raise SelfUpdateError(f"Unsupported platform for self-update: {system_name}/{machine_name}")
+        if mach_l != "x86_64":
+            raise SelfUpdateError(
+                "Published Linux standalone bundles support only x86_64 glibc hosts (Ubuntu/Debian-class)."
+            )
+        libc_kind = _linux_libc_kind()
+        if libc_kind == "glibc":
+            return "linux-x86_64-gnu"
+        if libc_kind == "musl":
+            raise SelfUpdateError(
+                "Published Linux standalone bundles support only x86_64 glibc hosts (Ubuntu/Debian-class). musl/Alpine is not supported."
+            )
+        raise SelfUpdateError(
+            "Could not detect a supported Linux libc. Published Linux standalone bundles support only x86_64 glibc hosts (Ubuntu/Debian-class)."
+        )
+    raise SelfUpdateError(
+        f"Unsupported platform for self-update: {system_name}/{machine_name}. "
+        "Supported standalone bundles are macOS arm64/x86_64 and Linux x86_64 glibc."
+    )
+
+
+def _linux_libc_kind() -> str:
+    override = str(os.environ.get("KAIST_LINUX_LIBC") or "").strip().lower()
+    if override:
+        return override
+
+    libc_name, _ = platform.libc_ver()
+    libc_name = str(libc_name or "").strip().lower()
+    if libc_name in {"glibc", "musl"}:
+        return libc_name
+
+    try:
+        output = subprocess.check_output(
+            ["getconf", "GNU_LIBC_VERSION"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        output = ""
+    if output:
+        return "glibc"
+
+    try:
+        output = subprocess.check_output(
+            ["ldd", "--version"],
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except Exception:
+        output = ""
+    output_lower = output.lower()
+    if "musl" in output_lower:
+        return "musl"
+    if "glibc" in output_lower or "gnu libc" in output_lower:
+        return "glibc"
+    return "unknown"
 
 
 def platform_target() -> str:

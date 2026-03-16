@@ -3,12 +3,12 @@ from __future__ import annotations
 import sys
 import traceback
 
-from .cli.dispatch import dispatch
-from .cli.errors import emit_json_error
-from .cli.output import emit_human_output, emit_json
-from .cli.parser import build_parser
-from .core.envelope import success_envelope
-from .core.error_registry import CliErrorDescriptor, classify_error
+from kaist_cli.cli.dispatch import dispatch
+from kaist_cli.cli.errors import emit_json_error
+from kaist_cli.cli.output import emit_human_output, emit_json
+from kaist_cli.cli.parser import build_parser
+from kaist_cli.core.envelope import success_envelope
+from kaist_cli.core.error_registry import CliErrorDescriptor, classify_error
 
 
 def main(argv: list[str] | None = None) -> int:

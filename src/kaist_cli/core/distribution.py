@@ -88,7 +88,6 @@ def _distribution_from_bundle_root(bundle_root: Path) -> DistributionInfo | None
     if manifest is None:
         return None
 
-    binary_path = bundle_root / manifest.binary_relpath
     skill_path = bundle_root / manifest.skill_relpath
     install_root = _install_root_from_bundle_root(bundle_root)
     managed = bool(install_root and (install_root / "versions").exists())
@@ -106,8 +105,8 @@ def _distribution_from_bundle_root(bundle_root: Path) -> DistributionInfo | None
 def _discover_from_executable(executable: Path) -> DistributionInfo | None:
     candidates: list[Path] = []
     for candidate in (executable, executable.resolve()):
-        if candidate.parent.name == "bin":
-            candidates.append(candidate.parent.parent)
+        parent = candidate.parent
+        candidates.extend([parent, *parent.parents])
 
     seen: set[Path] = set()
     for bundle_root in candidates:
@@ -119,6 +118,8 @@ def _discover_from_executable(executable: Path) -> DistributionInfo | None:
             continue
         seen.add(resolved_root)
 
+        if not (bundle_root / BUNDLE_FILENAME).exists():
+            continue
         info = _distribution_from_bundle_root(bundle_root)
         if info is not None:
             return info

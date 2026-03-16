@@ -23,6 +23,31 @@ normalize_tag() {
   fi
 }
 
+linux_libc_kind() {
+  local output=""
+  if command -v getconf >/dev/null 2>&1; then
+    output="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+    if [[ -n "$output" ]]; then
+      printf 'glibc'
+      return
+    fi
+  fi
+
+  if command -v ldd >/dev/null 2>&1; then
+    output="$(ldd --version 2>&1 || true)"
+    if printf '%s' "$output" | grep -Eiq 'musl'; then
+      printf 'musl'
+      return
+    fi
+    if printf '%s' "$output" | grep -Eiq 'glibc|gnu libc'; then
+      printf 'glibc'
+      return
+    fi
+  fi
+
+  printf 'unknown'
+}
+
 resolve_target() {
   if [[ -n "${KAIST_PLATFORM_TARGET:-}" ]]; then
     printf '%s' "$KAIST_PLATFORM_TARGET"
@@ -48,12 +73,35 @@ resolve_target() {
       esac
       ;;
     Linux)
-      die "Published standalone bundles currently support only macOS arm64/x86_64. Linux release bundles are not published yet."
+      case "$arch_name" in
+        x86_64|amd64)
+          case "$(linux_libc_kind)" in
+            glibc)
+              printf 'linux-x86_64-gnu'
+              ;;
+            musl)
+              die "Published Linux standalone bundles support only x86_64 glibc hosts (Ubuntu/Debian-class). musl/Alpine is not supported."
+              ;;
+            *)
+              die "Could not detect a supported Linux libc. Published Linux standalone bundles support only x86_64 glibc hosts (Ubuntu/Debian-class)."
+              ;;
+          esac
+          ;;
+        *)
+          die "Published standalone bundles currently support macOS arm64/x86_64 and Linux x86_64 glibc."
+          ;;
+      esac
       ;;
     *)
-      die "This installer currently supports macOS arm64/x86_64 standalone bundles."
+      die "This installer currently supports macOS arm64/x86_64 and Linux x86_64 glibc standalone bundles."
       ;;
   esac
+}
+
+json_field() {
+  local path="$1"
+  local key="$2"
+  tr -d '\n' <"$path" | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p"
 }
 
 fetch_latest_tag() {
@@ -198,9 +246,15 @@ mkdir -p "$extract_dir"
 tar -xzf "$archive_path" -C "$extract_dir"
 
 [[ -f "$extract_dir/bundle.json" ]] || die "Release archive is missing bundle.json."
-[[ -x "$extract_dir/bin/kaist" || -f "$extract_dir/bin/kaist" ]] || die "Release archive is missing bin/kaist."
-[[ -f "$extract_dir/skills/kaist-cli/SKILL.md" ]] || die "Release archive is missing bundled skill."
-chmod +x "$extract_dir/bin/kaist"
+binary_relpath="$(json_field "$extract_dir/bundle.json" "binary_relpath")"
+skill_relpath="$(json_field "$extract_dir/bundle.json" "skill_relpath")"
+[[ -n "$binary_relpath" ]] || die "Release archive bundle.json is missing binary_relpath."
+[[ -n "$skill_relpath" ]] || die "Release archive bundle.json is missing skill_relpath."
+binary_path="$extract_dir/$binary_relpath"
+skill_path="$extract_dir/$skill_relpath"
+[[ -x "$binary_path" || -f "$binary_path" ]] || die "Release archive is missing bundled executable at $binary_relpath."
+[[ -f "$skill_path/SKILL.md" ]] || die "Release archive is missing bundled skill."
+chmod +x "$binary_path"
 
 mkdir -p "$INSTALL_ROOT/versions" "$BIN_DIR"
 version_dir="$INSTALL_ROOT/versions/$TAG"
@@ -223,10 +277,10 @@ keep_current="$(resolve_dir_link "$current_link" || true)"
 keep_previous="$(resolve_dir_link "$previous_link" || true)"
 prune_versions "$INSTALL_ROOT" "$keep_current" "$keep_previous"
 
-ln -sfn "$INSTALL_ROOT/current/bin/kaist" "$bin_link"
+ln -sfn "$INSTALL_ROOT/current/$binary_relpath" "$bin_link"
 sync_claude_marketplace "$INSTALL_ROOT" "${TAG#v}" || warn "Could not sync Claude plugin marketplace metadata."
 
-skill_path="$INSTALL_ROOT/current/skills/kaist-cli"
+skill_path="$INSTALL_ROOT/current/$skill_relpath"
 printf 'Installed kaist %s to %s\n' "${TAG#v}" "$INSTALL_ROOT/current"
 printf 'Binary: %s\n' "$bin_link"
 printf 'Bundled skill: %s\n' "$skill_path"

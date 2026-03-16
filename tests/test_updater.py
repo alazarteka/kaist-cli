@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from kaist_cli.core import updater
-from kaist_cli.core.distribution import BundleManifest, DistributionInfo
+from kaist_cli.core.distribution import BundleManifest, DistributionInfo, discover_distribution_info
 
 
 def test_platform_target_mapping() -> None:
@@ -18,7 +18,13 @@ def test_platform_target_mapping() -> None:
     assert updater._platform_target("darwin", "x86_64") == "darwin-x86_64"  # type: ignore[attr-defined]
 
 
-def test_platform_target_mapping_linux_raises() -> None:
+def test_platform_target_mapping_linux_glibc(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(updater, "_linux_libc_kind", lambda: "glibc")
+    assert updater._platform_target("linux", "amd64") == "linux-x86_64-gnu"  # type: ignore[attr-defined]
+
+
+def test_platform_target_mapping_linux_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(updater, "_linux_libc_kind", lambda: "musl")
     with pytest.raises(updater.SelfUpdateError):
         updater._platform_target("Linux", "aarch64")  # type: ignore[attr-defined]
     with pytest.raises(updater.SelfUpdateError):
@@ -45,7 +51,7 @@ def test_parse_checksums_supports_star_prefix() -> None:
 
 def test_select_archive_asset_prefers_targeted_name() -> None:
     assets = [
-        updater.ReleaseAsset(name="kaist-v0.1.0-linux-x86_64.tar.gz", browser_download_url="u1", size=1),
+        updater.ReleaseAsset(name="kaist-v0.1.0-linux-x86_64-gnu.tar.gz", browser_download_url="u1", size=1),
         updater.ReleaseAsset(name="kaist-v0.1.0-darwin-arm64.tar.gz", browser_download_url="u2", size=1),
     ]
     selected = updater.select_archive_asset(assets, "darwin-arm64")
@@ -64,12 +70,24 @@ def _write_fake_binary(path: Path) -> None:
     os.chmod(path, 0o755)
 
 
-def _prepare_release_dir(base_dir: Path, version: str, *, target: str = "darwin-arm64") -> tuple[Path, Path]:
+def _prepare_release_dir(
+    base_dir: Path,
+    version: str,
+    *,
+    target: str = "darwin-arm64",
+    bundle_mode: str = "onedir",
+) -> tuple[Path, Path]:
     tag = version if version.startswith("v") else f"v{version}"
     release_dir = base_dir / tag
     release_dir.mkdir(parents=True, exist_ok=True)
     binary_path = base_dir / f"kaist-{tag}-{target}"
-    _write_fake_binary(binary_path)
+    if bundle_mode == "onedir":
+        binary_path.mkdir(parents=True, exist_ok=True)
+        _write_fake_binary(binary_path / "kaist")
+        (binary_path / "_internal").mkdir(parents=True, exist_ok=True)
+        (binary_path / "_internal" / "runtime.txt").write_text("runtime\n", encoding="utf-8")
+    else:
+        _write_fake_binary(binary_path)
     cp = subprocess.run(
         [
             "bash",
@@ -98,11 +116,12 @@ def _prepare_release_dir(base_dir: Path, version: str, *, target: str = "darwin-
     return archive_path, checksums_path
 
 
-def _populate_bundle_root(bundle_root: Path, version: str) -> None:
+def _populate_bundle_root(bundle_root: Path, version: str, *, binary_relpath: str = "bin/kaist") -> None:
     bundle_root.mkdir(parents=True, exist_ok=True)
-    (bundle_root / "bin").mkdir(parents=True, exist_ok=True)
     (bundle_root / "skills").mkdir(parents=True, exist_ok=True)
-    _write_fake_binary(bundle_root / "bin" / "kaist")
+    binary_path = bundle_root / binary_relpath
+    binary_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_fake_binary(binary_path)
     shutil.copytree(ROOT / "skills" / "kaist-cli", bundle_root / "skills" / "kaist-cli")
     (bundle_root / "bundle.json").write_text(
         json.dumps(
@@ -110,7 +129,7 @@ def _populate_bundle_root(bundle_root: Path, version: str) -> None:
                 "version": version.lstrip("v"),
                 "repo": updater.RELEASE_REPO,
                 "target": "darwin-arm64",
-                "binary_relpath": "bin/kaist",
+                "binary_relpath": binary_relpath,
                 "skill_relpath": "skills/kaist-cli",
             },
             indent=2,
@@ -154,14 +173,27 @@ def test_check_for_update_includes_distribution_metadata(monkeypatch: pytest.Mon
     assert payload["self_update_supported"] is False
 
 
-@pytest.mark.parametrize("target", ["darwin-arm64", "darwin-x86_64"])
-def test_build_release_bundle_contains_skill_and_manifest(tmp_path: Path, target: str) -> None:
-    archive_path, _ = _prepare_release_dir(tmp_path / "releases", "v0.1.4", target=target)
+@pytest.mark.parametrize(
+    ("target", "bundle_mode", "binary_relpath"),
+    [
+        ("darwin-arm64", "onedir", "bin/kaist/kaist"),
+        ("darwin-x86_64", "onedir", "bin/kaist/kaist"),
+        ("linux-x86_64-gnu", "onedir", "bin/kaist/kaist"),
+        ("darwin-arm64", "onefile", "bin/kaist"),
+    ],
+)
+def test_build_release_bundle_contains_skill_and_manifest(
+    tmp_path: Path,
+    target: str,
+    bundle_mode: str,
+    binary_relpath: str,
+) -> None:
+    archive_path, _ = _prepare_release_dir(tmp_path / "releases", "v0.1.4", target=target, bundle_mode=bundle_mode)
 
     with tarfile.open(archive_path, "r:gz") as tar:
         names = {name.lstrip("./") for name in tar.getnames()}
         assert "bundle.json" in names
-        assert "bin/kaist" in names
+        assert binary_relpath in names
         assert "skills/kaist-cli/SKILL.md" in names
         assert "skills/kaist-cli/agents/openai.yaml" in names
         manifest = json.loads(tar.extractfile("bundle.json").read().decode("utf-8"))  # type: ignore[union-attr]
@@ -170,7 +202,7 @@ def test_build_release_bundle_contains_skill_and_manifest(tmp_path: Path, target
         "version": "0.1.4",
         "repo": updater.RELEASE_REPO,
         "target": target,
-        "binary_relpath": "bin/kaist",
+        "binary_relpath": binary_relpath,
         "skill_relpath": "skills/kaist-cli",
     }
 
@@ -178,8 +210,8 @@ def test_build_release_bundle_contains_skill_and_manifest(tmp_path: Path, target
 @pytest.mark.parametrize("target", ["darwin-arm64", "darwin-x86_64"])
 def test_install_script_installs_managed_layout_and_rotates_previous(tmp_path: Path, target: str) -> None:
     downloads_dir = tmp_path / "downloads"
-    _prepare_release_dir(downloads_dir, "v0.1.4", target=target)
-    _prepare_release_dir(downloads_dir, "v0.1.5", target=target)
+    _prepare_release_dir(downloads_dir, "v0.1.4", target=target, bundle_mode="onedir")
+    _prepare_release_dir(downloads_dir, "v0.1.5", target=target, bundle_mode="onedir")
     latest_json = tmp_path / "latest.json"
     latest_json.write_text(json.dumps({"tag_name": "v0.1.4"}), encoding="utf-8")
 
@@ -211,6 +243,7 @@ def test_install_script_installs_managed_layout_and_rotates_previous(tmp_path: P
     assert json.loads((install_root / "mkt" / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"] == "0.1.4"
     assert (install_root / "mkt" / "plugins" / "kaist-cli" / "skills" / "kaist-cli").is_symlink()
     assert "Bundled skill:" in first.stdout
+    assert (bin_dir / "kaist").resolve() == (install_root / "current" / "bin" / "kaist" / "kaist").resolve()
 
     stale = install_root / "versions" / "v0.1.0"
     _populate_bundle_root(stale, "0.1.0")
@@ -228,7 +261,7 @@ def test_install_script_installs_managed_layout_and_rotates_previous(tmp_path: P
     assert (install_root / "current").resolve().name == "v0.1.5"
     assert (install_root / "previous").resolve().name == "v0.1.4"
     assert not stale.exists()
-    assert (bin_dir / "kaist").resolve() == (install_root / "current" / "bin" / "kaist").resolve()
+    assert (bin_dir / "kaist").resolve() == (install_root / "current" / "bin" / "kaist" / "kaist").resolve()
     assert json.loads((install_root / "mkt" / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"] == "0.1.5"
 
 
@@ -240,7 +273,7 @@ def test_perform_self_update_switches_current_and_previous(tmp_path: Path, monke
     stale = install_root / "versions" / "v0.1.0"
     _populate_bundle_root(stale, "0.1.0")
 
-    archive_path, checksums_path = _prepare_release_dir(tmp_path / "releases", "v0.1.5")
+    archive_path, checksums_path = _prepare_release_dir(tmp_path / "releases", "v0.1.5", bundle_mode="onedir")
     monkeypatch.setattr(updater, "platform_target", lambda: "darwin-arm64")
     monkeypatch.setattr(updater, "version_string", lambda: "0.1.4")
     monkeypatch.setattr(
@@ -275,6 +308,7 @@ def test_perform_self_update_switches_current_and_previous(tmp_path: Path, monke
     assert (install_root / "current").resolve().name == "v0.1.5"
     assert (install_root / "previous").resolve().name == "v0.1.4"
     assert not stale.exists()
+    assert payload["binary_path"] == str(install_root / "current" / "bin" / "kaist" / "kaist")
     assert json.loads((install_root / "mkt" / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"] == "0.1.5"
 
 
@@ -330,3 +364,67 @@ def test_prune_versions_returns_warning_on_failure(tmp_path: Path, monkeypatch: 
     assert warnings
     assert "Could not prune" in warnings[0]
     assert stale.exists()
+
+
+def test_distribution_discovers_managed_onedir_bundle(tmp_path: Path) -> None:
+    install_root = tmp_path / "managed-install"
+    version_root = install_root / "versions" / "v0.1.5"
+    _populate_bundle_root(version_root, "0.1.5", binary_relpath="bin/kaist/kaist")
+    (install_root / "current").symlink_to(version_root)
+
+    info = discover_distribution_info(
+        executable=install_root / "current" / "bin" / "kaist" / "kaist",
+        frozen=True,
+    )
+
+    assert info.distribution == "managed-release"
+    assert info.install_root == install_root
+    assert info.bundle_root == install_root / "current"
+    assert info.manifest is not None
+    assert info.manifest.binary_relpath == "bin/kaist/kaist"
+
+
+def test_install_script_detects_linux_glibc_target(tmp_path: Path) -> None:
+    downloads_dir = tmp_path / "downloads"
+    _prepare_release_dir(downloads_dir, "v0.1.4", target="linux-x86_64-gnu", bundle_mode="onedir")
+    latest_json = tmp_path / "latest.json"
+    latest_json.write_text(json.dumps({"tag_name": "v0.1.4"}), encoding="utf-8")
+
+    install_root = tmp_path / "install-root"
+    bin_dir = tmp_path / "bin"
+    shims_dir = tmp_path / "shims"
+    shims_dir.mkdir()
+    (shims_dir / "uname").write_text(
+        "#!/usr/bin/env bash\nif [[ \"$1\" == \"-s\" ]]; then echo Linux; elif [[ \"$1\" == \"-m\" ]]; then echo x86_64; else /usr/bin/uname \"$@\"; fi\n",
+        encoding="utf-8",
+    )
+    (shims_dir / "getconf").write_text(
+        "#!/usr/bin/env bash\nif [[ \"$1\" == \"GNU_LIBC_VERSION\" ]]; then echo 'glibc 2.35'; else /usr/bin/getconf \"$@\"; fi\n",
+        encoding="utf-8",
+    )
+    os.chmod(shims_dir / "uname", 0o755)
+    os.chmod(shims_dir / "getconf", 0o755)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "KAIST_RELEASE_API_URL": latest_json.resolve().as_uri(),
+            "KAIST_DOWNLOAD_BASE_URL": downloads_dir.resolve().as_uri(),
+            "KAIST_INSTALL_ROOT": str(install_root),
+            "KAIST_BIN_DIR": str(bin_dir),
+            "PATH": f"{shims_dir}:{env['PATH']}",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "install.sh")],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (install_root / "current").resolve().name == "v0.1.4"
+    assert (bin_dir / "kaist").resolve() == (install_root / "current" / "bin" / "kaist" / "kaist").resolve()

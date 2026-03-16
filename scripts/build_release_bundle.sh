@@ -5,6 +5,10 @@ usage() {
   cat <<'EOF'
 Usage:
   build_release_bundle.sh --binary <path> --version <vX.Y.Z|X.Y.Z> --target <target> --out-dir <path> [--repo <owner/repo>]
+
+`--binary` may point to either a standalone executable file or a PyInstaller onedir
+directory. When a directory is provided, the bundle manifest points to the real
+executable inside that runtime tree.
 EOF
 }
 
@@ -53,8 +57,8 @@ if [[ -z "$binary" || -z "$version" || -z "$target" || -z "$out_dir" ]]; then
   exit 2
 fi
 
-if [[ ! -f "$binary" ]]; then
-  echo "error: binary not found: $binary" >&2
+if [[ ! -e "$binary" ]]; then
+  echo "error: binary path not found: $binary" >&2
   exit 1
 fi
 
@@ -77,8 +81,20 @@ trap cleanup EXIT
 
 stage_dir="$tmp_dir/stage"
 mkdir -p "$stage_dir/bin" "$stage_dir/skills"
-cp "$binary" "$stage_dir/bin/kaist"
-chmod +x "$stage_dir/bin/kaist"
+binary_relpath=""
+if [[ -d "$binary" ]]; then
+  mkdir -p "$stage_dir/bin/kaist"
+  cp -R "$binary"/. "$stage_dir/bin/kaist/"
+  binary_relpath="bin/kaist/kaist"
+else
+  cp "$binary" "$stage_dir/bin/kaist"
+  binary_relpath="bin/kaist"
+fi
+if [[ ! -e "$stage_dir/$binary_relpath" ]]; then
+  echo "error: bundled executable missing at $binary_relpath" >&2
+  exit 1
+fi
+chmod +x "$stage_dir/$binary_relpath"
 cp -R "$skill_dir" "$stage_dir/skills/"
 
 cat >"$stage_dir/bundle.json" <<EOF
@@ -86,7 +102,7 @@ cat >"$stage_dir/bundle.json" <<EOF
   "version": "${version_no_v}",
   "repo": "${repo}",
   "target": "${target}",
-  "binary_relpath": "bin/kaist",
+  "binary_relpath": "${binary_relpath}",
   "skill_relpath": "skills/kaist-cli"
 }
 EOF

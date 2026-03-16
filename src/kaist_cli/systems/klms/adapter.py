@@ -4,8 +4,6 @@ import argparse
 import textwrap
 
 from ...core.contracts import SystemAdapter
-from ...v2.klms.commands import dispatch as dispatch_v2
-from ...v2.klms.container import build_container
 from ...v2.parser import register_klms_parser
 
 
@@ -41,6 +39,9 @@ class KlmsAdapter(SystemAdapter):
 
     @staticmethod
     def _handle(args: argparse.Namespace) -> object:
+        from ...v2.klms.commands import dispatch as dispatch_v2
+        from ...v2.klms.container import build_container
+
         result = dispatch_v2(args, build_container())
         setattr(args, "_explicit_source", result.source)
         setattr(args, "_explicit_capability", result.capability)

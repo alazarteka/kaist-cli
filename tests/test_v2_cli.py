@@ -8,16 +8,18 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import pytest
 from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from kaist_cli.v2.contracts import CommandResult
+from kaist_cli.v2.klms import auth as auth_module
+from kaist_cli.v2.contracts import CommandError, CommandResult
 from kaist_cli.v2.klms.cache import load_cache_entry, load_cache_value, save_cache_value
 from kaist_cli.v2.klms import dashboard as dashboard_module
 from kaist_cli.v2.klms.auth import AuthService
-from kaist_cli.v2.klms.auth import _extract_easy_login_error_message, _extract_easy_login_number, _extract_sso_login_view_url, looks_login_url
+from kaist_cli.v2.klms.auth import _EasyLoginSignals, _extract_easy_login_error_message, _extract_easy_login_number, _extract_sso_login_view_url, looks_login_url
 from kaist_cli.v2.klms.assignments import _extract_assignment_detail_from_html, _extract_assignment_rows_from_calendar_data
 from kaist_cli.v2.klms.courses import _parse_recent_courses_payload
 from kaist_cli.v2.klms.capture import _courseboard_runtime_capture_summary, _extract_courseboard_js_hints
@@ -30,6 +32,9 @@ from kaist_cli.v2.klms.notices import _discover_notice_board_ids_from_course_pag
 from kaist_cli.v2.klms.paths import resolve_paths
 from kaist_cli.v2.klms.provider_state import ProviderLoad
 from kaist_cli.v2.klms.videos import _extract_video_items_from_html, _parse_video_detail_from_html, _parse_video_viewer_from_html
+
+
+FIXTURES = ROOT / "tests" / "fixtures"
 
 
 def run_v2(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -93,6 +98,10 @@ def _write_storage_state(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return storage_state_path
+
+
+def _read_fixture(name: str) -> str:
+    return (FIXTURES / name).read_text(encoding="utf-8")
 
 
 def test_auth_status_json_envelope(tmp_path: Path) -> None:
@@ -231,6 +240,306 @@ def test_extract_easy_login_number_from_verification_widget() -> None:
     </body></html>
     """
     assert _extract_easy_login_number(html) == "50"
+
+
+def test_wait_for_easy_login_init_accepts_verification_page_without_second_redirect(tmp_path: Path) -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = "https://sso.kaist.ac.kr/auth/twofactor/mfa/login2Factor"
+            self.html = _read_fixture("kaist_sso_login2factor.html")
+
+        def content(self) -> str:
+            return self.html
+
+        def wait_for_timeout(self, ms: int) -> None:  # noqa: ARG002
+            raise AssertionError("verification page should be accepted immediately")
+
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        auth = AuthService(resolve_paths())
+        html = auth._wait_for_easy_login_init(FakePage(), timeout_seconds=1.0)
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert _extract_easy_login_number(html) == "50"
+
+
+def test_wait_for_easy_login_approval_succeeds_from_mfa_and_policy_responses(tmp_path: Path, monkeypatch) -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = "https://sso.kaist.ac.kr/auth/twofactor/mfa/login2Factor"
+            self.html = _read_fixture("kaist_sso_login2factor.html")
+            self.submitted = False
+            self.loop_count = 0
+
+        def content(self) -> str:
+            return self.html
+
+        def wait_for_timeout(self, ms: int) -> None:  # noqa: ARG002
+            self.loop_count += 1
+            if self.loop_count == 1:
+                signals.latest_mfa_payload = {"result": True}
+            elif self.loop_count == 2:
+                signals.latest_policy_payload = {"code": "SS0001"}
+
+        def evaluate(self, script: str) -> bool:  # noqa: ARG002
+            self.submitted = True
+            self.url = "https://sso.kaist.ac.kr/auth/user/login/link"
+            return True
+
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        auth = AuthService(paths)
+        page = FakePage()
+        signals = _EasyLoginSignals()
+        persisted: list[bool] = []
+
+        tick = {"value": 0.0}
+
+        def fake_monotonic() -> float:
+            tick["value"] += 0.6
+            return tick["value"]
+
+        monkeypatch.setattr(auth_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
+        monkeypatch.setattr(auth_module.time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(auth, "_persist_context_state", lambda context: persisted.append(True))
+        monkeypatch.setattr(
+            auth,
+            "_context_dashboard_state",
+            lambda context, *, config, timeout_ms: {  # type: ignore[no-untyped-def]
+                "authenticated": page.submitted,
+                "final_url": config.base_url.rstrip("/") + config.dashboard_path,
+                "html": "<html></html>",
+            },
+        )
+
+        result = auth._wait_for_easy_login_approval(
+            page=page,
+            context=object(),
+            config=config,
+            username="student123",
+            wait_seconds=20.0,
+            login_number="50",
+            signals=signals,
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert persisted == [True]
+    assert result.data["login_strategy"] == "sso_easy_login"
+    assert result.data["login_number"] == "50"
+
+
+def test_wait_for_easy_login_approval_fails_fast_on_canceled_request(tmp_path: Path, monkeypatch) -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = "https://sso.kaist.ac.kr/auth/twofactor/mfa/login2Factor"
+            self.html = _read_fixture("kaist_sso_login2factor.html")
+
+        def content(self) -> str:
+            return self.html
+
+        def wait_for_timeout(self, ms: int) -> None:  # noqa: ARG002
+            raise AssertionError("should fail before waiting")
+
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        auth = AuthService(paths)
+        signals = _EasyLoginSignals(latest_mfa_payload={"result": False, "error_code": "ESY023"})
+        monkeypatch.setattr(auth_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
+        with pytest.raises(CommandError) as excinfo:
+            auth._wait_for_easy_login_approval(
+                page=FakePage(),
+                context=object(),
+                config=config,
+                username="student123",
+                wait_seconds=20.0,
+                login_number="50",
+                signals=signals,
+            )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    error = excinfo.value
+    assert getattr(error, "code", None) == "AUTH_FAILED"
+    assert "canceled" in str(error).lower()
+
+
+def test_wait_for_easy_login_approval_times_out_on_repeated_waiting_state(tmp_path: Path, monkeypatch) -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = "https://sso.kaist.ac.kr/auth/twofactor/mfa/login2Factor"
+            self.html = _read_fixture("kaist_sso_login2factor.html")
+
+        def content(self) -> str:
+            return self.html
+
+        def wait_for_timeout(self, ms: int) -> None:  # noqa: ARG002
+            return None
+
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        auth = AuthService(paths)
+        signals = _EasyLoginSignals(latest_mfa_payload={"result": False, "error_code": "ESY020"})
+        tick = {"value": 0.0}
+
+        def fake_monotonic() -> float:
+            tick["value"] += 5.0
+            return tick["value"]
+
+        monkeypatch.setattr(auth_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
+        monkeypatch.setattr(auth_module.time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(
+            auth,
+            "_context_dashboard_state",
+            lambda context, *, config, timeout_ms: {  # type: ignore[no-untyped-def]
+                "authenticated": False,
+                "final_url": config.base_url.rstrip("/") + config.dashboard_path,
+                "html": "<html></html>",
+            },
+        )
+        with pytest.raises(CommandError) as excinfo:
+            auth._wait_for_easy_login_approval(
+                page=FakePage(),
+                context=object(),
+                config=config,
+                username="student123",
+                wait_seconds=15.0,
+                login_number="50",
+                signals=signals,
+            )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    error = excinfo.value
+    assert getattr(error, "code", None) == "AUTH_TIMEOUT"
+
+
+def test_wait_for_easy_login_approval_tolerates_page_content_error_during_navigation(tmp_path: Path, monkeypatch) -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = "https://sso.kaist.ac.kr/auth/twofactor/mfa/login2Factor"
+            self.html = _read_fixture("kaist_sso_login2factor.html")
+            self.submitted = False
+            self.loop_count = 0
+
+        def content(self) -> str:
+            if self.submitted:
+                raise RuntimeError("page is navigating")
+            return self.html
+
+        def wait_for_timeout(self, ms: int) -> None:  # noqa: ARG002
+            self.loop_count += 1
+            if self.loop_count == 1:
+                signals.latest_mfa_payload = {"result": True}
+                signals.latest_policy_payload = {"code": "SS0001"}
+
+        def evaluate(self, script: str) -> bool:  # noqa: ARG002
+            self.submitted = True
+            self.url = "https://sso.kaist.ac.kr/auth/user/login/link"
+            return True
+
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        auth = AuthService(paths)
+        page = FakePage()
+        signals = _EasyLoginSignals()
+        tick = {"value": 0.0}
+
+        def fake_monotonic() -> float:
+            tick["value"] += 0.7
+            return tick["value"]
+
+        monkeypatch.setattr(auth_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
+        monkeypatch.setattr(auth_module.time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(auth, "_persist_context_state", lambda context: None)
+        monkeypatch.setattr(
+            auth,
+            "_context_dashboard_state",
+            lambda context, *, config, timeout_ms: {  # type: ignore[no-untyped-def]
+                "authenticated": page.submitted,
+                "final_url": config.base_url.rstrip("/") + config.dashboard_path,
+                "html": "<html></html>",
+            },
+        )
+
+        result = auth._wait_for_easy_login_approval(
+            page=page,
+            context=object(),
+            config=config,
+            username="student123",
+            wait_seconds=20.0,
+            login_number="50",
+            signals=signals,
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result.data["username"] == "student123"
+
+
+def test_install_browser_reports_linux_dependency_hint(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        monkeypatch.setattr(auth_module.sys, "platform", "linux")
+        monkeypatch.setattr(auth_module, "configure_playwright_env", lambda paths: tmp_path / "pw-browsers")
+        monkeypatch.setattr(auth_module, "_playwright_install_cmd", lambda paths: (["playwright"], {}))
+        monkeypatch.setattr(
+            auth_module.subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(
+                args=args[0],
+                returncode=1,
+                stdout="",
+                stderr="Host system is missing dependencies to run browsers.",
+            ),
+        )
+
+        with pytest.raises(CommandError) as excinfo:
+            auth_module.install_browser(paths)
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    error = excinfo.value
+    assert error.code == "BROWSER_INSTALL_FAILED"
+    assert "linux browser/system dependencies" in (error.hint or "").lower()
 
 
 def test_recent_courses_args_load_from_api_map(tmp_path: Path) -> None:

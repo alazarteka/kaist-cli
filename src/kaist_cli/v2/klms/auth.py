@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -171,7 +172,7 @@ def _extract_easy_login_number(html: str) -> str | None:
 
 def _looks_like_easy_login_page(url: str) -> bool:
     lowered = (url or "").lower()
-    return EASY_LOGIN_VIEW_NEEDLE in lowered or EASY_LOGIN_SUBMIT_NEEDLE in lowered
+    return EASY_LOGIN_VIEW_NEEDLE.lower() in lowered or EASY_LOGIN_SUBMIT_NEEDLE.lower() in lowered
 
 
 def _safe_page_content(page: Any) -> str | None:
@@ -179,6 +180,168 @@ def _safe_page_content(page: Any) -> str | None:
         return str(page.content() or "")
     except Exception:
         return None
+
+
+def _looks_like_easy_login_verification_page(html: str) -> bool:
+    lowered = (html or "").lower()
+    return any(
+        needle in lowered
+        for needle in (
+            "auth_number",
+            "nember_wrap",
+            'id="countdown"',
+            "waiting for verification",
+            "verification code",
+            "btn_code",
+        )
+    )
+
+
+@dataclass
+class _EasyLoginSignals:
+    latest_mfa_payload: dict[str, Any] | None = None
+    latest_policy_payload: dict[str, Any] | None = None
+
+
+def _response_json_payload(response: Any) -> dict[str, Any] | None:
+    try:
+        text = str(response.text() or "")
+    except Exception:
+        return None
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _record_easy_login_signal(signals: _EasyLoginSignals, *, url: str, payload: dict[str, Any]) -> None:
+    lowered = (url or "").lower()
+    if "/auth/twofactor/mfa/auth" in lowered:
+        signals.latest_mfa_payload = payload
+    elif "/auth/kaist/user/login/check/policy" in lowered:
+        signals.latest_policy_payload = payload
+
+
+def _observe_easy_login_response(signals: _EasyLoginSignals, response: Any) -> None:
+    url = str(getattr(response, "url", "") or "")
+    lowered = url.lower()
+    if "/auth/twofactor/mfa/auth" not in lowered and "/auth/kaist/user/login/check/policy" not in lowered:
+        return
+    payload = _response_json_payload(response)
+    if payload is None:
+        return
+    _record_easy_login_signal(signals, url=url, payload=payload)
+
+
+def _evaluate_easy_login_mfa_payload(payload: dict[str, Any]) -> str:
+    if bool(payload.get("result")):
+        return "approved"
+
+    error_code = str(payload.get("error_code") or "").strip()
+    if not error_code or error_code == "ESY020":
+        return "waiting"
+    if error_code == "E004":
+        raise CommandError(
+            code="AUTH_TIMEOUT",
+            message="KAIST Easy Login approval timed out.",
+            hint="Retry the request in the KAIST auth app, or use `kaist klms auth login` without `--username`.",
+            exit_code=10,
+            retryable=True,
+        )
+
+    messages = {
+        "ESY021": "KAIST Easy Login is temporarily blocked because too many approvals failed.",
+        "ESY022": "KAIST Easy Login is blocked because too many approvals failed.",
+        "ESY023": "KAIST Easy Login approval was canceled in the KAIST auth app.",
+        "ESY024": "KAIST Easy Login verification number did not match in the KAIST auth app.",
+    }
+    message = messages.get(error_code, f"KAIST Easy Login failed ({error_code}).")
+    raise CommandError(
+        code="AUTH_FAILED",
+        message=message,
+        hint="Try again, or fall back to `kaist klms auth login` without `--username`.",
+        exit_code=10,
+        retryable=False,
+    )
+
+
+def _evaluate_easy_login_policy_payload(payload: dict[str, Any]) -> str:
+    code = str(payload.get("code") or "").strip()
+    if not code:
+        return "pending"
+    if code == "SS0001":
+        return "success"
+
+    if code == "SS0099":
+        raise CommandError(
+            code="AUTH_FLOW_UNSUPPORTED",
+            message="KAIST SSO requires device registration before Easy Login can complete.",
+            hint="Complete the device verification flow in the browser, then retry Easy Login.",
+            exit_code=10,
+            retryable=False,
+        )
+    if code == "SS0007":
+        raise CommandError(
+            code="AUTH_FLOW_UNSUPPORTED",
+            message="KAIST SSO reported an existing-session conflict that needs manual resolution.",
+            hint="Use the manual browser login flow once to resolve the duplicate-session prompt.",
+            exit_code=10,
+            retryable=False,
+        )
+    if code in {"SS0004", "SS0005", "SS0006"}:
+        raise CommandError(
+            code="AUTH_FLOW_UNSUPPORTED",
+            message="KAIST SSO requires a password change before KLMS login can complete.",
+            hint="Use the manual browser login flow and complete the password-change step.",
+            exit_code=10,
+            retryable=False,
+        )
+    if code == "dormancy":
+        raise CommandError(
+            code="AUTH_FLOW_UNSUPPORTED",
+            message="KAIST SSO requires dormant-account reactivation before KLMS login can complete.",
+            hint="Reactivate the KAIST account in the browser, then retry Easy Login.",
+            exit_code=10,
+            retryable=False,
+        )
+    if code in {"ES0017", "EAU016", "EAU017", "EAU018"}:
+        raise CommandError(
+            code="AUTH_FAILED",
+            message=f"KAIST SSO rejected the Easy Login request ({code}).",
+            hint="Retry the login flow; if it persists, use manual browser login once.",
+            exit_code=10,
+            retryable=False,
+        )
+
+    raise CommandError(
+        code="AUTH_FAILED",
+        message=f"KAIST SSO policy check failed ({code}).",
+        hint="Retry the login flow, or use manual browser login if the account needs extra steps.",
+        exit_code=10,
+        retryable=False,
+    )
+
+
+def _submit_easy_login_link(page: Any) -> bool:
+    try:
+        return bool(
+            page.evaluate(
+                """
+                () => {
+                  const form = document.querySelector('form[name="loginForm"]');
+                  if (!form) return false;
+                  form.action = "/auth/user/login/link";
+                  form.submit();
+                  return true;
+                }
+                """
+            )
+        )
+    except Exception:
+        return False
 
 
 def storage_state_cookie_stats(paths: KlmsPaths) -> dict[str, Any] | None:
@@ -349,8 +512,18 @@ def install_browser(paths: KlmsPaths, *, force: bool = False) -> dict[str, Any]:
     if stderr_tail:
         result["stderr_tail"] = stderr_tail
     if completed.returncode != 0:
-        hint = "Run the same command again after fixing browser/runtime issues."
         detail = stderr_tail or stdout_tail or f"exit code {completed.returncode}"
+        hint = "Run the same command again after fixing browser/runtime issues."
+        detail_lower = detail.lower()
+        if sys.platform.startswith("linux") and (
+            "host system is missing dependencies" in detail_lower
+            or "missing libraries" in detail_lower
+            or "install-deps" in detail_lower
+        ):
+            hint = (
+                "Install the required Linux browser/system dependencies on a supported x86_64 glibc host, "
+                "then rerun `kaist klms auth install-browser`."
+            )
         raise CommandError(
             code="BROWSER_INSTALL_FAILED",
             message=f"Failed to install Playwright Chromium ({detail}).",
@@ -591,7 +764,7 @@ class AuthService:
             capability="full",
         )
 
-    def _wait_for_easy_login_transition(self, page: Any, *, timeout_seconds: float) -> str:
+    def _wait_for_easy_login_init(self, page: Any, *, timeout_seconds: float) -> str:
         deadline = time.monotonic() + max(1.0, timeout_seconds)
         while time.monotonic() < deadline:
             current_url = str(page.url or "")
@@ -606,6 +779,8 @@ class AuthService:
                         exit_code=10,
                         retryable=False,
                     )
+                if _extract_easy_login_number(html) or _looks_like_easy_login_verification_page(html):
+                    return html
             if EASY_LOGIN_SUBMIT_NEEDLE in current_url or "/auth/twofactor/mfa/" in current_url:
                 return html or ""
             if not _looks_like_easy_login_page(current_url):
@@ -615,6 +790,94 @@ class AuthService:
             code="AUTH_TIMEOUT",
             message="Timed out waiting for KAIST Easy Login to initialize.",
             hint="Try again, or fall back to `kaist klms auth login` without `--username`.",
+            exit_code=10,
+            retryable=True,
+        )
+
+    def _easy_login_success_result(self, *, config: KlmsConfig, username: str, login_number: str | None) -> CommandResult:
+        return CommandResult(
+            data={
+                "ok": True,
+                "base_url": config.base_url,
+                "dashboard_path": config.dashboard_path,
+                "config_path": str(self._paths.config_path),
+                "profile_path": str(self._paths.profile_dir),
+                "storage_state_path": str(self._paths.storage_state_path),
+                "preferred_mode": "profile",
+                "login_strategy": "sso_easy_login",
+                "username": username,
+                "login_number": login_number,
+            },
+            source="browser",
+            capability="full",
+        )
+
+    def _wait_for_easy_login_approval(
+        self,
+        *,
+        page: Any,
+        context: Any,
+        config: KlmsConfig,
+        username: str,
+        wait_seconds: float,
+        login_number: str | None,
+        signals: _EasyLoginSignals,
+    ) -> CommandResult:
+        auth_deadline = time.monotonic() + wait_seconds
+        last_auth_check = 0.0
+        policy_success_at: float | None = None
+        submitted_link_form = False
+        printed_login_number = login_number
+
+        while time.monotonic() < auth_deadline:
+            now = time.monotonic()
+            current_url = str(page.url or "")
+            current_html = _safe_page_content(page) if _looks_like_easy_login_page(current_url) else None
+
+            if current_html:
+                error_message = _extract_easy_login_error_message(current_html)
+                if error_message:
+                    raise CommandError(
+                        code="AUTH_FAILED",
+                        message=f"KAIST Easy Login failed after initialization ({error_message}).",
+                        hint="Try again, or fall back to `kaist klms auth login` without `--username`.",
+                        exit_code=10,
+                        retryable=False,
+                    )
+                current_number = _extract_easy_login_number(current_html)
+                if current_number and current_number != printed_login_number:
+                    printed_login_number = current_number
+                    print(f"KAIST SSO Easy Login number: {current_number}", file=sys.stderr)
+
+            if signals.latest_mfa_payload is not None:
+                auth_state = _evaluate_easy_login_mfa_payload(signals.latest_mfa_payload)
+                if auth_state == "approved" and signals.latest_policy_payload is not None:
+                    policy_state = _evaluate_easy_login_policy_payload(signals.latest_policy_payload)
+                    if policy_state == "success" and policy_success_at is None:
+                        policy_success_at = now
+
+            if (
+                policy_success_at is not None
+                and not submitted_link_form
+                and _looks_like_easy_login_page(current_url)
+                and now - policy_success_at >= 0.5
+            ):
+                submitted_link_form = _submit_easy_login_link(page)
+
+            if now - last_auth_check >= EASY_LOGIN_POLL_SECONDS:
+                last_auth_check = now
+                state = self._context_dashboard_state(context, config=config, timeout_ms=5_000)
+                if state["authenticated"]:
+                    self._persist_context_state(context)
+                    return self._easy_login_success_result(config=config, username=username, login_number=printed_login_number)
+
+            page.wait_for_timeout(int(EASY_LOGIN_POLL_SECONDS * 1000))
+
+        detail = f" Login number: {printed_login_number}." if printed_login_number else ""
+        raise CommandError(
+            code="AUTH_TIMEOUT",
+            message=f"Timed out waiting for KAIST Easy Login approval.{detail}",
+            hint="Approve the request in the KAIST auth app faster, or use `kaist klms auth login` without `--username`.",
             exit_code=10,
             retryable=True,
         )
@@ -633,9 +896,11 @@ class AuthService:
                 accept_downloads=False,
             )
             try:
+                signals = _EasyLoginSignals()
                 page = context.new_page()
+                page.on("response", lambda response: _observe_easy_login_response(signals, response))
                 page.goto(config.base_url, wait_until="domcontentloaded", timeout=30_000)
-                html = page.content()
+                html = _safe_page_content(page) or ""
                 current_url = str(page.url or "")
                 sso_url = _extract_sso_login_view_url(current_url, html)
                 if not sso_url:
@@ -652,7 +917,7 @@ class AuthService:
                 page.goto(sso_url, wait_until="networkidle", timeout=30_000)
                 page.fill("#login_id_mfa", username)
                 page.click("a.btn_login")
-                html = self._wait_for_easy_login_transition(page, timeout_seconds=12.0)
+                html = self._wait_for_easy_login_init(page, timeout_seconds=12.0)
                 login_number = _extract_easy_login_number(html)
                 if login_number:
                     printed_login_number = login_number
@@ -660,59 +925,14 @@ class AuthService:
                     print("Approve this login in the KAIST auth app. Waiting for KLMS session...", file=sys.stderr)
                 else:
                     print("KAIST SSO Easy Login initialized. Waiting for approval in the KAIST auth app...", file=sys.stderr)
-
-                auth_deadline = time.monotonic() + wait_seconds
-                last_auth_check = 0.0
-                while time.monotonic() < auth_deadline:
-                    now = time.monotonic()
-                    if now - last_auth_check >= EASY_LOGIN_POLL_SECONDS:
-                        last_auth_check = now
-                        state = self._context_dashboard_state(context, config=config, timeout_ms=5_000)
-                        if state["authenticated"]:
-                            self._persist_context_state(context)
-                            return CommandResult(
-                                data={
-                                    "ok": True,
-                                    "base_url": config.base_url,
-                                    "dashboard_path": config.dashboard_path,
-                                    "config_path": str(self._paths.config_path),
-                                    "profile_path": str(self._paths.profile_dir),
-                                    "storage_state_path": str(self._paths.storage_state_path),
-                                    "preferred_mode": "profile",
-                                    "login_strategy": "sso_easy_login",
-                                    "username": username,
-                                    "login_number": printed_login_number,
-                                },
-                                source="browser",
-                                capability="full",
-                            )
-
-                    current_url = str(page.url or "")
-                    if _looks_like_easy_login_page(current_url) or EASY_LOGIN_SUBMIT_NEEDLE in current_url or "/auth/twofactor/mfa/" in current_url:
-                        current_html = _safe_page_content(page)
-                        if current_html:
-                            error_message = _extract_easy_login_error_message(current_html)
-                            if error_message:
-                                raise CommandError(
-                                    code="AUTH_FAILED",
-                                    message=f"KAIST Easy Login failed after initialization ({error_message}).",
-                                    hint="Try again, or fall back to `kaist klms auth login` without `--username`.",
-                                    exit_code=10,
-                                    retryable=False,
-                                )
-                            current_number = _extract_easy_login_number(current_html)
-                            if current_number and current_number != printed_login_number:
-                                printed_login_number = current_number
-                                print(f"KAIST SSO Easy Login number: {current_number}", file=sys.stderr)
-                    page.wait_for_timeout(int(EASY_LOGIN_POLL_SECONDS * 1000))
-
-                detail = f" Login number: {printed_login_number}." if printed_login_number else ""
-                raise CommandError(
-                    code="AUTH_TIMEOUT",
-                    message=f"Timed out waiting for KAIST Easy Login approval.{detail}",
-                    hint="Approve the request in the KAIST auth app faster, or use `kaist klms auth login` without `--username`.",
-                    exit_code=10,
-                    retryable=True,
+                return self._wait_for_easy_login_approval(
+                    page=page,
+                    context=context,
+                    config=config,
+                    username=username,
+                    wait_seconds=wait_seconds,
+                    login_number=printed_login_number,
+                    signals=signals,
                 )
             finally:
                 context.close()

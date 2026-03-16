@@ -18,6 +18,8 @@ jobs:
             runner: macos-14
           - target: darwin-x86_64
             runner: macos-15-intel
+          - target: linux-x86_64-gnu
+            runner: ubuntu-22.04
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
@@ -37,9 +39,12 @@ jobs:
         run: |
           pyinstaller \
             --name kaist \
-            --onefile \
+            --onedir \
             --console \
             --clean \
+            --distpath dist/pyinstaller \
+            --workpath build/pyinstaller \
+            --specpath build/pyinstaller \
             --paths src \
             --hidden-import playwright.async_api \
             --hidden-import playwright.sync_api \
@@ -53,7 +58,7 @@ jobs:
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           scripts/build_release_bundle.sh \
-            --binary dist/kaist \
+            --binary dist/pyinstaller/kaist \
             --version "${TAG}" \
             --target "${{ matrix.target }}" \
             --out-dir dist
@@ -87,4 +92,5 @@ jobs:
           files: |
             dist/kaist-${{ github.ref_name }}-darwin-arm64.tar.gz
             dist/kaist-${{ github.ref_name }}-darwin-x86_64.tar.gz
+            dist/kaist-${{ github.ref_name }}-linux-x86_64-gnu.tar.gz
             dist/checksums.txt

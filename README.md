@@ -21,6 +21,7 @@ Current KLMS surface:
 Managed release install on:
 - macOS arm64
 - macOS x86_64
+- Linux x86_64 glibc (Ubuntu/Debian-class)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/alazarteka/kaist-cli/main/install.sh | bash
@@ -36,8 +37,10 @@ This installs:
 Use `kaist update --check` and `kaist update` to manage release updates.
 
 Linux note:
-- published standalone bundles are not shipped for Linux yet
-- use a source checkout on Linux for now
+- published standalone bundles support `x86_64` glibc hosts only
+- Alpine/musl is not supported
+- headless Linux should use `kaist klms auth login --username ...` or `kaist klms auth refresh`
+- manual browser login on a headless host is not supported
 
 ## Source Quick Start
 
@@ -112,6 +115,11 @@ Operational controls:
 ## Release
 
 Managed standalone bundles are published through GitHub Releases.
+
+Current published targets:
+- `darwin-arm64`
+- `darwin-x86_64`
+- `linux-x86_64-gnu`
 
 Check latest release:
 
