@@ -5,6 +5,7 @@ import ssl
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import certifi
@@ -29,6 +30,20 @@ class KlmsHttpResponse:
     url: str
     text: str
     via: str
+
+
+@dataclass(frozen=True)
+class KlmsDownloadResponse:
+    url: str
+    path: str
+    via: str
+    content_type: str | None
+    content_disposition: str | None
+    bytes_written: int
+
+
+class KlmsDownloadFallback(Exception):
+    pass
 
 
 @dataclass(frozen=True)
@@ -157,6 +172,56 @@ class KlmsHttpSession:
                 url=str(response.geturl() or target_url),
                 text=text,
                 via="http",
+            )
+
+    def download_to_path(
+        self,
+        url_or_path: str,
+        *,
+        destination: Path,
+        timeout_seconds: float = 120.0,
+    ) -> KlmsDownloadResponse:
+        target_url = abs_url(self._base_url, url_or_path)
+        opener = self._build_opener()
+        request = urllib.request.Request(target_url, headers=DEFAULT_HEADERS)
+        with opener.open(request, timeout=max(1.0, timeout_seconds)) as response:
+            final_url = str(response.geturl() or target_url)
+            content_type = str(response.headers.get_content_type() or "").lower() or None
+            content_disposition = str(response.headers.get("Content-Disposition") or "").strip() or None
+            is_html = content_type in {"text/html", "application/xhtml+xml"}
+            preview = b""
+            if looks_login_url(final_url):
+                raise KlmsDownloadFallback(f"Download redirected to login: {final_url}")
+            if is_html and "attachment" not in str(content_disposition or "").lower():
+                preview = response.read(64 * 1024)
+                charset = response.headers.get_content_charset() or "utf-8"
+                try:
+                    preview_text = preview.decode(charset, errors="replace")
+                except LookupError:
+                    preview_text = preview.decode("utf-8", errors="replace")
+                if looks_login_url(final_url) or looks_logged_out_html(preview_text):
+                    raise KlmsDownloadFallback("Download response was an HTML login page.")
+                raise KlmsDownloadFallback("Download response was an HTML page instead of a file.")
+
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            bytes_written = 0
+            with destination.open("wb") as handle:
+                if preview:
+                    handle.write(preview)
+                    bytes_written += len(preview)
+                while True:
+                    chunk = response.read(64 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    bytes_written += len(chunk)
+            return KlmsDownloadResponse(
+                url=final_url,
+                path=str(destination),
+                via="http",
+                content_type=content_type,
+                content_disposition=content_disposition,
+                bytes_written=bytes_written,
             )
 
     @staticmethod

@@ -83,6 +83,14 @@ def test_files_pull_accepts_course_query_flag(tmp_path: Path) -> None:
     assert payload["ok"] is False
 
 
+def test_notice_attachments_pull_schema_is_stable(tmp_path: Path) -> None:
+    cp = run_cli(tmp_path, "--agent", "klms", "notices", "attachments", "pull", "--course-id", "178223")
+    assert cp.returncode == 40
+    payload = json.loads(cp.stdout)
+    assert payload["schema"] == "kaist.klms.notices.attachments.pull.v1"
+    assert payload["ok"] is False
+
+
 def test_sync_status_works_without_klms_config(tmp_path: Path) -> None:
     cp = run_cli(tmp_path, "--agent", "klms", "sync", "status")
     assert cp.returncode == 0

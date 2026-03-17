@@ -79,6 +79,15 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
             max_pages=args.max_pages,
             include_html=args.include_html,
         )
+    if args.group == "notices" and args.action == "attachments" and args.attachments_action == "pull":
+        return facade.pull_notice_attachments(
+            course_id=args.course_id,
+            course_query=args.course,
+            since_iso=args.since_iso,
+            limit=args.limit,
+            subdir=args.subdir,
+            if_exists=args.if_exists,
+        )
     if args.group == "files" and args.action == "list":
         return facade.list_files(course_id=args.course_id, course_query=args.course, limit=args.limit)
     if args.group == "files" and args.action == "get":

@@ -27,7 +27,7 @@ from .deadline import RefreshDeadline
 from .models import FileItem
 from .paths import KlmsPaths
 from .provider_state import ProviderLoad
-from .session import KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
+from .session import KlmsDownloadFallback, KlmsHttpSession, KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
 from .validate import looks_klms_error_html
 
 ALLOWED_MODULES = {"resource", "folder", "url", "page"}
@@ -849,13 +849,14 @@ class FileService:
                 )
             result = self._download_resolved_item(
                 context=context,
+                config=config,
                 item=item,
                 filename_override=filename,
                 subdir=subdir,
                 if_exists=if_exists,
                 auth_mode=auth_mode,
             )
-            return CommandResult(data=result, source="browser", capability="partial")
+            return CommandResult(data=result, source=str(result.get("transport") or "browser"), capability="partial")
 
         return self._auth.run_authenticated(
             config=config,
@@ -910,6 +911,7 @@ class FileService:
                 try:
                     result = self._download_resolved_item(
                         context=context,
+                        config=config,
                         item=item,
                         filename_override=None,
                         subdir=target_subdir,
@@ -968,6 +970,7 @@ class FileService:
                             "course_title": item.course_title,
                             "path": result.get("path"),
                             "filename": result.get("filename"),
+                            "transport": result.get("transport"),
                         }
                     )
 
@@ -985,7 +988,7 @@ class FileService:
             }
             return CommandResult(
                 data=payload,
-                source="browser",
+                source="http" if downloaded_count and all(result.get("transport") == "http" for result in results if result.get("status") == "downloaded") else "mixed",
                 capability="degraded" if failed_count else "partial",
             )
 
@@ -1483,6 +1486,7 @@ class FileService:
         self,
         *,
         context: Any,
+        config: KlmsConfig,
         item: FileItem,
         filename_override: str | None,
         subdir: str | None,
@@ -1507,6 +1511,45 @@ class FileService:
             out_dir = ensure_dir / _sanitize_relpath(subdir)
             out_dir.mkdir(parents=True, exist_ok=True)
 
+        final_name = str(filename_override or item.filename or _filename_from_url(download_url) or f"download-{item.id or 'file'}").strip()
+        out_path = out_dir / final_name
+        if out_path.exists() and if_exists == "skip":
+            return {
+                "skipped": True,
+                "reason": "exists",
+                "path": str(out_path),
+                "filename": final_name,
+                "download_url": download_url,
+                "auth_mode": auth_mode,
+                "item": item.to_dict(),
+            }
+
+        if _looks_like_direct_file_url(download_url):
+            http = KlmsHttpSession(context, base_url=config.base_url)
+            try:
+                http_result = http.download_to_path(
+                    download_url,
+                    destination=out_path,
+                    timeout_seconds=180.0,
+                )
+                return {
+                    "ok": True,
+                    "path": http_result.path,
+                    "filename": final_name,
+                    "download_url": http_result.url,
+                    "auth_mode": auth_mode,
+                    "transport": "http",
+                    "bytes_written": http_result.bytes_written,
+                    "item": item.to_dict(),
+                }
+            except KlmsDownloadFallback:
+                if out_path.exists():
+                    out_path.unlink(missing_ok=True)
+            except Exception:
+                if out_path.exists():
+                    out_path.unlink(missing_ok=True)
+                raise
+
         page = context.new_page()
         try:
             try:
@@ -1523,24 +1566,46 @@ class FileService:
             page.close()
 
         suggested_name = str(download.suggested_filename or "").strip() or None
-        final_name = str(filename_override or suggested_name or item.filename or _filename_from_url(download_url) or f"download-{item.id or 'file'}").strip()
-        out_path = out_dir / final_name
-        if out_path.exists() and if_exists == "skip":
+        browser_name = str(filename_override or suggested_name or item.filename or _filename_from_url(download_url) or f"download-{item.id or 'file'}").strip()
+        browser_path = out_dir / browser_name
+        if browser_path.exists() and if_exists == "skip":
             return {
                 "skipped": True,
                 "reason": "exists",
-                "path": str(out_path),
-                "filename": final_name,
+                "path": str(browser_path),
+                "filename": browser_name,
                 "download_url": download_url,
                 "auth_mode": auth_mode,
                 "item": item.to_dict(),
             }
-        download.save_as(str(out_path))
+        download.save_as(str(browser_path))
         return {
             "ok": True,
-            "path": str(out_path),
-            "filename": final_name,
+            "path": str(browser_path),
+            "filename": browser_name,
             "download_url": download_url,
             "auth_mode": auth_mode,
+            "transport": "browser",
             "item": item.to_dict(),
         }
+
+    def download_item_with_context(
+        self,
+        *,
+        context: Any,
+        config: KlmsConfig,
+        item: FileItem,
+        filename_override: str | None = None,
+        subdir: str | None = None,
+        if_exists: str = "skip",
+        auth_mode: str,
+    ) -> dict[str, Any]:
+        return self._download_resolved_item(
+            context=context,
+            config=config,
+            item=item,
+            filename_override=filename_override,
+            subdir=subdir,
+            if_exists=if_exists,
+            auth_mode=auth_mode,
+        )

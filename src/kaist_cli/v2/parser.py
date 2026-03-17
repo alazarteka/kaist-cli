@@ -218,6 +218,25 @@ def register_klms_parser(
         command_path="klms notices show",
         handler=handler,
     )
+    notices_attachments = notices_sub.add_parser("attachments", help="Operate on notice-post attachments.", formatter_class=_HelpFormatter)
+    notices_attachments_sub = notices_attachments.add_subparsers(dest="attachments_action", required=True, metavar="ACTION")
+    notices_attachments_pull = notices_attachments_sub.add_parser(
+        "pull",
+        help="Download notice-post attachments into a local mirror using authenticated HTTP where possible.",
+        formatter_class=_HelpFormatter,
+    )
+    notices_attachments_pull.add_argument("--course-id", metavar="ID", help="Filter to boards belonging to one course ID.")
+    notices_attachments_pull.add_argument("--course", metavar="QUERY", help="Filter to boards belonging to matching course code or title text.")
+    notices_attachments_pull.add_argument("--since", dest="since_iso", metavar="ISO", help="Only scan notices with posted_iso >= ISO.")
+    notices_attachments_pull.add_argument("--limit", type=int, metavar="N", help="Maximum number of notices to scan for attachments.")
+    notices_attachments_pull.add_argument("--subdir", metavar="DIR", help="Relative destination under the v2 files root.")
+    notices_attachments_pull.add_argument("--if-exists", choices=["skip", "overwrite"], default="skip", help="Behavior when the destination exists.")
+    _set_defaults(
+        notices_attachments_pull,
+        schema_name=f"{schema_prefix}.notices.attachments.pull.v1",
+        command_path="klms notices attachments pull",
+        handler=handler,
+    )
 
     files = klms_sub.add_parser("files", help="List, resolve, download, and mirror KLMS files and materials.", formatter_class=_HelpFormatter)
     files_sub = files.add_subparsers(dest="action", required=True, metavar="ACTION")

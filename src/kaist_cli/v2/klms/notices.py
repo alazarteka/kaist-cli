@@ -12,7 +12,7 @@ from .auth import AuthService, looks_logged_out_html, looks_login_url
 from .cache import list_cache_entries, load_cache_entry, save_cache_value
 from .assignments import _attachment_filename_from_url, _looks_like_attachment_url, _parse_datetime_guess
 from .config import KlmsConfig, abs_url, load_config
-from .courses import _norm_text, _select_dashboard_courses
+from .courses import _course_code_base, _norm_text, _select_dashboard_courses
 from .deadline import RefreshDeadline
 from .models import Notice
 from .paths import KlmsPaths
@@ -57,6 +57,44 @@ def _extract_course_ids_from_dashboard(
         seen.add(value)
         deduped.append(value)
     return deduped
+
+
+def _course_meta_map_from_dashboard(
+    html: str,
+    *,
+    base_url: str,
+    exclude_patterns: tuple[str, ...],
+    course_query: str | None = None,
+    course_id: str | None = None,
+) -> dict[str, dict[str, str | None]]:
+    selected = _select_dashboard_courses(
+        html,
+        base_url=base_url,
+        exclude_patterns=exclude_patterns,
+        course_query=course_query,
+        include_past=False,
+        allow_termless_fallback=True,
+    )
+    out = {
+        str(course.id): {
+            "course_id": str(course.id),
+            "course_title": course.title,
+            "course_code": course.course_code,
+            "course_code_base": _course_code_base(course.course_code),
+        }
+        for course in selected
+        if str(course.id).strip()
+    }
+    if course_id:
+        target = str(course_id).strip()
+        if target and target not in out:
+            out[target] = {
+                "course_id": target,
+                "course_title": None,
+                "course_code": None,
+                "course_code_base": None,
+            }
+    return out
 
 
 def _discover_notice_board_ids_from_course_page(html: str) -> list[str]:
@@ -1092,6 +1130,196 @@ class NoticeService:
             callback=callback,
         )
 
+    def pull_attachments(
+        self,
+        *,
+        course_id: str | None = None,
+        course_query: str | None = None,
+        since_iso: str | None = None,
+        limit: int | None = None,
+        subdir: str | None = None,
+        if_exists: str = "skip",
+    ) -> CommandResult:
+        from .files import FileService, _pull_subdir_for_item, _sanitize_relpath
+        from .models import FileItem
+
+        config = load_config(self._paths)
+        if if_exists not in {"skip", "overwrite"}:
+            raise CommandError(code="CONFIG_INVALID", message="if_exists must be 'skip' or 'overwrite'.", exit_code=40)
+
+        def callback(context: Any, auth_mode: str) -> CommandResult:
+            bootstrap = build_session_bootstrap(
+                self._paths,
+                context=context,
+                config=config,
+                auth_mode=auth_mode,
+            )
+            course_meta = _course_meta_map_from_dashboard(
+                bootstrap.dashboard_html,
+                base_url=config.base_url,
+                exclude_patterns=config.exclude_course_title_patterns,
+                course_query=course_query,
+                course_id=course_id,
+            )
+            board_map = self._resolve_notice_board_map(
+                context=context,
+                config=config,
+                explicit_board_id=None,
+                course_id=course_id,
+                course_query=course_query,
+                bootstrap=bootstrap,
+                allow_stale_cache=True,
+            )
+            board_to_course: dict[str, str] = {}
+            for mapped_course_id, board_ids in board_map.items():
+                course_id_text = str(mapped_course_id).strip()
+                if not course_id_text:
+                    continue
+                for board_id_text in board_ids:
+                    board_to_course[str(board_id_text).strip()] = course_id_text
+
+            notices = self._list_html(
+                context=context,
+                config=config,
+                auth_mode=auth_mode,
+                notice_board_id=None,
+                course_id=course_id,
+                course_query=course_query,
+                max_pages=3,
+                since_iso=since_iso,
+                limit=limit,
+                bootstrap=bootstrap,
+            )
+            downloader = FileService(self._paths, self._auth)
+            results: list[dict[str, Any]] = []
+            candidate_count = 0
+            downloaded_count = 0
+            skipped_count = 0
+            failed_count = 0
+            base_root = self._paths.files_root / _sanitize_relpath(subdir) if subdir else self._paths.files_root
+            base_root.mkdir(parents=True, exist_ok=True)
+
+            for notice in notices:
+                for index, attachment in enumerate(notice.attachments):
+                    attachment_url = str(attachment.get("url") or "").strip()
+                    if not attachment_url:
+                        continue
+                    candidate_count += 1
+                    resolved_course_id = board_to_course.get(str(notice.board_id or "").strip())
+                    course_row = course_meta.get(resolved_course_id or "", {})
+                    item = FileItem(
+                        id=f"{notice.id or 'notice'}:{index}",
+                        title=str(attachment.get("title") or attachment.get("filename") or notice.title or "attachment"),
+                        url=attachment_url,
+                        download_url=attachment_url,
+                        filename=str(attachment.get("filename") or _attachment_filename_from_url(attachment_url) or "").strip() or None,
+                        kind="file",
+                        downloadable=True,
+                        course_id=resolved_course_id,
+                        course_title=course_row.get("course_title") if isinstance(course_row, dict) else None,
+                        course_code=course_row.get("course_code") if isinstance(course_row, dict) else None,
+                        course_code_base=course_row.get("course_code_base") if isinstance(course_row, dict) else None,
+                        source="html:notice-attachment",
+                        confidence=0.82,
+                        auth_mode=auth_mode,
+                    )
+                    target_subdir = _pull_subdir_for_item(item, base_subdir=subdir)
+                    try:
+                        result = downloader.download_item_with_context(
+                            context=context,
+                            config=config,
+                            item=item,
+                            filename_override=None,
+                            subdir=target_subdir,
+                            if_exists=if_exists,
+                            auth_mode=auth_mode,
+                        )
+                    except CommandError as exc:
+                        failed_count += 1
+                        results.append(
+                            {
+                                "status": "failed",
+                                "notice_id": notice.id,
+                                "notice_title": notice.title,
+                                "board_id": notice.board_id,
+                                "course_id": resolved_course_id,
+                                "course_title": course_row.get("course_title") if isinstance(course_row, dict) else None,
+                                "filename": item.filename,
+                                "error": {"code": exc.code, "message": exc.message},
+                            }
+                        )
+                        continue
+                    except Exception as exc:
+                        failed_count += 1
+                        results.append(
+                            {
+                                "status": "failed",
+                                "notice_id": notice.id,
+                                "notice_title": notice.title,
+                                "board_id": notice.board_id,
+                                "course_id": resolved_course_id,
+                                "course_title": course_row.get("course_title") if isinstance(course_row, dict) else None,
+                                "filename": item.filename,
+                                "error": {"code": "DOWNLOAD_FAILED", "message": str(exc)},
+                            }
+                        )
+                        continue
+
+                    if bool(result.get("skipped")):
+                        skipped_count += 1
+                        results.append(
+                            {
+                                "status": "skipped",
+                                "notice_id": notice.id,
+                                "notice_title": notice.title,
+                                "board_id": notice.board_id,
+                                "course_id": resolved_course_id,
+                                "course_title": course_row.get("course_title") if isinstance(course_row, dict) else None,
+                                "path": result.get("path"),
+                                "filename": result.get("filename"),
+                                "transport": result.get("transport"),
+                            }
+                        )
+                    else:
+                        downloaded_count += 1
+                        results.append(
+                            {
+                                "status": "downloaded",
+                                "notice_id": notice.id,
+                                "notice_title": notice.title,
+                                "board_id": notice.board_id,
+                                "course_id": resolved_course_id,
+                                "course_title": course_row.get("course_title") if isinstance(course_row, dict) else None,
+                                "path": result.get("path"),
+                                "filename": result.get("filename"),
+                                "transport": result.get("transport"),
+                            }
+                        )
+
+            payload = {
+                "root": str(base_root),
+                "course_id": str(course_id).strip() or None if course_id else None,
+                "course_query": str(course_query).strip() or None if course_query else None,
+                "since_iso": since_iso,
+                "if_exists": if_exists,
+                "requested_limit": limit,
+                "candidate_count": candidate_count,
+                "downloaded_count": downloaded_count,
+                "skipped_count": skipped_count,
+                "failed_count": failed_count,
+                "results": results,
+            }
+            source = "http" if downloaded_count and all(row.get("transport") == "http" for row in results if row.get("status") == "downloaded") else "mixed"
+            return CommandResult(data=payload, source=source, capability="degraded" if failed_count else "partial")
+
+        return self._auth.run_authenticated(
+            config=config,
+            headless=True,
+            accept_downloads=True,
+            timeout_seconds=10.0,
+            callback=callback,
+        )
+
     def _list_html(
         self,
         *,
@@ -1274,7 +1502,7 @@ class NoticeService:
         save_cache_value(self._paths, self._notice_list_cache_key(config, board_ids, max_pages), [item.to_dict() for item in all_items], ttl_seconds=NOTICE_LIST_TTL_SECONDS)
         return all_items
 
-    def _resolve_notice_board_ids(
+    def _resolve_notice_board_map(
         self,
         *,
         context: Any,
@@ -1285,11 +1513,13 @@ class NoticeService:
         bootstrap: KlmsSessionBootstrap | None = None,
         deadline: RefreshDeadline | None = None,
         allow_stale_cache: bool = False,
-    ) -> list[str]:
+    ) -> dict[str, list[str]]:
         if explicit_board_id:
-            return [str(explicit_board_id).strip()]
+            board_id = str(explicit_board_id).strip()
+            return {"": [board_id]} if board_id else {}
         if config.notice_board_ids:
-            return [str(board_id).strip() for board_id in config.notice_board_ids if str(board_id).strip()]
+            configured = [str(board_id).strip() for board_id in config.notice_board_ids if str(board_id).strip()]
+            return {"": configured} if configured else {}
 
         if bootstrap is None:
             raise CommandError(
@@ -1308,8 +1538,8 @@ class NoticeService:
         )
         if not course_ids:
             cached_board_ids = self._fallback_notice_board_ids_from_cache(self._paths, config)
-            if cached_board_ids:
-                return cached_board_ids
+            return {"": cached_board_ids} if cached_board_ids else {}
+
         cache_key = self._notice_board_cache_key(config, course_ids)
         cache_entry = load_cache_entry(self._paths, cache_key)
         cached_rows = cache_entry.get("value") if isinstance(cache_entry, dict) else None
@@ -1317,8 +1547,8 @@ class NoticeService:
 
         def flatten_board_map(board_map: dict[str, Any]) -> list[str]:
             flattened: list[str] = []
-            for course_id in course_ids:
-                values = board_map.get(course_id)
+            for selected_course_id in course_ids:
+                values = board_map.get(selected_course_id)
                 if not isinstance(values, list):
                     continue
                 flattened.extend(str(board_id).strip() for board_id in values if str(board_id).strip())
@@ -1326,19 +1556,29 @@ class NoticeService:
 
         cached_board_ids = flatten_board_map(cached_board_map)
         if cached_board_ids and (not bool((cache_entry or {}).get("stale")) or allow_stale_cache):
-            return cached_board_ids
+            return {
+                selected_course_id: [str(board_id).strip() for board_id in cached_board_map.get(selected_course_id, []) if str(board_id).strip()]
+                for selected_course_id in course_ids
+                if isinstance(cached_board_map.get(selected_course_id), list)
+            }
         if deadline is not None and deadline.hard_expired():
-            return cached_board_ids if allow_stale_cache else []
+            if allow_stale_cache and cached_board_ids:
+                return {
+                    selected_course_id: [str(board_id).strip() for board_id in cached_board_map.get(selected_course_id, []) if str(board_id).strip()]
+                    for selected_course_id in course_ids
+                    if isinstance(cached_board_map.get(selected_course_id), list)
+                }
+            return {}
 
         board_map: dict[str, list[str]] = {}
-        paths = [f"/course/view.php?id={course_id}&section=0" for course_id in course_ids]
+        paths = [f"/course/view.php?id={selected_course_id}&section=0" for selected_course_id in course_ids]
         responses = fetch_html_batch(
             bootstrap.http,
             paths,
             deadline=deadline,
             max_workers=MAX_NOTICE_HTTP_WORKERS,
         )
-        for course_id, path in zip(course_ids, paths):
+        for selected_course_id, path in zip(course_ids, paths):
             response = responses.get(path)
             if response is None:
                 continue
@@ -1352,9 +1592,41 @@ class NoticeService:
                 )
             board_ids = _discover_notice_board_ids_from_course_page(response.text)
             if board_ids:
-                board_map[course_id] = board_ids
-        resolved = flatten_board_map(board_map)
-        if resolved:
+                board_map[selected_course_id] = board_ids
+        if any(board_map.values()):
             save_cache_value(self._paths, cache_key, board_map, ttl_seconds=NOTICE_BOARD_TTL_SECONDS)
-            return resolved
-        return cached_board_ids if allow_stale_cache else resolved
+            return board_map
+        if allow_stale_cache and cached_board_ids:
+            return {
+                selected_course_id: [str(board_id).strip() for board_id in cached_board_map.get(selected_course_id, []) if str(board_id).strip()]
+                for selected_course_id in course_ids
+                if isinstance(cached_board_map.get(selected_course_id), list)
+            }
+        return {}
+
+    def _resolve_notice_board_ids(
+        self,
+        *,
+        context: Any,
+        config: KlmsConfig,
+        explicit_board_id: str | None,
+        course_id: str | None = None,
+        course_query: str | None = None,
+        bootstrap: KlmsSessionBootstrap | None = None,
+        deadline: RefreshDeadline | None = None,
+        allow_stale_cache: bool = False,
+    ) -> list[str]:
+        board_map = self._resolve_notice_board_map(
+            context=context,
+            config=config,
+            explicit_board_id=explicit_board_id,
+            course_id=course_id,
+            course_query=course_query,
+            bootstrap=bootstrap,
+            deadline=deadline,
+            allow_stale_cache=allow_stale_cache,
+        )
+        flattened: list[str] = []
+        for rows in board_map.values():
+            flattened.extend(str(board_id).strip() for board_id in rows if str(board_id).strip())
+        return list(dict.fromkeys(flattened))

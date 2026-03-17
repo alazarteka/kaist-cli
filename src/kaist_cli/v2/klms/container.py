@@ -204,6 +204,25 @@ class KlmsFacade:
             include_html=include_html,
         )
 
+    def pull_notice_attachments(
+        self,
+        *,
+        course_id: str | None = None,
+        course_query: str | None = None,
+        since_iso: str | None = None,
+        limit: int | None = None,
+        subdir: str | None = None,
+        if_exists: str = "skip",
+    ) -> CommandResult:
+        return self._notices.pull_attachments(
+            course_id=course_id,
+            course_query=course_query,
+            since_iso=since_iso,
+            limit=limit,
+            subdir=subdir,
+            if_exists=if_exists,
+        )
+
     def list_files(self, *, course_id: str | None = None, course_query: str | None = None, limit: int | None = None) -> CommandResult:
         return self._files.list(course_id=course_id, course_query=course_query, limit=limit)
 

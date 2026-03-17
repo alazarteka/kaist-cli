@@ -31,10 +31,11 @@ from kaist_cli.v2.klms.config import load_config
 from kaist_cli.v2.klms.dashboard import DashboardService, _build_inbox_items, _decorate_today_assignments, _filter_inbox_assignments, _select_recent_notices
 from kaist_cli.v2.klms.discovery import load_recent_courses_args, map_discovery_report
 from kaist_cli.v2.klms.files import FileService, _extract_file_items_from_course_contents, _extract_file_items_from_html, _pull_subdir_for_item, _sanitize_relpath, _synthesize_file_item_from_url, _unwrap_moodle_ajax_payload
-from kaist_cli.v2.klms.models import Assignment, Course, FileItem
+from kaist_cli.v2.klms.models import Assignment, Course, FileItem, Notice
 from kaist_cli.v2.klms.notices import NoticeService, _discover_notice_board_ids_from_course_page, _extract_course_ids_from_dashboard, _parse_notice_detail_from_html, _parse_notice_items_from_soup
 from kaist_cli.v2.klms.paths import resolve_paths
 from kaist_cli.v2.klms.provider_state import ProviderLoad
+from kaist_cli.v2.klms.session import KlmsDownloadFallback
 from kaist_cli.v2.klms.videos import _extract_video_items_from_html, _parse_video_detail_from_html, _parse_video_viewer_from_html
 
 
@@ -1487,6 +1488,231 @@ def test_resolve_target_item_rejects_non_material_url(tmp_path: Path, monkeypatc
             os.environ["KAIST_CLI_HOME"] = old_home
 
     assert exc_info.value.code == "CONFIG_INVALID"
+
+
+def test_download_resolved_item_uses_http_for_direct_file_urls(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        service = FileService(paths, AuthService(paths))
+        item = FileItem(
+            id="991",
+            title="Week 1 Slides",
+            url="https://klms.kaist.ac.kr/mod/resource/view.php?id=991",
+            download_url="https://klms.kaist.ac.kr/pluginfile.php/123/week1.pdf?forcedownload=1",
+            filename="week1.pdf",
+            kind="file",
+            downloadable=True,
+            course_id="180871",
+            course_title="Introduction to Algorithms",
+            course_code="CS.30000_2026_1",
+            course_code_base="CS.30000",
+            source="html:file-resolved",
+            confidence=0.8,
+            auth_mode="profile",
+        )
+        calls: list[tuple[str, str, float]] = []
+
+        class FakeHttpSession:
+            def __init__(self, context, *, base_url: str) -> None:  # type: ignore[no-untyped-def]
+                assert base_url == "https://klms.kaist.ac.kr"
+
+            def download_to_path(self, url_or_path: str, *, destination: Path, timeout_seconds: float = 120.0):  # type: ignore[no-untyped-def]
+                calls.append((url_or_path, str(destination), timeout_seconds))
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"%PDF-http")
+                return SimpleNamespace(
+                    url=url_or_path,
+                    path=str(destination),
+                    bytes_written=9,
+                )
+
+        class FakeContext:
+            def new_page(self):  # type: ignore[no-untyped-def]
+                raise AssertionError("browser fallback should not be used for direct pluginfile downloads")
+
+        monkeypatch.setattr("kaist_cli.v2.klms.files.KlmsHttpSession", FakeHttpSession)
+        result = service._download_resolved_item(
+            context=FakeContext(),
+            config=config,
+            item=item,
+            filename_override=None,
+            subdir="pull-http",
+            if_exists="overwrite",
+            auth_mode="profile",
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result["transport"] == "http"
+    assert calls
+    assert Path(result["path"]).read_bytes() == b"%PDF-http"
+
+
+def test_download_resolved_item_falls_back_to_browser_when_http_returns_html(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        service = FileService(paths, AuthService(paths))
+        item = FileItem(
+            id="991",
+            title="Week 1 Slides",
+            url="https://klms.kaist.ac.kr/mod/resource/view.php?id=991",
+            download_url="https://klms.kaist.ac.kr/pluginfile.php/123/week1.pdf?forcedownload=1",
+            filename="week1.pdf",
+            kind="file",
+            downloadable=True,
+            course_id="180871",
+            course_title="Introduction to Algorithms",
+            course_code="CS.30000_2026_1",
+            course_code_base="CS.30000",
+            source="html:file-resolved",
+            confidence=0.8,
+            auth_mode="profile",
+        )
+
+        class FakeHttpSession:
+            def __init__(self, context, *, base_url: str) -> None:  # type: ignore[no-untyped-def]
+                pass
+
+            def download_to_path(self, url_or_path: str, *, destination: Path, timeout_seconds: float = 120.0):  # type: ignore[no-untyped-def]
+                raise KlmsDownloadFallback("html response")
+
+        class FakeDownload:
+            suggested_filename = "week1-from-browser.pdf"
+
+            def save_as(self, path: str) -> None:
+                Path(path).write_bytes(b"%PDF-browser")
+
+        class FakeDownloadWaiter:
+            def __enter__(self):  # type: ignore[no-untyped-def]
+                return self
+
+            def __exit__(self, exc_type, exc, tb):  # type: ignore[no-untyped-def]
+                return False
+
+            @property
+            def value(self) -> FakeDownload:
+                return FakeDownload()
+
+        class FakePage:
+            def expect_download(self) -> FakeDownloadWaiter:
+                return FakeDownloadWaiter()
+
+            def goto(self, url: str, *, wait_until: str, timeout: int) -> None:
+                raise RuntimeError("Download is starting")
+
+            def close(self) -> None:
+                return None
+
+        class FakeContext:
+            def new_page(self) -> FakePage:
+                return FakePage()
+
+        monkeypatch.setattr("kaist_cli.v2.klms.files.KlmsHttpSession", FakeHttpSession)
+        result = service._download_resolved_item(
+            context=FakeContext(),
+            config=config,
+            item=item,
+            filename_override=None,
+            subdir="pull-browser",
+            if_exists="overwrite",
+            auth_mode="profile",
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result["transport"] == "browser"
+    assert Path(result["path"]).read_bytes() == b"%PDF-browser"
+
+
+def test_pull_notice_attachments_downloads_attachment_urls(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        service = NoticeService(paths, AuthService(paths))
+
+        monkeypatch.setattr(
+            "kaist_cli.v2.klms.notices.build_session_bootstrap",
+            lambda *args, **kwargs: SimpleNamespace(
+                dashboard_html='<a href="/course/view.php?id=178223">General Chemistry Lab I(CH.10002_2026_1)</a>'
+            ),
+        )
+        monkeypatch.setattr(
+            service,
+            "_resolve_notice_board_map",
+            lambda **kwargs: {"178223": ["838536"]},
+        )
+        monkeypatch.setattr(
+            service,
+            "_list_html",
+            lambda **kwargs: [
+                Notice(
+                    board_id="838536",
+                    id="423326",
+                    title="Lab Manual",
+                    url="https://klms.kaist.ac.kr/mod/courseboard/article.php?id=838536&bwid=423326",
+                    posted_raw="2026-03-16 18:57",
+                    posted_iso="2026-03-16T09:57:00Z",
+                    attachments=(
+                        {
+                            "title": "week1-manual.pdf",
+                            "filename": "week1-manual.pdf",
+                            "url": "https://klms.kaist.ac.kr/pluginfile.php/123/week1-manual.pdf?forcedownload=1",
+                        },
+                    ),
+                    source="html:courseboard-article",
+                    confidence=0.8,
+                    auth_mode="profile",
+                )
+            ],
+        )
+
+        def fake_run_authenticated(*, config, headless, accept_downloads, timeout_seconds, callback):  # type: ignore[no-untyped-def]
+            return callback(SimpleNamespace(), "profile")
+
+        monkeypatch.setattr(service._auth, "run_authenticated", fake_run_authenticated)
+
+        def fake_download(self, *, context, config, item, filename_override=None, subdir=None, if_exists="skip", auth_mode):  # type: ignore[no-untyped-def]
+            out_dir = paths.files_root / (subdir or "")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / (item.filename or "attachment.bin")
+            out_path.write_bytes(b"notice-attachment")
+            return {
+                "ok": True,
+                "path": str(out_path),
+                "filename": out_path.name,
+                "transport": "http",
+            }
+
+        monkeypatch.setattr("kaist_cli.v2.klms.files.FileService.download_item_with_context", fake_download)
+
+        result = service.pull_attachments(course_id="178223", subdir="notice-files")
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result.data["candidate_count"] == 1
+    assert result.data["downloaded_count"] == 1
+    assert result.data["results"][0]["transport"] == "http"
+    assert result.data["results"][0]["course_id"] == "178223"
+    assert "CH.10002_2026_1" in result.data["results"][0]["path"]
 
 
 def test_sanitize_relpath_drops_parent_segments() -> None:
