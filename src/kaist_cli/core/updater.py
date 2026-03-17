@@ -8,6 +8,7 @@ import re
 import shutil
 import ssl
 import subprocess
+import sys
 import tarfile
 import tempfile
 import urllib.error
@@ -22,10 +23,15 @@ from .versioning import version_string
 
 GITHUB_API_BASE = "https://api.github.com"
 INSTALL_HINT = "Reinstall using `curl -fsSL https://raw.githubusercontent.com/alazarteka/kaist-cli/main/install.sh | bash`."
+INSTALL_METADATA_FILENAME = "install.json"
 
 
 class SelfUpdateError(RuntimeError):
     pass
+
+
+def _progress(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
 
 
 @dataclass(frozen=True)
@@ -325,6 +331,72 @@ def _resolved_symlink(path: Path) -> Path | None:
         return None
 
 
+def _install_metadata_path(install_root: Path) -> Path:
+    return install_root / INSTALL_METADATA_FILENAME
+
+
+def _load_install_metadata(install_root: Path) -> dict[str, Any]:
+    path = _install_metadata_path(install_root)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_install_metadata(install_root: Path, *, launcher_path: Path | None) -> None:
+    payload: dict[str, Any] = {}
+    if launcher_path is not None:
+        payload["launcher_path"] = str(launcher_path)
+    _write_json(_install_metadata_path(install_root), payload)
+
+
+def _symlink_points_within_install_root(path: Path, install_root: Path) -> bool:
+    if not path.is_symlink():
+        return False
+    try:
+        target = path.readlink()
+    except OSError:
+        return False
+    if not target.is_absolute():
+        target = (path.parent / target)
+    try:
+        resolved = target.resolve()
+    except OSError:
+        resolved = target
+    try:
+        return install_root.resolve() in resolved.parents or resolved == install_root.resolve()
+    except OSError:
+        return str(install_root) in str(target)
+
+
+def _launcher_candidates(ctx: ManagedInstallContext, executable_path: Path) -> list[Path]:
+    candidates: list[Path] = []
+    metadata = _load_install_metadata(ctx.install_root)
+    launcher_raw = str(metadata.get("launcher_path") or "").strip()
+    if launcher_raw:
+        candidates.append(Path(launcher_raw).expanduser())
+
+    default_launcher = Path.home() / ".local" / "bin" / "kaist"
+    if default_launcher.is_symlink() and _symlink_points_within_install_root(default_launcher, ctx.install_root):
+        candidates.append(default_launcher)
+
+    if executable_path.is_symlink() or not executable_path.exists():
+        candidates.append(executable_path)
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate.expanduser())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
+
+
 def _swap_symlink(link_path: Path, target_path: Path) -> None:
     link_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = link_path.parent / f".{link_path.name}.new"
@@ -432,10 +504,10 @@ def _sync_claude_plugin_metadata(install_root: Path, *, version: str) -> Path:
     return marketplace_manifest_path
 
 
-def check_for_update() -> dict[str, Any]:
+def check_for_update(*, release: dict[str, Any] | None = None) -> dict[str, Any]:
     current = version_string()
     target = platform_target()
-    release = fetch_latest_release()
+    release = release or fetch_latest_release()
     latest_tag = str(release.get("tag_name") or "").strip()
     latest = normalize_version(latest_tag)
     assets = _coerce_assets(release)
@@ -457,7 +529,9 @@ def check_for_update() -> dict[str, Any]:
 
 
 def perform_self_update() -> dict[str, Any]:
-    check = check_for_update()
+    _progress("Checking latest kaist release...")
+    release = fetch_latest_release()
+    check = check_for_update(release=release)
     if not check.get("update_available"):
         return {
             "ok": True,
@@ -474,20 +548,25 @@ def perform_self_update() -> dict[str, Any]:
             + INSTALL_HINT
         )
 
-    release = fetch_latest_release()
     assets = _coerce_assets(release)
     target = str(check["platform_target"])
     archive_asset = select_archive_asset(assets, target)
     checksums_asset = select_checksums_asset(assets)
+    launcher_candidates = _launcher_candidates(ctx, executable_path)
 
     with tempfile.TemporaryDirectory(prefix="kaist-update-") as tmp:
         tmp_dir = Path(tmp)
         archive_path = tmp_dir / archive_asset.name
         checksums_path = tmp_dir / checksums_asset.name
-        staged_bundle = tmp_dir / "bundle"
+        version_tag = str(check.get("latest_tag") or f"v{check['latest_version']}")
+        version_dir = ctx.versions_dir / version_tag
+        temp_version_dir = ctx.versions_dir / f".{version_tag}.install"
+
+        _progress(f"Downloading {archive_asset.name}...")
         _download_to_path(archive_asset.browser_download_url, archive_path)
         _download_to_path(checksums_asset.browser_download_url, checksums_path)
 
+        _progress("Verifying download integrity...")
         checksums = parse_checksums(checksums_path.read_text(encoding="utf-8"))
         expected = checksums.get(archive_asset.name)
         if not expected:
@@ -498,17 +577,14 @@ def perform_self_update() -> dict[str, Any]:
                 f"Checksum mismatch for {archive_asset.name}: expected {expected}, got {actual}"
             )
 
-        manifest = _extract_bundle_root(archive_path, staged_bundle)
-        version_tag = str(check.get("latest_tag") or f"v{check['latest_version']}")
-        version_dir = ctx.versions_dir / version_tag
-        temp_version_dir = ctx.versions_dir / f".{version_tag}.install"
-
         if temp_version_dir.exists() or temp_version_dir.is_symlink():
             _remove_path(temp_version_dir)
         if version_dir.exists() or version_dir.is_symlink():
             _remove_path(version_dir)
 
-        shutil.copytree(staged_bundle, temp_version_dir)
+        _progress("Extracting update bundle...")
+        manifest = _extract_bundle_root(archive_path, temp_version_dir)
+        _progress("Installing update...")
         os.replace(temp_version_dir, version_dir)
 
     previous_root = _resolved_symlink(ctx.current_link)
@@ -533,11 +609,17 @@ def perform_self_update() -> dict[str, Any]:
     bundled_skill_path = current_bundle_root / manifest.skill_relpath
     installed_binary_path = current_bundle_root / manifest.binary_relpath
     launcher_path: str | None = None
-    if ctx.install_root not in executable_path.parents:
+    for launcher_candidate in launcher_candidates:
         try:
-            launcher_path = _maybe_update_launcher_symlink(executable_path, installed_binary_path)
+            _swap_symlink(launcher_candidate, installed_binary_path)
+            if launcher_path is None:
+                launcher_path = str(launcher_candidate)
         except Exception as exc:  # noqa: BLE001
-            warnings.append(f"Could not update launcher symlink {executable_path}: {exc}")
+            warnings.append(f"Could not update launcher symlink {launcher_candidate}: {exc}")
+    try:
+        _write_install_metadata(ctx.install_root, launcher_path=Path(launcher_path) if launcher_path else None)
+    except Exception as exc:  # noqa: BLE001
+        warnings.append(f"Could not update install metadata: {exc}")
 
     payload = {
         "ok": True,

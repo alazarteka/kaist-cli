@@ -253,9 +253,11 @@ extract_dir="$tmp_dir/extracted"
 log "Downloading ${ARCHIVE_NAME}"
 curl -fsSL "$ARCHIVE_URL" -o "$archive_path" || die "Failed to download release archive."
 curl -fsSL "$CHECKSUMS_URL" -o "$checksums_path" || die "Failed to download checksums.txt."
+log "Verifying ${ARCHIVE_NAME}"
 verify_checksum "$archive_path" "$checksums_path"
 
 mkdir -p "$extract_dir"
+log "Extracting ${ARCHIVE_NAME}"
 tar -xzf "$archive_path" -C "$extract_dir"
 
 [[ -f "$extract_dir/bundle.json" ]] || die "Release archive is missing bundle.json."
@@ -274,9 +276,11 @@ version_dir="$INSTALL_ROOT/versions/$TAG"
 current_link="$INSTALL_ROOT/current"
 previous_link="$INSTALL_ROOT/previous"
 bin_link="$BIN_DIR/kaist"
+install_metadata_path="$INSTALL_ROOT/install.json"
 
 old_current="$(resolve_dir_link "$current_link" || true)"
 rm -rf "$version_dir"
+log "Installing ${TAG}"
 mv "$extract_dir" "$version_dir"
 
 ln -sfn "$version_dir" "$current_link"
@@ -291,6 +295,11 @@ keep_previous="$(resolve_dir_link "$previous_link" || true)"
 prune_versions "$INSTALL_ROOT" "$keep_current" "$keep_previous"
 
 ln -sfn "$INSTALL_ROOT/current/$binary_relpath" "$bin_link"
+cat >"$install_metadata_path" <<JSON
+{
+  "launcher_path": "$bin_link"
+}
+JSON
 sync_claude_marketplace "$INSTALL_ROOT" "${TAG#v}" || warn "Could not sync Claude plugin marketplace metadata."
 
 skill_path="$INSTALL_ROOT/current/$skill_relpath"

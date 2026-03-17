@@ -246,6 +246,7 @@ def test_install_script_installs_managed_layout_and_rotates_previous(tmp_path: P
     assert (install_root / "current" / "skills" / "kaist-cli" / "SKILL.md").exists()
     assert json.loads((install_root / "current" / "skills" / "kaist-cli" / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"] == "0.1.4"
     assert json.loads((install_root / "mkt" / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"] == "0.1.4"
+    assert json.loads((install_root / "install.json").read_text(encoding="utf-8"))["launcher_path"] == str(bin_dir / "kaist")
     assert (install_root / "mkt" / "plugins" / "kaist-cli" / "skills" / "kaist-cli").is_symlink()
     assert "Bundled skill:" in first.stdout
     assert (bin_dir / "kaist").resolve() == (install_root / "current" / "bin" / "kaist" / "kaist").resolve()
@@ -269,6 +270,7 @@ def test_install_script_installs_managed_layout_and_rotates_previous(tmp_path: P
     assert (bin_dir / "kaist").resolve() == (install_root / "current" / "bin" / "kaist" / "kaist").resolve()
     assert json.loads((install_root / "current" / "skills" / "kaist-cli" / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"] == "0.1.5"
     assert json.loads((install_root / "mkt" / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"] == "0.1.5"
+    assert json.loads((install_root / "install.json").read_text(encoding="utf-8"))["launcher_path"] == str(bin_dir / "kaist")
 
 
 def test_perform_self_update_switches_current_and_previous(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -286,17 +288,19 @@ def test_perform_self_update_switches_current_and_previous(tmp_path: Path, monke
     archive_path, checksums_path = _prepare_release_dir(tmp_path / "releases", "v0.1.5", bundle_mode="onedir")
     monkeypatch.setattr(updater, "platform_target", lambda: "darwin-arm64")
     monkeypatch.setattr(updater, "version_string", lambda: "0.1.4")
-    monkeypatch.setattr(
-        updater,
-        "fetch_latest_release",
-        lambda: {
+    fetch_count = {"value": 0}
+
+    def fake_release() -> dict[str, object]:
+        fetch_count["value"] += 1
+        return {
             "tag_name": "v0.1.5",
             "assets": [
                 {"name": archive_path.name, "browser_download_url": "archive-url", "size": archive_path.stat().st_size},
                 {"name": "checksums.txt", "browser_download_url": "checksums-url", "size": checksums_path.stat().st_size},
             ],
-        },
-    )
+        }
+
+    monkeypatch.setattr(updater, "fetch_latest_release", fake_release)
     monkeypatch.setattr(updater, "_current_binary_path", lambda: launcher_link)
 
     def fake_download(url: str, destination: Path) -> None:
@@ -322,6 +326,59 @@ def test_perform_self_update_switches_current_and_previous(tmp_path: Path, monke
     assert payload["launcher_path"] == str(launcher_link)
     assert launcher_link.resolve() == (install_root / "current" / "bin" / "kaist" / "kaist").resolve()
     assert json.loads((install_root / "mkt" / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))["plugins"][0]["version"] == "0.1.5"
+    assert json.loads((install_root / "install.json").read_text(encoding="utf-8"))["launcher_path"] == str(launcher_link)
+    assert fetch_count["value"] == 1
+
+
+def test_perform_self_update_repairs_legacy_default_launcher_from_onefile_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_root = tmp_path / "managed-install"
+    current_version = install_root / "versions" / "v0.1.4"
+    _populate_bundle_root(current_version, "0.1.4", binary_relpath="bin/kaist")
+    (install_root / "current").symlink_to(current_version)
+
+    home_dir = tmp_path / "home"
+    launcher_dir = home_dir / ".local" / "bin"
+    launcher_dir.mkdir(parents=True, exist_ok=True)
+    launcher_link = launcher_dir / "kaist"
+    launcher_link.symlink_to(install_root / "current" / "bin" / "kaist")
+
+    archive_path, checksums_path = _prepare_release_dir(tmp_path / "releases", "v0.1.5", bundle_mode="onedir")
+    monkeypatch.setattr(updater, "platform_target", lambda: "darwin-arm64")
+    monkeypatch.setattr(updater, "version_string", lambda: "0.1.4")
+    monkeypatch.setattr(updater.Path, "home", lambda: home_dir)
+    monkeypatch.setattr(
+        updater,
+        "fetch_latest_release",
+        lambda: {
+            "tag_name": "v0.1.5",
+            "assets": [
+                {"name": archive_path.name, "browser_download_url": "archive-url", "size": archive_path.stat().st_size},
+                {"name": "checksums.txt", "browser_download_url": "checksums-url", "size": checksums_path.stat().st_size},
+            ],
+        },
+    )
+    monkeypatch.setattr(updater, "_current_binary_path", lambda: install_root / "current" / "bin" / "kaist")
+
+    def fake_download(url: str, destination: Path) -> None:
+        if url == "archive-url":
+            shutil.copy2(archive_path, destination)
+            return
+        if url == "checksums-url":
+            shutil.copy2(checksums_path, destination)
+            return
+        raise AssertionError(f"unexpected url: {url}")
+
+    monkeypatch.setattr(updater, "_download_to_path", fake_download)
+
+    payload = updater.perform_self_update()
+
+    assert payload["updated"] is True
+    assert payload["launcher_path"] == str(launcher_link)
+    assert launcher_link.resolve() == (install_root / "current" / "bin" / "kaist" / "kaist").resolve()
+    assert json.loads((install_root / "install.json").read_text(encoding="utf-8"))["launcher_path"] == str(launcher_link)
 
 
 def test_prune_versions_returns_warning_on_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
