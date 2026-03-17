@@ -444,6 +444,44 @@ def test_wait_for_easy_login_approval_times_out_on_repeated_waiting_state(tmp_pa
     assert getattr(error, "code", None) == "AUTH_TIMEOUT"
 
 
+def test_wait_for_easy_login_approval_fails_fast_on_device_registration_page(tmp_path: Path, monkeypatch) -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = "https://sso.kaist.ac.kr/auth/kaist/user/device/view"
+
+        def wait_for_timeout(self, ms: int) -> None:  # noqa: ARG002
+            raise AssertionError("device-registration path should fail before waiting")
+
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        auth = AuthService(paths)
+        signals = _EasyLoginSignals(latest_mfa_payload={"result": True, "error_code": ""})
+        monkeypatch.setattr(auth_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
+        with pytest.raises(CommandError) as excinfo:
+            auth._wait_for_easy_login_approval(
+                page=FakePage(),
+                context=object(),
+                config=config,
+                username="student123",
+                wait_seconds=20.0,
+                login_number="50",
+                signals=signals,
+            )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    error = excinfo.value
+    assert getattr(error, "code", None) == "AUTH_FLOW_UNSUPPORTED"
+    assert "device registration" in str(error).lower()
+
+
 def test_wait_for_easy_login_approval_tolerates_page_content_error_during_navigation(tmp_path: Path, monkeypatch) -> None:
     class FakePage:
         def __init__(self) -> None:
@@ -512,6 +550,85 @@ def test_wait_for_easy_login_approval_tolerates_page_content_error_during_naviga
             os.environ["KAIST_CLI_HOME"] = old_home
 
     assert result.data["username"] == "student123"
+
+
+def test_easy_login_registers_response_listener_on_context(tmp_path: Path, monkeypatch) -> None:
+    import playwright.sync_api as playwright_sync_api  # type: ignore[import-untyped]
+
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = "https://klms.kaist.ac.kr/"
+
+        def goto(self, url: str, **kwargs: Any) -> None:  # noqa: ARG002
+            self.url = url
+
+        def fill(self, selector: str, value: str) -> None:  # noqa: ARG002
+            return None
+
+        def click(self, selector: str) -> None:  # noqa: ARG002
+            return None
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.page = FakePage()
+            self.handlers: dict[str, Any] = {}
+
+        def new_page(self) -> FakePage:
+            return self.page
+
+        def on(self, event: str, handler: Any) -> None:
+            self.handlers[event] = handler
+
+        def close(self) -> None:
+            return None
+
+    class FakePlaywrightContextManager:
+        def __enter__(self) -> object:
+            return object()
+
+        def __exit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001
+            return None
+
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        auth = AuthService(paths)
+        fake_context = FakeContext()
+
+        monkeypatch.setattr(playwright_sync_api, "sync_playwright", lambda: FakePlaywrightContextManager())
+        monkeypatch.setattr(
+            auth_module,
+            "_launch_chromium_persistent_context_sync",
+            lambda *args, **kwargs: fake_context,  # noqa: ARG005
+        )
+        monkeypatch.setattr(
+            auth_module,
+            "_extract_sso_login_view_url",
+            lambda current_url, html: "https://sso.kaist.ac.kr/auth/kaist/user/login/view",  # noqa: ARG005
+        )
+        monkeypatch.setattr(auth, "_wait_for_easy_login_init", lambda page, timeout_seconds: _read_fixture("kaist_sso_login2factor.html"))  # noqa: ARG005
+        monkeypatch.setattr(
+            auth,
+            "_wait_for_easy_login_approval",
+            lambda **kwargs: CommandResult(  # type: ignore[misc]
+                data={"ok": True, "signals_seen": kwargs["signals"] is not None},
+                source="browser",
+                capability="full",
+            ),
+        )
+
+        result = auth._easy_login(config=config, username="student123", wait_seconds=30.0)
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result.data["ok"] is True
+    assert "response" in fake_context.handlers
 
 
 def test_manual_login_fails_early_without_interactive_stdin(tmp_path: Path, monkeypatch) -> None:

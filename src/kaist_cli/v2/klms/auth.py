@@ -840,8 +840,12 @@ class AuthService:
         while time.monotonic() < auth_deadline:
             now = time.monotonic()
             current_url = str(page.url or "")
+            lowered_url = current_url.lower()
             current_html = _safe_page_content(page) if _looks_like_easy_login_page(current_url) else None
             approved = False
+
+            if "/auth/kaist/user/device/view" in lowered_url:
+                _evaluate_easy_login_policy_payload({"code": "SS0099"})
 
             if current_html:
                 error_message = _extract_easy_login_error_message(current_html)
@@ -922,7 +926,7 @@ class AuthService:
             try:
                 signals = _EasyLoginSignals()
                 page = context.new_page()
-                page.on("response", lambda response: _observe_easy_login_response(signals, response))
+                context.on("response", lambda response: _observe_easy_login_response(signals, response))
                 page.goto(config.base_url, wait_until="domcontentloaded", timeout=30_000)
                 html = _safe_page_content(page) or ""
                 current_url = str(page.url or "")
