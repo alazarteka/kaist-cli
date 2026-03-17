@@ -25,7 +25,7 @@ from kaist_cli.v2.klms import dashboard as dashboard_module
 from kaist_cli.v2.klms.auth import AuthService
 from kaist_cli.v2.klms.auth import _EasyLoginSignals, _extract_easy_login_error_message, _extract_easy_login_number, _extract_sso_login_view_url, looks_login_url
 from kaist_cli.v2.klms.assignments import _extract_assignment_detail_from_html, _extract_assignment_rows_from_calendar_data, _filter_assignments
-from kaist_cli.v2.klms.courses import _course_is_current_term, _discover_courses_from_dashboard, _parse_recent_courses_payload
+from kaist_cli.v2.klms.courses import _course_is_current_term, _course_matches_query, _discover_courses_from_dashboard, _parse_recent_courses_payload
 from kaist_cli.v2.klms.capture import _courseboard_runtime_capture_summary, _extract_courseboard_js_hints
 from kaist_cli.v2.klms.config import load_config
 from kaist_cli.v2.klms.dashboard import DashboardService, _build_inbox_items, _decorate_today_assignments, _filter_inbox_assignments, _select_recent_notices
@@ -1065,6 +1065,54 @@ def test_extract_course_ids_from_dashboard_prefers_non_noise_courses() -> None:
     ) == ["180871", "178434"]
 
 
+def test_extract_course_ids_from_dashboard_falls_back_to_termless_current_courses() -> None:
+    html = """
+    <html><body>
+      <select name="year"><option selected>2026</option></select>
+      <select name="semester"><option selected>Spring</option></select>
+      <a href="/course/view.php?id=178223">General Chemistry Experiment I(CH.10002)</a>
+      <a href="/course/view.php?id=180871">Introduction to Algorithms(CS.30000)</a>
+      <a href="/course/view.php?id=147806">Exam Bank</a>
+    </body></html>
+    """
+    assert _extract_course_ids_from_dashboard(
+        html,
+        base_url="https://klms.kaist.ac.kr",
+        configured_ids=(),
+        exclude_patterns=(),
+    ) == ["178223", "180871"]
+
+
+def test_extract_course_ids_from_dashboard_does_not_append_unrelated_configured_ids_when_filtered() -> None:
+    html = """
+    <html><body>
+      <select name="year"><option selected>2026</option></select>
+      <select name="semester"><option selected>Spring</option></select>
+      <a href="/course/view.php?id=178223">General Chemistry Experiment I(CH.10002)</a>
+      <a href="/course/view.php?id=180871">Introduction to Algorithms(CS.30000)</a>
+    </body></html>
+    """
+    assert _extract_course_ids_from_dashboard(
+        html,
+        base_url="https://klms.kaist.ac.kr",
+        configured_ids=("180871", "178434"),
+        exclude_patterns=(),
+        course_query="178223",
+    ) == ["178223"]
+
+
+def test_course_matches_query_accepts_numeric_course_id() -> None:
+    course = Course(
+        id="178223",
+        title="General Chemistry Experiment I",
+        url="https://klms.kaist.ac.kr/course/view.php?id=178223",
+        course_code="CH.10002",
+        course_code_base="CH.10002",
+        term_label=None,
+    )
+    assert _course_matches_query(course, "178223") is True
+
+
 def test_parse_notice_items_from_soup_skips_hidden_rows() -> None:
     soup = BeautifulSoup(
         """
@@ -1225,6 +1273,34 @@ def test_extract_file_items_from_html_skips_video_and_captures_js_helper() -> No
     assert items[3].kind == "page"
 
 
+def test_extract_file_items_from_html_parses_onclick_downloadfile_nodes() -> None:
+    html = """
+    <html><body>
+      <li class="activity resource modtype_resource" id="module-1205280">
+        <div class="activityinstance">
+          <div class="aalink cursor-pointer" onclick="M.course.format.downloadFile('https://klms.kaist.ac.kr/pluginfile.php/1839743/mod_resource/content/0/intro.pdf', 'intro.pdf')">
+            <span class="instancename cursor-pointer">Introduction<span class="accesshide"> File</span></span>
+          </div>
+        </div>
+      </li>
+    </body></html>
+    """
+    items = _extract_file_items_from_html(
+        html,
+        base_url="https://klms.kaist.ac.kr",
+        course_id="180871",
+        course_title="Introduction to Algorithms",
+        course_code="CS.30000",
+        auth_mode="profile",
+        source="html:course-view",
+    )
+    assert len(items) == 1
+    assert items[0].id == "1205280"
+    assert items[0].title == "Introduction"
+    assert items[0].downloadable is True
+    assert items[0].download_url == "https://klms.kaist.ac.kr/pluginfile.php/1839743/mod_resource/content/0/intro.pdf"
+
+
 def test_extract_file_items_from_course_contents_prefers_api_metadata() -> None:
     items = _extract_file_items_from_course_contents(
         [
@@ -1353,6 +1429,64 @@ def test_synthesize_file_item_from_url_preserves_direct_downloads() -> None:
     assert item.downloadable is True
     assert item.filename == "CS30000_Written_Assignment1.pdf"
     assert item.download_url == item.url
+
+
+def test_file_course_map_falls_back_to_termless_dashboard_courses(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        service = FileService(paths, AuthService(paths))
+        bootstrap = SimpleNamespace(
+            dashboard_html="""
+            <html><body>
+              <select name="year"><option selected>2026</option></select>
+              <select name="semester"><option selected>Spring</option></select>
+              <a href="/course/view.php?id=180871">Introduction to Algorithms(CS.30000)</a>
+              <a href="/course/view.php?id=178223">General Chemistry Experiment I(CH.10002)</a>
+            </body></html>
+            """
+        )
+        course_map = service._course_map_for_request(
+            bootstrap=bootstrap,
+            config=config,
+            course_id=None,
+            course_query=None,
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert set(course_map.keys()) == {"180871", "178223"}
+
+
+def test_resolve_target_item_rejects_non_material_url(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        service = FileService(paths, AuthService(paths))
+        monkeypatch.setattr(service, "_list_html", lambda **kwargs: [])
+        with pytest.raises(CommandError) as exc_info:
+            service._resolve_target_item(
+                context=object(),
+                config=config,
+                auth_mode="profile",
+                target="https://klms.kaist.ac.kr/course/view.php?id=178223",
+            )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert exc_info.value.code == "CONFIG_INVALID"
 
 
 def test_sanitize_relpath_drops_parent_segments() -> None:

@@ -17,13 +17,11 @@ from .cache import load_cache_entry, load_cache_value, save_cache_value
 from .config import KlmsConfig, abs_url, load_config
 from .courses import (
     _course_code_base,
-    _course_is_current_term,
     _course_matches_query,
-    _discover_courses_from_dashboard,
     _extract_course_code_from_resource_index,
-    _extract_current_term_from_dashboard,
     _is_noise_course,
     _norm_text,
+    _select_dashboard_courses,
 )
 from .deadline import RefreshDeadline
 from .models import FileItem
@@ -124,6 +122,20 @@ def _extract_module_from_url(url: str) -> tuple[str | None, str | None]:
     return (match.group(1) if match else None), (module_id_text or None)
 
 
+def _extract_module_id_from_node(node: Any) -> str | None:
+    current = node
+    for _ in range(8):
+        if current is None:
+            break
+        attrs = getattr(current, "attrs", None) or {}
+        raw_id = str(attrs.get("id") or "").strip()
+        match = re.search(r"(?:^|[^0-9])module-(\d+)$", raw_id)
+        if match:
+            return match.group(1)
+        current = getattr(current, "parent", None)
+    return None
+
+
 def _looks_like_direct_file_url(url: str) -> bool:
     lowered = url.lower()
     return "pluginfile.php" in lowered or "forcedownload=1" in lowered or bool(
@@ -134,6 +146,13 @@ def _looks_like_direct_file_url(url: str) -> bool:
 def _looks_like_url_candidate(value: str) -> bool:
     text = str(value or "").strip()
     return text.startswith(("http://", "https://", "/")) or any(token in text for token in (".php", "pluginfile.php", "/mod/"))
+
+
+def _looks_like_material_target_url(url: str) -> bool:
+    if _looks_like_direct_file_url(url):
+        return True
+    module, module_id = _extract_module_from_url(url)
+    return bool(module_id and module in ALLOWED_MODULES)
 
 
 def _extract_material_title_from_page(html: str) -> str | None:
@@ -156,7 +175,14 @@ def _course_map_from_dashboard(html: str, *, base_url: str, configured_ids: tupl
             "course_code": course.course_code,
             "term_label": course.term_label,
         }
-        for course in _discover_courses_from_dashboard(html, base_url=base_url)
+        for course in _select_dashboard_courses(
+            html,
+            base_url=base_url,
+            exclude_patterns=(),
+            course_query=None,
+            include_past=True,
+            allow_termless_fallback=True,
+        )
     }
     for configured_id in configured_ids:
         course_id = str(configured_id).strip()
@@ -282,8 +308,40 @@ def _extract_file_items_from_html(
         if item is not None:
             out.append(item)
 
+    for node in soup.select("[onclick*='downloadFile(']"):
+        onclick = _html.unescape(str(node.get("onclick") or "")).strip()
+        match = re.search(
+            r"downloadFile\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+)['\"]\s*\)",
+            onclick,
+        )
+        if not match:
+            continue
+        url = abs_url(base_url, _html.unescape(match.group(1)))
+        title = _norm_text(node.get_text(" ", strip=True))
+        title = re.sub(r"\bFile\s*$", "", title, flags=re.IGNORECASE).strip() or _clean_html_text(match.group(2))
+        item = _build_file_item(
+            url=url,
+            title=title,
+            course_id=course_id,
+            course_title=course_title,
+            course_code=course_code,
+            auth_mode=auth_mode,
+            source="html:downloadFile-js",
+            confidence=0.74,
+        )
+        if item is not None:
+            out.append(
+                replace(
+                    item,
+                    id=item.id or _extract_module_id_from_node(node),
+                    filename=item.filename or _norm_text(_html.unescape(match.group(2))) or _filename_from_url(url),
+                    download_url=url,
+                    downloadable=True,
+                )
+            )
+
     for match in re.finditer(
-        r"downloadFile\(\s*['\"]([^'\"]+?/mod/[^'\"]+?/view\.php\?id=\d+)['\"]\s*,\s*['\"](.+?)['\"]\s*\)",
+        r"downloadFile\(\s*(?:&#0*39;|['\"])([^'\"<]+?)(?:&#0*39;|['\"])\s*,\s*(?:&#0*39;|['\"])(.+?)(?:&#0*39;|['\"])\s*\)",
         html,
         flags=re.DOTALL,
     ):
@@ -811,6 +869,7 @@ class FileService:
         self,
         *,
         course_id: str | None = None,
+        course_query: str | None = None,
         limit: int | None = None,
         subdir: str | None = None,
         if_exists: str = "skip",
@@ -831,7 +890,7 @@ class FileService:
                 config=config,
                 auth_mode=auth_mode,
                 course_id=course_id,
-                course_query=None,
+                course_query=course_query,
                 limit=limit,
                 bootstrap=bootstrap,
             )
@@ -915,6 +974,7 @@ class FileService:
             payload = {
                 "root": str(base_root),
                 "course_id": str(course_id).strip() or None if course_id else None,
+                "course_query": str(course_query).strip() or None if course_query else None,
                 "if_exists": if_exists,
                 "requested_limit": limit,
                 "candidate_count": len(candidates),
@@ -988,40 +1048,36 @@ class FileService:
         course_query: str | None = None,
     ) -> dict[str, dict[str, str | None]]:
         course_map = _course_map_from_dashboard(bootstrap.dashboard_html, base_url=config.base_url, configured_ids=config.course_ids)
-        current_term_label = _extract_current_term_from_dashboard(bootstrap.dashboard_html)
         if course_id:
             target = str(course_id).strip()
             course_meta = course_map.get(target) or {"course_id": target, "course_title": None, "course_code": None, "term_label": None}
             return {target: course_meta}
+        discovered = _select_dashboard_courses(
+            bootstrap.dashboard_html,
+            base_url=config.base_url,
+            exclude_patterns=config.exclude_course_title_patterns,
+            course_query=course_query,
+            include_past=False,
+            allow_termless_fallback=True,
+        )
+        selected_ids = {str(course.id).strip() for course in discovered if str(course.id).strip()}
         return {
             key: value
             for key, value in course_map.items()
-            if not _is_noise_course(str(value.get("course_title") or ""), config.exclude_course_title_patterns)
+            if key in selected_ids
+            and not _is_noise_course(str(value.get("course_title") or ""), config.exclude_course_title_patterns)
             and _course_matches_query(
                 type(
                     "_CourseQueryCarrier",
                     (),
                     {
+                        "id": key,
                         "title": str(value.get("course_title") or ""),
                         "course_code": value.get("course_code"),
                         "course_code_base": _course_code_base(str(value.get("course_code") or "").strip() or None),
                     },
                 ),
                 course_query,
-            )
-            and _course_is_current_term(
-                type(
-                    "_CourseTermCarrier",
-                    (),
-                    {
-                        "title": str(value.get("course_title") or ""),
-                        "course_code": value.get("course_code"),
-                        "course_code_base": _course_code_base(str(value.get("course_code") or "").strip() or None),
-                        "term_label": value.get("term_label"),
-                    },
-                ),
-                current_term_label,
-                include_past=False,
             )
         }
 
@@ -1313,6 +1369,13 @@ class FileService:
                     selected = item
                     break
             if selected is None:
+                if not _looks_like_material_target_url(normalized_url):
+                    raise CommandError(
+                        code="CONFIG_INVALID",
+                        message=f"Not a KLMS file/material URL: {target}",
+                        hint="Pass a direct file URL or a file/module ID returned by `kaist klms files list`.",
+                        exit_code=40,
+                    )
                 selected = _synthesize_file_item_from_url(
                     normalized_url,
                     course_id=None,

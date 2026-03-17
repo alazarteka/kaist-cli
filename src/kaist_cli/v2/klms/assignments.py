@@ -19,6 +19,7 @@ from .courses import (
     _extract_current_term_from_dashboard,
     _is_noise_course,
     _norm_text,
+    _select_dashboard_courses,
     _term_label_from_course_code,
 )
 from .deadline import RefreshDeadline
@@ -119,15 +120,15 @@ def _discover_current_term_course_ids_from_dashboard(
     exclude_patterns: tuple[str, ...],
     include_past: bool,
 ) -> list[str]:
-    current_term_label = _extract_current_term_from_dashboard(html)
-    discovered = _discover_courses_from_dashboard(html, base_url=base_url)
-    out: list[str] = []
-    for course in discovered:
-        if _is_noise_course(course.title, exclude_patterns):
-            continue
-        if not _course_is_current_term(course, current_term_label, include_past=include_past):
-            continue
-        out.append(str(course.id).strip())
+    discovered = _select_dashboard_courses(
+        html,
+        base_url=base_url,
+        exclude_patterns=exclude_patterns,
+        course_query=None,
+        include_past=include_past,
+        allow_termless_fallback=True,
+    )
+    out = [str(course.id).strip() for course in discovered if str(course.id).strip()]
     if include_past:
         out.extend(str(course_id).strip() for course_id in configured_ids if str(course_id).strip())
     seen: set[str] = set()

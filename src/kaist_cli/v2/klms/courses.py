@@ -77,7 +77,9 @@ def _course_matches_query(course: Course, query: str | None) -> bool:
     needle = _norm_text(str(query or "")).lower()
     if not needle:
         return True
+    course_id = str(getattr(course, "id", "") or "").strip() or None
     haystacks = (
+        course_id,
         course.title,
         course.course_code,
         course.course_code_base,
@@ -91,6 +93,41 @@ def _course_is_current_term(course: Course, current_term_label: str | None, *, i
     if not course.term_label:
         return False
     return _norm_text(course.term_label).lower() == _norm_text(current_term_label).lower()
+
+
+def _select_dashboard_courses(
+    html: str,
+    *,
+    base_url: str,
+    exclude_patterns: tuple[str, ...],
+    course_query: str | None = None,
+    include_past: bool = False,
+    allow_termless_fallback: bool = False,
+) -> list[Course]:
+    current_term_label = _extract_current_term_from_dashboard(html)
+    current_term_courses: list[Course] = []
+    termless_courses: list[Course] = []
+    all_courses: list[Course] = []
+    for course in _discover_courses_from_dashboard(html, base_url=base_url):
+        if _is_noise_course(course.title, exclude_patterns):
+            continue
+        if not _course_matches_query(course, course_query):
+            continue
+        if include_past:
+            all_courses.append(course)
+            continue
+        if _course_is_current_term(course, current_term_label, include_past=False):
+            current_term_courses.append(course)
+            continue
+        if allow_termless_fallback and not course.term_label:
+            termless_courses.append(course)
+    if include_past:
+        return all_courses
+    if current_term_courses:
+        return current_term_courses
+    if allow_termless_fallback:
+        return termless_courses
+    return []
 
 
 def _is_noise_course(title: str, exclude_patterns: tuple[str, ...]) -> bool:

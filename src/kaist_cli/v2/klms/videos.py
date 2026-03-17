@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 from ..contracts import CommandError, CommandResult
 from .auth import AuthService, looks_logged_out_html, looks_login_url
 from .config import KlmsConfig, abs_url, load_config
-from .courses import _course_code_base, _course_is_current_term, _course_matches_query, _discover_courses_from_dashboard, _extract_current_term_from_dashboard, _is_noise_course, _norm_text
+from .courses import _course_code_base, _course_matches_query, _discover_courses_from_dashboard, _is_noise_course, _norm_text, _select_dashboard_courses
 from .models import Video
 from .paths import KlmsPaths
 from .session import KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
@@ -414,40 +414,36 @@ class VideoService:
         course_query: str | None = None,
     ) -> dict[str, dict[str, str | None]]:
         course_map = _course_map_from_dashboard(bootstrap.dashboard_html, base_url=config.base_url, configured_ids=config.course_ids)
-        current_term_label = _extract_current_term_from_dashboard(bootstrap.dashboard_html)
         if course_id:
             target = str(course_id).strip()
             course_meta = course_map.get(target) or {"course_id": target, "course_title": None, "course_code": None, "term_label": None}
             return {target: course_meta}
+        discovered = _select_dashboard_courses(
+            bootstrap.dashboard_html,
+            base_url=config.base_url,
+            exclude_patterns=config.exclude_course_title_patterns,
+            course_query=course_query,
+            include_past=False,
+            allow_termless_fallback=True,
+        )
+        selected_ids = {str(course.id).strip() for course in discovered if str(course.id).strip()}
         return {
             key: value
             for key, value in course_map.items()
+            if key in selected_ids
             if not _is_noise_course(str(value.get("course_title") or ""), config.exclude_course_title_patterns)
             and _course_matches_query(
                 type(
                     "_CourseQueryCarrier",
                     (),
                     {
+                        "id": key,
                         "title": str(value.get("course_title") or ""),
                         "course_code": value.get("course_code"),
                         "course_code_base": _course_code_base(str(value.get("course_code") or "").strip() or None),
                     },
                 ),
                 course_query,
-            )
-            and _course_is_current_term(
-                type(
-                    "_CourseTermCarrier",
-                    (),
-                    {
-                        "title": str(value.get("course_title") or ""),
-                        "course_code": value.get("course_code"),
-                        "course_code_base": _course_code_base(str(value.get("course_code") or "").strip() or None),
-                        "term_label": value.get("term_label"),
-                    },
-                ),
-                current_term_label,
-                include_past=False,
             )
         }
 

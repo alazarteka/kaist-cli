@@ -170,6 +170,7 @@ class KlmsFacade:
         self,
         *,
         notice_board_id: str | None = None,
+        course_id: str | None = None,
         course_query: str | None = None,
         max_pages: int = 1,
         since_iso: str | None = None,
@@ -177,6 +178,7 @@ class KlmsFacade:
     ) -> CommandResult:
         return self._notices.list(
             notice_board_id=notice_board_id,
+            course_id=course_id,
             course_query=course_query,
             max_pages=max_pages,
             since_iso=since_iso,
@@ -188,6 +190,7 @@ class KlmsFacade:
         notice_id: str,
         *,
         notice_board_id: str | None = None,
+        course_id: str | None = None,
         course_query: str | None = None,
         max_pages: int = 3,
         include_html: bool = False,
@@ -195,6 +198,7 @@ class KlmsFacade:
         return self._notices.show(
             notice_id,
             notice_board_id=notice_board_id,
+            course_id=course_id,
             course_query=course_query,
             max_pages=max_pages,
             include_html=include_html,
@@ -220,11 +224,12 @@ class KlmsFacade:
         self,
         *,
         course_id: str | None = None,
+        course_query: str | None = None,
         limit: int | None = None,
         subdir: str | None = None,
         if_exists: str = "skip",
     ) -> CommandResult:
-        return self._files.pull(course_id=course_id, limit=limit, subdir=subdir, if_exists=if_exists)
+        return self._files.pull(course_id=course_id, course_query=course_query, limit=limit, subdir=subdir, if_exists=if_exists)
 
     def list_videos(
         self,

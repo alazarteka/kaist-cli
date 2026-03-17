@@ -12,7 +12,7 @@ from .auth import AuthService, looks_logged_out_html, looks_login_url
 from .cache import list_cache_entries, load_cache_entry, save_cache_value
 from .assignments import _attachment_filename_from_url, _looks_like_attachment_url, _parse_datetime_guess
 from .config import KlmsConfig, abs_url, load_config
-from .courses import _course_is_current_term, _course_matches_query, _discover_courses_from_dashboard, _extract_current_term_from_dashboard, _is_noise_course, _norm_text
+from .courses import _norm_text, _select_dashboard_courses
 from .deadline import RefreshDeadline
 from .models import Notice
 from .paths import KlmsPaths
@@ -32,24 +32,23 @@ def _extract_course_ids_from_dashboard(
     configured_ids: tuple[str, ...],
     exclude_patterns: tuple[str, ...],
     course_query: str | None = None,
+    course_id: str | None = None,
 ) -> list[str]:
-    current_term_ids: list[str] = []
-    termless_ids: list[str] = []
-    current_term_label = _extract_current_term_from_dashboard(html)
-    for course in _discover_courses_from_dashboard(html, base_url=base_url):
-        if _is_noise_course(course.title, exclude_patterns):
-            continue
-        if not _course_matches_query(course, course_query):
-            continue
-        course_id = str(course.id).strip()
-        if not course_id:
-            continue
-        if _course_is_current_term(course, current_term_label, include_past=False):
-            current_term_ids.append(course_id)
-        elif not course.term_label:
-            termless_ids.append(course_id)
-    out = current_term_ids or termless_ids
-    out.extend(str(course_id).strip() for course_id in configured_ids if str(course_id).strip())
+    if course_id:
+        target = str(course_id).strip()
+        out = [target] if target else []
+    else:
+        discovered = _select_dashboard_courses(
+            html,
+            base_url=base_url,
+            exclude_patterns=exclude_patterns,
+            course_query=course_query,
+            include_past=False,
+            allow_termless_fallback=True,
+        )
+        out = [str(course.id).strip() for course in discovered if str(course.id).strip()]
+    if not course_id and not course_query:
+        out.extend(str(configured_id).strip() for configured_id in configured_ids if str(configured_id).strip())
     seen: set[str] = set()
     deduped: list[str] = []
     for value in out:
@@ -670,6 +669,7 @@ class NoticeService:
         config: KlmsConfig,
         auth_mode: str,
         notice_board_id: str | None = None,
+        course_id: str | None = None,
         course_query: str | None = None,
         max_pages: int = 1,
         since_iso: str | None = None,
@@ -687,6 +687,7 @@ class NoticeService:
             config=config,
             auth_mode=auth_mode,
             notice_board_id=notice_board_id,
+            course_id=course_id,
             course_query=course_query,
             max_pages=max_pages,
             since_iso=since_iso,
@@ -702,6 +703,7 @@ class NoticeService:
         config: KlmsConfig,
         auth_mode: str,
         notice_board_id: str | None = None,
+        course_id: str | None = None,
         course_query: str | None = None,
         max_pages: int = 1,
         since_iso: str | None = None,
@@ -720,6 +722,7 @@ class NoticeService:
             context=context,
             config=config,
             explicit_board_id=notice_board_id,
+            course_id=course_id,
             course_query=course_query,
             bootstrap=bootstrap,
             deadline=deadline,
@@ -907,12 +910,14 @@ class NoticeService:
         config: KlmsConfig,
         auth_mode: str,
         max_pages: int = 1,
+        course_id: str | None = None,
         bootstrap: KlmsSessionBootstrap | None = None,
     ) -> ProviderLoad:
         return self.load_for_dashboard(
             context=context,
             config=config,
             auth_mode=auth_mode,
+            course_id=course_id,
             max_pages=max_pages,
             bootstrap=bootstrap,
             deadline=None,
@@ -923,6 +928,7 @@ class NoticeService:
         self,
         *,
         notice_board_id: str | None = None,
+        course_id: str | None = None,
         course_query: str | None = None,
         max_pages: int = 1,
         since_iso: str | None = None,
@@ -937,6 +943,7 @@ class NoticeService:
                 config=config,
                 auth_mode=auth_mode,
                 notice_board_id=notice_board_id,
+                course_id=course_id,
                 course_query=course_query,
                 max_pages=max_pages,
                 since_iso=since_iso,
@@ -956,6 +963,7 @@ class NoticeService:
         notice_id: str,
         *,
         notice_board_id: str | None = None,
+        course_id: str | None = None,
         course_query: str | None = None,
         max_pages: int = 3,
         include_html: bool = False,
@@ -976,6 +984,7 @@ class NoticeService:
                 context=context,
                 config=config,
                 explicit_board_id=notice_board_id,
+                course_id=course_id,
                 course_query=course_query,
                 bootstrap=bootstrap,
             )
@@ -994,6 +1003,7 @@ class NoticeService:
                     config=config,
                     auth_mode=auth_mode,
                     notice_board_id=None,
+                    course_id=course_id,
                     course_query=course_query,
                     max_pages=max_pages,
                     since_iso=None,
@@ -1089,6 +1099,7 @@ class NoticeService:
         config: KlmsConfig,
         auth_mode: str,
         notice_board_id: str | None,
+        course_id: str | None,
         course_query: str | None,
         max_pages: int,
         since_iso: str | None,
@@ -1105,6 +1116,7 @@ class NoticeService:
             context=context,
             config=config,
             explicit_board_id=notice_board_id,
+            course_id=course_id,
             course_query=course_query,
             bootstrap=bootstrap,
         )
@@ -1268,6 +1280,7 @@ class NoticeService:
         context: Any,
         config: KlmsConfig,
         explicit_board_id: str | None,
+        course_id: str | None = None,
         course_query: str | None = None,
         bootstrap: KlmsSessionBootstrap | None = None,
         deadline: RefreshDeadline | None = None,
@@ -1291,6 +1304,7 @@ class NoticeService:
             configured_ids=config.course_ids,
             exclude_patterns=config.exclude_course_title_patterns,
             course_query=course_query,
+            course_id=course_id,
         )
         if not course_ids:
             cached_board_ids = self._fallback_notice_board_ids_from_cache(self._paths, config)

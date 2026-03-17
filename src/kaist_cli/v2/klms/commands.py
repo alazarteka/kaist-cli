@@ -64,6 +64,7 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
     if args.group == "notices" and args.action == "list":
         return facade.list_notices(
             notice_board_id=args.notice_board_id,
+            course_id=args.course_id,
             course_query=args.course,
             max_pages=args.max_pages,
             since_iso=args.since_iso,
@@ -73,6 +74,7 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
         return facade.show_notice(
             args.notice_id,
             notice_board_id=args.notice_board_id,
+            course_id=args.course_id,
             course_query=args.course,
             max_pages=args.max_pages,
             include_html=args.include_html,
@@ -91,6 +93,7 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
     if args.group == "files" and args.action == "pull":
         return facade.pull_files(
             course_id=args.course_id,
+            course_query=args.course,
             limit=args.limit,
             subdir=args.subdir,
             if_exists=args.if_exists,
