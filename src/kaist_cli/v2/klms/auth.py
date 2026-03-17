@@ -276,13 +276,7 @@ def _evaluate_easy_login_policy_payload(payload: dict[str, Any]) -> str:
         return "success"
 
     if code == "SS0099":
-        raise CommandError(
-            code="AUTH_FLOW_UNSUPPORTED",
-            message="KAIST SSO requires device registration before Easy Login can complete.",
-            hint="Complete the device verification flow in the browser, then retry Easy Login.",
-            exit_code=10,
-            retryable=False,
-        )
+        return "device_registration"
     if code == "SS0007":
         raise CommandError(
             code="AUTH_FLOW_UNSUPPORTED",
@@ -342,6 +336,31 @@ def _submit_easy_login_link(page: Any) -> bool:
         )
     except Exception:
         return False
+
+
+def _complete_easy_login_device_registration(page: Any) -> bool:
+    try:
+        submitted = bool(
+            page.evaluate(
+                """
+                () => {
+                  if (typeof setDevice === "function") {
+                    setDevice();
+                    return true;
+                  }
+                  const link = document.querySelector('a[href="javascript:setDevice();"]');
+                  if (!link) return false;
+                  link.click();
+                  return true;
+                }
+                """
+            )
+        )
+        if submitted:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def storage_state_cookie_stats(paths: KlmsPaths) -> dict[str, Any] | None:
@@ -835,6 +854,7 @@ class AuthService:
         last_auth_check = 0.0
         policy_success_at: float | None = None
         submitted_link_form = False
+        completed_device_registration = False
         printed_login_number = login_number
 
         while time.monotonic() < auth_deadline:
@@ -845,7 +865,21 @@ class AuthService:
             approved = False
 
             if "/auth/kaist/user/device/view" in lowered_url:
-                _evaluate_easy_login_policy_payload({"code": "SS0099"})
+                if not completed_device_registration:
+                    completed_device_registration = _complete_easy_login_device_registration(page)
+                if not completed_device_registration:
+                    raise CommandError(
+                        code="AUTH_FLOW_UNSUPPORTED",
+                        message="KAIST SSO requires device registration before Easy Login can complete.",
+                        hint="Use the manual browser login flow once to complete the device-registration step.",
+                        exit_code=10,
+                        retryable=False,
+                    )
+                try:
+                    page.wait_for_timeout(250)
+                except Exception:
+                    pass
+                continue
 
             if current_html:
                 error_message = _extract_easy_login_error_message(current_html)
@@ -870,6 +904,8 @@ class AuthService:
                         policy_state = _evaluate_easy_login_policy_payload(signals.latest_policy_payload)
                         if policy_state == "success" and policy_success_at is None:
                             policy_success_at = now
+                        elif policy_state == "device_registration":
+                            approved = True
 
             if (
                 policy_success_at is not None

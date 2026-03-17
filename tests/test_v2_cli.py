@@ -444,13 +444,72 @@ def test_wait_for_easy_login_approval_times_out_on_repeated_waiting_state(tmp_pa
     assert getattr(error, "code", None) == "AUTH_TIMEOUT"
 
 
-def test_wait_for_easy_login_approval_fails_fast_on_device_registration_page(tmp_path: Path, monkeypatch) -> None:
+def test_wait_for_easy_login_approval_completes_device_registration_and_succeeds(tmp_path: Path, monkeypatch) -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = "https://sso.kaist.ac.kr/auth/kaist/user/device/view"
+            self.registered = False
+
+        def wait_for_timeout(self, ms: int) -> None:  # noqa: ARG002
+            return None
+
+        def evaluate(self, script: str) -> bool:  # noqa: ARG002
+            self.registered = True
+            self.url = "https://sso.kaist.ac.kr/auth/kaist/user/device/login"
+            return True
+
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        auth = AuthService(paths)
+        page = FakePage()
+        signals = _EasyLoginSignals(latest_mfa_payload={"result": True, "error_code": ""})
+        monkeypatch.setattr(auth_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
+        monkeypatch.setattr(auth, "_persist_context_state", lambda context: None)
+        monkeypatch.setattr(
+            auth,
+            "_context_dashboard_state",
+            lambda context, *, config, timeout_ms: {  # type: ignore[no-untyped-def]
+                "authenticated": page.registered,
+                "final_url": config.base_url.rstrip("/") + config.dashboard_path,
+                "html": "<html></html>",
+            },
+        )
+        result = auth._wait_for_easy_login_approval(
+            page=page,
+            context=object(),
+            config=config,
+            username="student123",
+            wait_seconds=20.0,
+            login_number="50",
+            signals=signals,
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result.data["username"] == "student123"
+    assert page.registered is True
+
+
+def test_wait_for_easy_login_approval_errors_if_device_registration_fails(tmp_path: Path, monkeypatch) -> None:
     class FakePage:
         def __init__(self) -> None:
             self.url = "https://sso.kaist.ac.kr/auth/kaist/user/device/view"
 
         def wait_for_timeout(self, ms: int) -> None:  # noqa: ARG002
-            raise AssertionError("device-registration path should fail before waiting")
+            raise AssertionError("device-registration path should fail before waiting again")
+
+        def evaluate(self, script: str) -> bool:  # noqa: ARG002
+            raise RuntimeError("js disabled")
+
+        def goto(self, url: str, **kwargs: Any) -> None:  # noqa: ARG002
+            raise RuntimeError("navigation blocked")
 
     old_home = os.environ.get("KAIST_CLI_HOME")
     os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
