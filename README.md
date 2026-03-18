@@ -71,7 +71,6 @@ Other systems:
 - `kaist version`
 - `kaist update --check`
 - `kaist update`
-- `kaist portal status`
 
 ## Output Modes
 
