@@ -26,7 +26,6 @@ class SystemRegistry:
 
 def default_registry() -> SystemRegistry:
     from ..systems.klms.adapter import KlmsAdapter
-    from ..systems.portal.adapter import PortalAdapter
     from ..systems.update.adapter import UpdateAdapter
     from ..systems.version.adapter import VersionAdapter
 
@@ -34,5 +33,5 @@ def default_registry() -> SystemRegistry:
     registry.register(VersionAdapter())
     registry.register(UpdateAdapter())
     registry.register(KlmsAdapter())
-    registry.register(PortalAdapter())
+    # PortalAdapter disabled — scaffold only, no implemented functionality yet
     return registry

@@ -16,10 +16,6 @@ def test_registry_registers_core_and_system_commands() -> None:
     assert args_update.system == "update"
     assert callable(args_update.handler)
 
-    args_portal = parser.parse_args(["portal", "status"])
-    assert args_portal.system == "portal"
-    assert callable(args_portal.handler)
-
     args_klms = parser.parse_args(["klms", "courses", "list"])
     assert args_klms.system == "klms"
     assert args_klms.group == "courses"

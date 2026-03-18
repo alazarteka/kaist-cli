@@ -102,14 +102,6 @@ def test_sync_status_works_without_klms_config(tmp_path: Path) -> None:
     assert payload["data"]["providers"]["files"]["entry_count"] == 0
 
 
-def test_portal_scaffold_command(tmp_path: Path) -> None:
-    cp = run_cli(tmp_path, "--agent", "portal", "status")
-    assert cp.returncode == 0
-    payload = json.loads(cp.stdout)
-    assert payload["ok"] is True
-    assert payload["schema"] == "kaist.portal.status.v1"
-    assert payload["data"]["implemented"] is False
-
 
 def test_version_command_schema(tmp_path: Path) -> None:
     cp = run_cli(tmp_path, "--agent", "version")
