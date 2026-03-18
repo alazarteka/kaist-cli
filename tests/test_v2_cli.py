@@ -172,6 +172,55 @@ def test_auth_refresh_uses_saved_auth_username(tmp_path: Path, monkeypatch) -> N
             os.environ["KAIST_CLI_HOME"] = old_home
 
 
+def test_run_authenticated_configures_playwright_env_before_launch(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        _write_storage_state(tmp_path)
+        paths = resolve_paths()
+        auth = AuthService(paths)
+        config = load_config(paths)
+        calls: list[str] = []
+
+        def fake_configure(paths_arg):  # type: ignore[no-untyped-def]
+            calls.append("configure")
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(paths_arg.playwright_browsers_dir)
+            return paths_arg.playwright_browsers_dir
+
+        class FakePlaywrightContext:
+            def __enter__(self):  # type: ignore[no-untyped-def]
+                calls.append("sync_playwright")
+                assert os.environ.get("PLAYWRIGHT_BROWSERS_PATH") == str(paths.playwright_browsers_dir)
+                return SimpleNamespace()
+
+            def __exit__(self, exc_type, exc, tb):  # type: ignore[no-untyped-def]
+                return False
+
+        monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+        monkeypatch.setattr(auth_module, "configure_playwright_env", fake_configure)
+        monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: FakePlaywrightContext())
+        monkeypatch.setattr(auth_module, "_launch_chromium_persistent_context_sync", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stop")))
+        monkeypatch.setattr(auth_module, "_launch_chromium_browser_sync", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("stop")))
+
+        with pytest.raises(CommandError) as exc_info:
+            auth.run_authenticated(
+                config=config,
+                headless=True,
+                accept_downloads=False,
+                timeout_seconds=1.0,
+                callback=lambda context, auth_mode: None,
+            )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert exc_info.value.code == "AUTH_EXPIRED"
+    assert calls[:2] == ["configure", "sync_playwright"]
+
+
 def test_dev_plan_json_envelope(tmp_path: Path) -> None:
     cp = run_v2(tmp_path, "--json", "klms", "dev", "plan")
     assert cp.returncode == 0, cp.stderr

@@ -1154,6 +1154,7 @@ class AuthService:
                 retryable=True,
             )
 
+        configure_playwright_env(self._paths)
         timeout_ms = max(1_000, int(timeout_seconds * 1000))
         attempts: list[dict[str, Any]] = []
 
