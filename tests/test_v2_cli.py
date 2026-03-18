@@ -612,6 +612,57 @@ def test_wait_for_easy_login_approval_tolerates_page_content_error_during_naviga
     assert result.data["username"] == "student123"
 
 
+def test_wait_for_easy_login_approval_succeeds_from_authenticated_context_page(tmp_path: Path, monkeypatch) -> None:
+    class ClosedSsoPage:
+        @property
+        def url(self) -> str:
+            raise RuntimeError("page closed")
+
+        def content(self) -> str:
+            raise RuntimeError("page closed")
+
+        def wait_for_timeout(self, ms: int) -> None:  # noqa: ARG002
+            raise RuntimeError("page closed")
+
+    class AuthenticatedKlmsPage:
+        def __init__(self) -> None:
+            self.url = "https://klms.kaist.ac.kr/my/"
+
+        def content(self) -> str:
+            return "<html><body>dashboard</body></html>"
+
+    class FakeContext:
+        def __init__(self) -> None:
+            self.pages = [ClosedSsoPage(), AuthenticatedKlmsPage()]
+
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        auth = AuthService(paths)
+        persisted: list[bool] = []
+        monkeypatch.setattr(auth, "_persist_context_state", lambda context: persisted.append(True))
+        result = auth._wait_for_easy_login_approval(
+            page=ClosedSsoPage(),
+            context=FakeContext(),
+            config=config,
+            username="student123",
+            wait_seconds=20.0,
+            login_number="50",
+            signals=_EasyLoginSignals(latest_mfa_payload={"result": True}),
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert persisted == [True]
+    assert result.data["username"] == "student123"
+
+
 def test_easy_login_registers_response_listener_on_context(tmp_path: Path, monkeypatch) -> None:
     import playwright.sync_api as playwright_sync_api  # type: ignore[import-untyped]
 

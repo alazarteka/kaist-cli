@@ -182,6 +182,14 @@ def _safe_page_content(page: Any) -> str | None:
         return None
 
 
+def _safe_page_url(page: Any) -> str | None:
+    try:
+        url = str(page.url or "").strip()
+    except Exception:
+        return None
+    return url or None
+
+
 def _looks_like_easy_login_verification_page(html: str) -> bool:
     lowered = (html or "").lower()
     return any(
@@ -361,6 +369,21 @@ def _complete_easy_login_device_registration(page: Any) -> bool:
     except Exception:
         pass
     return False
+
+
+def _page_has_authenticated_klms_session(page: Any, *, config: KlmsConfig) -> bool:
+    url = _safe_page_url(page)
+    if not url:
+        return False
+    base_url = config.base_url.rstrip("/")
+    if not url.startswith(base_url):
+        return False
+    if looks_login_url(url):
+        return False
+    html = _safe_page_content(page)
+    if html is None:
+        return True
+    return not looks_logged_out_html(html)
 
 
 def storage_state_cookie_stats(paths: KlmsPaths) -> dict[str, Any] | None:
@@ -839,6 +862,12 @@ class AuthService:
             capability="full",
         )
 
+    def _context_has_authenticated_page(self, context: Any, *, config: KlmsConfig) -> bool:
+        pages = getattr(context, "pages", None)
+        if not isinstance(pages, list):
+            return False
+        return any(_page_has_authenticated_klms_session(page, config=config) for page in pages)
+
     def _wait_for_easy_login_approval(
         self,
         *,
@@ -859,10 +888,16 @@ class AuthService:
 
         while time.monotonic() < auth_deadline:
             now = time.monotonic()
-            current_url = str(page.url or "")
+            current_url = _safe_page_url(page) or ""
             lowered_url = current_url.lower()
-            current_html = _safe_page_content(page) if _looks_like_easy_login_page(current_url) else None
+            current_html = None
+            if _looks_like_easy_login_page(current_url) or current_url.startswith(config.base_url.rstrip("/")):
+                current_html = _safe_page_content(page)
             approved = False
+
+            if _page_has_authenticated_klms_session(page, config=config) or self._context_has_authenticated_page(context, config=config):
+                self._persist_context_state(context)
+                return self._easy_login_success_result(config=config, username=username, login_number=printed_login_number)
 
             if "/auth/kaist/user/device/view" in lowered_url:
                 if not completed_device_registration:
@@ -931,6 +966,9 @@ class AuthService:
             try:
                 page.wait_for_timeout(int(EASY_LOGIN_POLL_SECONDS * 1000))
             except Exception:
+                if self._context_has_authenticated_page(context, config=config):
+                    self._persist_context_state(context)
+                    return self._easy_login_success_result(config=config, username=username, login_number=printed_login_number)
                 state = self._context_dashboard_state(context, config=config, timeout_ms=5_000)
                 if state["authenticated"]:
                     self._persist_context_state(context)
@@ -959,10 +997,11 @@ class AuthService:
                 headless=True,
                 accept_downloads=False,
             )
+            signals = _EasyLoginSignals()
+            response_listener = lambda response: _observe_easy_login_response(signals, response)  # noqa: E731
             try:
-                signals = _EasyLoginSignals()
                 page = context.new_page()
-                context.on("response", lambda response: _observe_easy_login_response(signals, response))
+                context.on("response", response_listener)
                 page.goto(config.base_url, wait_until="domcontentloaded", timeout=30_000)
                 html = _safe_page_content(page) or ""
                 current_url = str(page.url or "")
@@ -999,6 +1038,10 @@ class AuthService:
                     signals=signals,
                 )
             finally:
+                try:
+                    context.remove_listener("response", response_listener)
+                except Exception:
+                    pass
                 context.close()
 
     def login(
