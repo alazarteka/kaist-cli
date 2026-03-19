@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import html as _html
 import re
+import sys
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +43,18 @@ FILE_AJAX_HEADERS = {
     "Content-Type": "application/json",
     "X-Requested-With": "XMLHttpRequest",
 }
+
+
+def _emit_pull_progress(index: int, total: int, title: str, *, status: str | None = None, detail: str | None = None) -> None:
+    prefix = f"[{index}/{total}]"
+    safe_title = " ".join(str(title or "unnamed item").split()) or "unnamed item"
+    if status is None:
+        message = f"{prefix} downloading {safe_title} ..."
+    else:
+        message = f"{prefix} {status} {safe_title}"
+        if detail:
+            message += f" ({detail})"
+    print(message, file=sys.stderr, flush=True)
 
 
 def _clean_html_text(raw: str) -> str:
@@ -906,7 +919,9 @@ class FileService:
             base_root = self._paths.files_root / _sanitize_relpath(subdir) if subdir else self._paths.files_root
             base_root.mkdir(parents=True, exist_ok=True)
 
-            for item in candidates:
+            total = len(candidates)
+            for index, item in enumerate(candidates, start=1):
+                _emit_pull_progress(index, total, item.title)
                 target_subdir = _pull_subdir_for_item(item, base_subdir=subdir)
                 try:
                     result = self._download_resolved_item(
@@ -920,6 +935,7 @@ class FileService:
                     )
                 except CommandError as exc:
                     failed_count += 1
+                    _emit_pull_progress(index, total, item.title, status="failed", detail=exc.message)
                     results.append(
                         {
                             "status": "failed",
@@ -933,6 +949,7 @@ class FileService:
                     continue
                 except Exception as exc:  # noqa: BLE001
                     failed_count += 1
+                    _emit_pull_progress(index, total, item.title, status="failed", detail=str(exc))
                     results.append(
                         {
                             "status": "failed",
@@ -947,6 +964,7 @@ class FileService:
 
                 if bool(result.get("skipped")):
                     skipped_count += 1
+                    _emit_pull_progress(index, total, item.title, status="skipped", detail=str(result.get("reason") or "exists"))
                     results.append(
                         {
                             "status": "skipped",

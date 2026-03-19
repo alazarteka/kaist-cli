@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -23,6 +24,18 @@ from .validate import looks_klms_error_html
 NOTICE_BOARD_TTL_SECONDS = 6 * 3600
 NOTICE_LIST_TTL_SECONDS = 5 * 60
 MAX_NOTICE_HTTP_WORKERS = 4
+
+
+def _emit_pull_progress(index: int, total: int, title: str, *, status: str | None = None, detail: str | None = None) -> None:
+    prefix = f"[{index}/{total}]"
+    safe_title = " ".join(str(title or "unnamed attachment").split()) or "unnamed attachment"
+    if status is None:
+        message = f"{prefix} downloading {safe_title} ..."
+    else:
+        message = f"{prefix} {status} {safe_title}"
+        if detail:
+            message += f" ({detail})"
+    print(message, file=sys.stderr, flush=True)
 
 
 def _extract_course_ids_from_dashboard(
@@ -1199,17 +1212,22 @@ class NoticeService:
             base_root = self._paths.files_root / _sanitize_relpath(subdir) if subdir else self._paths.files_root
             base_root.mkdir(parents=True, exist_ok=True)
 
+            total = sum(1 for notice in notices for attachment in notice.attachments if str(attachment.get("url") or "").strip())
+            current = 0
             for notice in notices:
                 for index, attachment in enumerate(notice.attachments):
                     attachment_url = str(attachment.get("url") or "").strip()
                     if not attachment_url:
                         continue
+                    current += 1
                     candidate_count += 1
                     resolved_course_id = board_to_course.get(str(notice.board_id or "").strip())
                     course_row = course_meta.get(resolved_course_id or "", {})
+                    attachment_title = str(attachment.get("title") or attachment.get("filename") or notice.title or "attachment")
+                    _emit_pull_progress(current, total, attachment_title)
                     item = FileItem(
                         id=f"{notice.id or 'notice'}:{index}",
-                        title=str(attachment.get("title") or attachment.get("filename") or notice.title or "attachment"),
+                        title=attachment_title,
                         url=attachment_url,
                         download_url=attachment_url,
                         filename=str(attachment.get("filename") or _attachment_filename_from_url(attachment_url) or "").strip() or None,
@@ -1236,6 +1254,7 @@ class NoticeService:
                         )
                     except CommandError as exc:
                         failed_count += 1
+                        _emit_pull_progress(current, total, attachment_title, status="failed", detail=exc.message)
                         results.append(
                             {
                                 "status": "failed",
@@ -1251,6 +1270,7 @@ class NoticeService:
                         continue
                     except Exception as exc:
                         failed_count += 1
+                        _emit_pull_progress(current, total, attachment_title, status="failed", detail=str(exc))
                         results.append(
                             {
                                 "status": "failed",
@@ -1267,6 +1287,7 @@ class NoticeService:
 
                     if bool(result.get("skipped")):
                         skipped_count += 1
+                        _emit_pull_progress(current, total, attachment_title, status="skipped", detail=str(result.get("reason") or "exists"))
                         results.append(
                             {
                                 "status": "skipped",
