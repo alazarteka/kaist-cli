@@ -24,6 +24,9 @@ from .versioning import version_string
 GITHUB_API_BASE = "https://api.github.com"
 INSTALL_HINT = "Reinstall using `curl -fsSL https://raw.githubusercontent.com/alazarteka/kaist-cli/main/install.sh | bash`."
 INSTALL_METADATA_FILENAME = "install.json"
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+DOWNLOAD_PROGRESS_PERCENT_STEP = 10
+DOWNLOAD_PROGRESS_BYTES_STEP = 10 * 1024 * 1024
 
 
 class SelfUpdateError(RuntimeError):
@@ -32,6 +35,13 @@ class SelfUpdateError(RuntimeError):
 
 def _progress(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
+
+
+def _stderr_is_tty() -> bool:
+    try:
+        return bool(sys.stderr.isatty())
+    except Exception:
+        return False
 
 
 @dataclass(frozen=True)
@@ -235,9 +245,101 @@ def _download_to_path(url: str, destination: Path) -> None:
 def _sha256(path: Path) -> str:
     hasher = hashlib.sha256()
     with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        for chunk in iter(lambda: handle.read(DOWNLOAD_CHUNK_SIZE), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def _content_length_from_response(response: Any) -> int | None:
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        content_length = headers.get("Content-Length")
+    except Exception:
+        content_length = None
+    if content_length in {None, ""}:
+        return None
+    try:
+        value = int(content_length)
+    except Exception:
+        return None
+    return value if value > 0 else None
+
+
+def _finish_download_progress(*, tty: bool, active: bool) -> None:
+    if tty and active:
+        print(file=sys.stderr, flush=True)
+
+
+def _download_to_path_with_hash(
+    url: str,
+    destination: Path,
+    *,
+    label: str,
+    expected_size: int | None = None,
+) -> tuple[str, int]:
+    request = urllib.request.Request(url, headers={"User-Agent": "kaist-cli-updater"})
+    hasher = hashlib.sha256()
+    bytes_written = 0
+    tty = _stderr_is_tty()
+    used_inline_progress = False
+    last_percent_emitted = -DOWNLOAD_PROGRESS_PERCENT_STEP
+    next_bytes_report = DOWNLOAD_PROGRESS_BYTES_STEP
+
+    def emit_percent(percent: int) -> None:
+        nonlocal used_inline_progress, last_percent_emitted
+        bounded = max(0, min(100, int(percent)))
+        if tty:
+            used_inline_progress = True
+            print(f"\r{label} {bounded:3d}%", end="", file=sys.stderr, flush=True)
+            return
+        if bounded == 100 or bounded >= last_percent_emitted + DOWNLOAD_PROGRESS_PERCENT_STEP:
+            _progress(f"{label} {bounded}%")
+            last_percent_emitted = bounded
+
+    def emit_bytes() -> None:
+        nonlocal next_bytes_report
+        if tty:
+            used_inline_progress = True
+            mib = bytes_written / (1024 * 1024)
+            print(f"\r{label} {mib:.1f} MiB", end="", file=sys.stderr, flush=True)
+            return
+        while bytes_written >= next_bytes_report:
+            mib = next_bytes_report / (1024 * 1024)
+            _progress(f"{label} {mib:.0f} MiB")
+            next_bytes_report += DOWNLOAD_PROGRESS_BYTES_STEP
+
+    try:
+        with _urlopen(request, timeout=60) as response:
+            total_size = expected_size if expected_size and expected_size > 0 else _content_length_from_response(response)
+            if total_size is not None:
+                emit_percent(0)
+            with destination.open("wb") as handle:
+                while True:
+                    chunk = response.read(DOWNLOAD_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    hasher.update(chunk)
+                    bytes_written += len(chunk)
+                    if total_size is not None:
+                        emit_percent((bytes_written * 100) // total_size if total_size > 0 else 100)
+                    else:
+                        emit_bytes()
+            if total_size is not None:
+                emit_percent(100)
+            elif not tty and bytes_written == 0:
+                _progress(f"{label} 0 MiB")
+    except urllib.error.URLError as exc:
+        _finish_download_progress(tty=tty, active=used_inline_progress)
+        raise SelfUpdateError(f"Failed downloading release asset: {exc}") from exc
+    except Exception:
+        _finish_download_progress(tty=tty, active=used_inline_progress)
+        raise
+
+    _finish_download_progress(tty=tty, active=used_inline_progress)
+    return hasher.hexdigest(), bytes_written
 
 
 def parse_checksums(text: str) -> dict[str, str]:
@@ -434,6 +536,22 @@ def _prune_versions(ctx: ManagedInstallContext, keep_roots: set[Path]) -> list[s
     return warnings
 
 
+def _has_prunable_versions(ctx: ManagedInstallContext, keep_roots: set[Path]) -> bool:
+    if not ctx.versions_dir.exists():
+        return False
+    resolved_keep = {root.resolve() for root in keep_roots}
+    for child in ctx.versions_dir.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            if child.resolve() in resolved_keep:
+                continue
+        except OSError:
+            pass
+        return True
+    return False
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -562,16 +680,20 @@ def perform_self_update() -> dict[str, Any]:
         version_dir = ctx.versions_dir / version_tag
         temp_version_dir = ctx.versions_dir / f".{version_tag}.install"
 
-        _progress(f"Downloading {archive_asset.name}...")
-        _download_to_path(archive_asset.browser_download_url, archive_path)
         _download_to_path(checksums_asset.browser_download_url, checksums_path)
-
-        _progress("Verifying download integrity...")
         checksums = parse_checksums(checksums_path.read_text(encoding="utf-8"))
         expected = checksums.get(archive_asset.name)
         if not expected:
             raise SelfUpdateError(f"checksums.txt does not include {archive_asset.name}")
-        actual = _sha256(archive_path)
+
+        _progress(f"Downloading {archive_asset.name}...")
+        actual, _bytes_written = _download_to_path_with_hash(
+            archive_asset.browser_download_url,
+            archive_path,
+            label=f"Downloading {archive_asset.name}...",
+            expected_size=archive_asset.size,
+        )
+        _progress("Verifying download integrity...")
         if actual != expected:
             raise SelfUpdateError(
                 f"Checksum mismatch for {archive_asset.name}: expected {expected}, got {actual}"
@@ -598,9 +720,12 @@ def perform_self_update() -> dict[str, Any]:
     previous_kept = _resolved_symlink(ctx.previous_link)
     if previous_kept is not None:
         keep_roots.add(previous_kept)
+    if _has_prunable_versions(ctx, keep_roots):
+        _progress("Pruning old versions...")
     warnings = _prune_versions(ctx, keep_roots)
     claude_marketplace_path: str | None = None
     try:
+        _progress("Syncing Claude marketplace metadata...")
         claude_marketplace_path = str(_sync_claude_plugin_metadata(ctx.install_root, version=manifest.version))
     except Exception as exc:  # noqa: BLE001
         warnings.append(f"Could not sync Claude plugin marketplace: {exc}")

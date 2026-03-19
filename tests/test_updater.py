@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -63,6 +64,45 @@ def test_release_repo_is_fixed() -> None:
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class _FakeStderr(io.StringIO):
+    def __init__(self, *, tty: bool) -> None:
+        super().__init__()
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+class _FakeHTTPResponse:
+    def __init__(self, payload: bytes, *, headers: dict[str, str] | None = None, chunk_size: int | None = None) -> None:
+        self._payload = payload
+        self._headers = headers or {}
+        self._chunk_size = chunk_size
+        self._offset = 0
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return self._headers
+
+    def read(self, size: int = -1) -> bytes:
+        if self._offset >= len(self._payload):
+            return b""
+        if size is None or size < 0:
+            size = len(self._payload) - self._offset
+        if self._chunk_size is not None:
+            size = min(size, self._chunk_size)
+        start = self._offset
+        end = min(len(self._payload), start + size)
+        self._offset = end
+        return self._payload[start:end]
+
+    def __enter__(self) -> _FakeHTTPResponse:
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        return False
 
 
 def _write_fake_binary(path: Path) -> None:
@@ -137,6 +177,121 @@ def _populate_bundle_root(bundle_root: Path, version: str, *, binary_relpath: st
         + "\n",
         encoding="utf-8",
     )
+
+
+def test_download_to_path_with_hash_matches_sha256(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = (b"kaist-update-payload\n" * 4096) + b"tail"
+    destination = tmp_path / "archive.tar.gz"
+    stderr = _FakeStderr(tty=False)
+    monkeypatch.setattr(updater.sys, "stderr", stderr)
+    monkeypatch.setattr(
+        updater,
+        "_urlopen",
+        lambda request, timeout: _FakeHTTPResponse(
+            payload,
+            headers={"Content-Length": str(len(payload))},
+            chunk_size=8192,
+        ),
+    )
+
+    digest, bytes_written = updater._download_to_path_with_hash(  # type: ignore[attr-defined]
+        "https://example.invalid/archive.tar.gz",
+        destination,
+        label="Downloading archive...",
+        expected_size=len(payload),
+    )
+
+    assert bytes_written == len(payload)
+    assert destination.read_bytes() == payload
+    assert digest == updater._sha256(destination)  # type: ignore[attr-defined]
+
+
+def test_download_to_path_with_hash_reports_percent_progress_for_tty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"x" * (3 * 1024 * 1024)
+    destination = tmp_path / "archive.tar.gz"
+    stderr = _FakeStderr(tty=True)
+    monkeypatch.setattr(updater.sys, "stderr", stderr)
+    monkeypatch.setattr(
+        updater,
+        "_urlopen",
+        lambda request, timeout: _FakeHTTPResponse(
+            payload,
+            headers={"Content-Length": str(len(payload))},
+            chunk_size=1024 * 1024,
+        ),
+    )
+
+    updater._download_to_path_with_hash(  # type: ignore[attr-defined]
+        "https://example.invalid/archive.tar.gz",
+        destination,
+        label="Downloading archive...",
+        expected_size=len(payload),
+    )
+
+    output = stderr.getvalue()
+    assert "\rDownloading archive...   0%" in output
+    assert "\rDownloading archive... 100%" in output
+    assert output.endswith("\n")
+
+
+def test_download_to_path_with_hash_reports_percent_progress_for_non_tty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"x" * (10 * 1024 * 1024)
+    destination = tmp_path / "archive.tar.gz"
+    stderr = _FakeStderr(tty=False)
+    monkeypatch.setattr(updater.sys, "stderr", stderr)
+    monkeypatch.setattr(
+        updater,
+        "_urlopen",
+        lambda request, timeout: _FakeHTTPResponse(
+            payload,
+            headers={"Content-Length": str(len(payload))},
+            chunk_size=1024 * 1024,
+        ),
+    )
+
+    updater._download_to_path_with_hash(  # type: ignore[attr-defined]
+        "https://example.invalid/archive.tar.gz",
+        destination,
+        label="Downloading archive...",
+        expected_size=len(payload),
+    )
+
+    output = stderr.getvalue()
+    assert "Downloading archive... 0%" in output
+    assert "Downloading archive... 10%" in output
+    assert "Downloading archive... 100%" in output
+
+
+def test_download_to_path_with_hash_reports_bytes_when_size_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"x" * (25 * 1024 * 1024)
+    destination = tmp_path / "archive.tar.gz"
+    stderr = _FakeStderr(tty=False)
+    monkeypatch.setattr(updater.sys, "stderr", stderr)
+    monkeypatch.setattr(
+        updater,
+        "_urlopen",
+        lambda request, timeout: _FakeHTTPResponse(payload, headers={}, chunk_size=1024 * 1024),
+    )
+
+    updater._download_to_path_with_hash(  # type: ignore[attr-defined]
+        "https://example.invalid/archive.tar.gz",
+        destination,
+        label="Downloading archive...",
+        expected_size=None,
+    )
+
+    output = stderr.getvalue()
+    assert "Downloading archive... 10 MiB" in output
+    assert "Downloading archive... 20 MiB" in output
 
 
 def test_check_for_update_includes_distribution_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -302,17 +457,28 @@ def test_perform_self_update_switches_current_and_previous(tmp_path: Path, monke
 
     monkeypatch.setattr(updater, "fetch_latest_release", fake_release)
     monkeypatch.setattr(updater, "_current_binary_path", lambda: launcher_link)
+    archive_digest = updater._sha256(archive_path)  # type: ignore[attr-defined]
 
     def fake_download(url: str, destination: Path) -> None:
-        if url == "archive-url":
-            shutil.copy2(archive_path, destination)
-            return
         if url == "checksums-url":
             shutil.copy2(checksums_path, destination)
             return
         raise AssertionError(f"unexpected url: {url}")
 
     monkeypatch.setattr(updater, "_download_to_path", fake_download)
+    monkeypatch.setattr(
+        updater,
+        "_download_to_path_with_hash",
+        lambda url, destination, *, label, expected_size=None: (
+            shutil.copy2(archive_path, destination),
+            (archive_digest, archive_path.stat().st_size),
+        )[1],
+    )
+    monkeypatch.setattr(
+        updater,
+        "_sha256",
+        lambda path: (_ for _ in ()).throw(AssertionError("_sha256 should not be called during self-update")),
+    )
 
     payload = updater.perform_self_update()
 
@@ -361,17 +527,28 @@ def test_perform_self_update_repairs_legacy_default_launcher_from_onefile_layout
         },
     )
     monkeypatch.setattr(updater, "_current_binary_path", lambda: install_root / "current" / "bin" / "kaist")
+    archive_digest = updater._sha256(archive_path)  # type: ignore[attr-defined]
 
     def fake_download(url: str, destination: Path) -> None:
-        if url == "archive-url":
-            shutil.copy2(archive_path, destination)
-            return
         if url == "checksums-url":
             shutil.copy2(checksums_path, destination)
             return
         raise AssertionError(f"unexpected url: {url}")
 
     monkeypatch.setattr(updater, "_download_to_path", fake_download)
+    monkeypatch.setattr(
+        updater,
+        "_download_to_path_with_hash",
+        lambda url, destination, *, label, expected_size=None: (
+            shutil.copy2(archive_path, destination),
+            (archive_digest, archive_path.stat().st_size),
+        )[1],
+    )
+    monkeypatch.setattr(
+        updater,
+        "_sha256",
+        lambda path: (_ for _ in ()).throw(AssertionError("_sha256 should not be called during self-update")),
+    )
 
     payload = updater.perform_self_update()
 
@@ -379,6 +556,49 @@ def test_perform_self_update_repairs_legacy_default_launcher_from_onefile_layout
     assert payload["launcher_path"] == str(launcher_link)
     assert launcher_link.resolve() == (install_root / "current" / "bin" / "kaist" / "kaist").resolve()
     assert json.loads((install_root / "install.json").read_text(encoding="utf-8"))["launcher_path"] == str(launcher_link)
+
+
+def test_perform_self_update_raises_on_checksum_mismatch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    install_root = tmp_path / "managed-install"
+    current_version = install_root / "versions" / "v0.1.4"
+    _populate_bundle_root(current_version, "0.1.4")
+    (install_root / "current").symlink_to(current_version)
+    launcher_link = install_root / "current" / "bin" / "kaist"
+
+    archive_path, checksums_path = _prepare_release_dir(tmp_path / "releases", "v0.1.5", bundle_mode="onedir")
+    monkeypatch.setattr(updater, "platform_target", lambda: "darwin-arm64")
+    monkeypatch.setattr(updater, "version_string", lambda: "0.1.4")
+    monkeypatch.setattr(
+        updater,
+        "fetch_latest_release",
+        lambda: {
+            "tag_name": "v0.1.5",
+            "assets": [
+                {"name": archive_path.name, "browser_download_url": "archive-url", "size": archive_path.stat().st_size},
+                {"name": "checksums.txt", "browser_download_url": "checksums-url", "size": checksums_path.stat().st_size},
+            ],
+        },
+    )
+    monkeypatch.setattr(updater, "_current_binary_path", lambda: launcher_link)
+
+    def fake_download(url: str, destination: Path) -> None:
+        if url == "checksums-url":
+            shutil.copy2(checksums_path, destination)
+            return
+        raise AssertionError(f"unexpected url: {url}")
+
+    monkeypatch.setattr(updater, "_download_to_path", fake_download)
+    monkeypatch.setattr(
+        updater,
+        "_download_to_path_with_hash",
+        lambda url, destination, *, label, expected_size=None: (
+            shutil.copy2(archive_path, destination),
+            ("0" * 64, archive_path.stat().st_size),
+        )[1],
+    )
+
+    with pytest.raises(updater.SelfUpdateError, match="Checksum mismatch"):
+        updater.perform_self_update()
 
 
 def test_prune_versions_returns_warning_on_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
