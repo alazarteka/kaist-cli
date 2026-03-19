@@ -1211,6 +1211,14 @@ class NoticeService:
                 limit=limit,
                 bootstrap=bootstrap,
             )
+            attachment_course_ids = {
+                str(board_to_course.get(str(notice.board_id or "").strip()) or "").strip()
+                for notice in notices
+                for attachment in notice.attachments
+                if str(attachment.get("url") or "").strip()
+            }
+            attachment_course_ids.discard("")
+            include_course_dirs = len(attachment_course_ids) != 1
             downloader = FileService(self._paths, self._auth)
             results: list[dict[str, Any]] = []
             candidate_count = 0
@@ -1248,7 +1256,11 @@ class NoticeService:
                         confidence=0.82,
                         auth_mode=auth_mode,
                     )
-                    target_subdir = _pull_subdir_for_item(item, base_subdir=subdir if dest is None else None)
+                    target_subdir = _pull_subdir_for_item(
+                        item,
+                        base_subdir=None,
+                        include_course_dir=include_course_dirs,
+                    )
                     try:
                         result = downloader.download_item_with_context(
                             context=context,

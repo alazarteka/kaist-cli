@@ -128,7 +128,7 @@ def _slug_component(text: str) -> str:
     return cleaned
 
 
-def _pull_subdir_for_item(item: FileItem, *, base_subdir: str | None) -> str | None:
+def _pull_subdir_for_item(item: FileItem, *, base_subdir: str | None, include_course_dir: bool = True) -> str | None:
     course_key = _slug_component(item.course_code or "") or (f"course-{item.course_id}" if item.course_id else "")
     course_label = _slug_component(item.course_title or "")
     if course_key and course_label and course_label.lower() != course_key.lower():
@@ -137,12 +137,14 @@ def _pull_subdir_for_item(item: FileItem, *, base_subdir: str | None) -> str | N
         course_dir = course_key or course_label
 
     base_path = _sanitize_relpath(base_subdir) if base_subdir else Path()
-    if course_dir:
+    if include_course_dir and course_dir:
         resolved = base_path / course_dir
     else:
         resolved = base_path
     text = str(resolved).strip()
-    return text or None
+    if text in {"", "."}:
+        return None
+    return text
 
 
 def _extract_module_from_url(url: str) -> tuple[str | None, str | None]:
@@ -947,6 +949,8 @@ class FileService:
             candidates = [item for item in items if item.downloadable and str(item.download_url or item.url or "").strip()]
             if limit is not None:
                 candidates = candidates[: max(0, limit)]
+            candidate_course_ids = {str(item.course_id).strip() for item in candidates if str(item.course_id or "").strip()}
+            include_course_dirs = len(candidate_course_ids) != 1
 
             results: list[dict[str, Any]] = []
             downloaded_count = 0
@@ -957,7 +961,11 @@ class FileService:
             total = len(candidates)
             for index, item in enumerate(candidates, start=1):
                 _emit_pull_progress(index, total, item.title)
-                target_subdir = _pull_subdir_for_item(item, base_subdir=subdir if dest is None else None)
+                target_subdir = _pull_subdir_for_item(
+                    item,
+                    base_subdir=None,
+                    include_course_dir=include_course_dirs,
+                )
                 try:
                     result = self._download_resolved_item(
                         context=context,

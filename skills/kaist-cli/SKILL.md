@@ -163,7 +163,7 @@ kaist --agent klms notices attachments pull --course "CS101" --since 2026-03-01
 kaist --agent klms notices attachments pull --course "CS101" --dest ~/Documents/course-materials/CS101-notices
 ```
 
-By default, downloads land under `~/.kaist-cli/files/klms/`. Use `--dest PATH` to write directly into a chosen directory. `--dest` and `--subdir` are mutually exclusive. Use `--if-exists skip` (default) or `--if-exists overwrite` to control re-download behavior.
+By default, downloads land under `~/.kaist-cli/files/klms/`. Use `--dest PATH` to write directly into a chosen directory. `--dest` and `--subdir` are mutually exclusive. Single-course pulls write directly into the chosen target; multi-course or unscoped pulls still create per-course subdirectories. Use `--if-exists skip` (default) or `--if-exists overwrite` to control re-download behavior.
 
 ### Watch lecture videos
 
