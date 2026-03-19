@@ -152,15 +152,18 @@ kaist --agent klms files list
 kaist --agent klms files list --course "CS101"
 kaist --agent klms files get FILE_ID           # metadata only, no download
 kaist --agent klms files download FILE_ID      # download one file
+kaist --agent klms files download FILE_ID --dest ~/Downloads/cs101
 kaist --agent klms files pull                  # bulk mirror all downloadable files
 kaist --agent klms files pull --course "CS101"
+kaist --agent klms files pull --course "CS101" --dest ~/Documents/course-materials/CS101
 
 # Notice attachments
 kaist --agent klms notices attachments pull
 kaist --agent klms notices attachments pull --course "CS101" --since 2026-03-01
+kaist --agent klms notices attachments pull --course "CS101" --dest ~/Documents/course-materials/CS101-notices
 ```
 
-Downloads land under `~/.kaist-cli/files/klms/`. Use `--if-exists skip` (default) or `--if-exists overwrite` to control re-download behavior.
+By default, downloads land under `~/.kaist-cli/files/klms/`. Use `--dest PATH` to write directly into a chosen directory. `--dest` and `--subdir` are mutually exclusive. Use `--if-exists skip` (default) or `--if-exists overwrite` to control re-download behavior.
 
 ### Watch lecture videos
 
@@ -192,6 +195,7 @@ Use `--since` to avoid reprocessing stale assignment, notice, inbox, or attachme
 | `--since ISO` | inbox, assignments, notices, notice attachments | Only items after this timestamp |
 | `--include-past` | courses, assignments | Include previous terms |
 | `--limit N` | most list commands | Cap result count |
+| `--dest PATH` | files download, files pull, notice attachments pull | Write directly to a chosen directory instead of the managed files root |
 
 ## Error handling and recovery
 

@@ -86,6 +86,7 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
             since_iso=args.since_iso,
             limit=args.limit,
             subdir=args.subdir,
+            dest=args.dest,
             if_exists=args.if_exists,
         )
     if args.group == "files" and args.action == "list":
@@ -97,6 +98,7 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
             args.file_id,
             filename=args.filename,
             subdir=args.subdir,
+            dest=args.dest,
             if_exists=args.if_exists,
         )
     if args.group == "files" and args.action == "pull":
@@ -105,6 +107,7 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
             course_query=args.course,
             limit=args.limit,
             subdir=args.subdir,
+            dest=args.dest,
             if_exists=args.if_exists,
         )
     if args.group == "videos" and args.action == "list":

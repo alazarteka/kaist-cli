@@ -212,6 +212,7 @@ class KlmsFacade:
         since_iso: str | None = None,
         limit: int | None = None,
         subdir: str | None = None,
+        dest: str | None = None,
         if_exists: str = "skip",
     ) -> CommandResult:
         return self._notices.pull_attachments(
@@ -220,6 +221,7 @@ class KlmsFacade:
             since_iso=since_iso,
             limit=limit,
             subdir=subdir,
+            dest=dest,
             if_exists=if_exists,
         )
 
@@ -235,9 +237,10 @@ class KlmsFacade:
         *,
         filename: str | None = None,
         subdir: str | None = None,
+        dest: str | None = None,
         if_exists: str = "skip",
     ) -> CommandResult:
-        return self._files.download(file_id_or_url, filename=filename, subdir=subdir, if_exists=if_exists)
+        return self._files.download(file_id_or_url, filename=filename, subdir=subdir, dest=dest, if_exists=if_exists)
 
     def pull_files(
         self,
@@ -246,9 +249,10 @@ class KlmsFacade:
         course_query: str | None = None,
         limit: int | None = None,
         subdir: str | None = None,
+        dest: str | None = None,
         if_exists: str = "skip",
     ) -> CommandResult:
-        return self._files.pull(course_id=course_id, course_query=course_query, limit=limit, subdir=subdir, if_exists=if_exists)
+        return self._files.pull(course_id=course_id, course_query=course_query, limit=limit, subdir=subdir, dest=dest, if_exists=if_exists)
 
     def list_videos(
         self,

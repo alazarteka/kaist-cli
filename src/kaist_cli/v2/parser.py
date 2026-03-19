@@ -230,6 +230,7 @@ def register_klms_parser(
     notices_attachments_pull.add_argument("--since", dest="since_iso", metavar="ISO", help="Only scan notices with posted_iso >= ISO.")
     notices_attachments_pull.add_argument("--limit", type=int, metavar="N", help="Maximum number of notices to scan for attachments.")
     notices_attachments_pull.add_argument("--subdir", metavar="DIR", help="Relative destination under the v2 files root.")
+    notices_attachments_pull.add_argument("--dest", metavar="PATH", help="Write into this directory instead of the managed files root.")
     notices_attachments_pull.add_argument("--if-exists", choices=["skip", "overwrite"], default="skip", help="Behavior when the destination exists.")
     _set_defaults(
         notices_attachments_pull,
@@ -252,6 +253,7 @@ def register_klms_parser(
     files_download.add_argument("file_id", metavar="ID", help="File ID or URL.")
     files_download.add_argument("--filename", metavar="NAME", help="Optional output filename override.")
     files_download.add_argument("--subdir", metavar="DIR", help="Relative destination under the v2 files root.")
+    files_download.add_argument("--dest", metavar="PATH", help="Write into this directory instead of the managed files root.")
     files_download.add_argument("--if-exists", choices=["skip", "overwrite"], default="skip", help="Behavior when the destination exists.")
     _set_defaults(
         files_download,
@@ -264,6 +266,7 @@ def register_klms_parser(
     files_pull.add_argument("--course", metavar="QUERY", help="Filter by course code or title substring.")
     files_pull.add_argument("--limit", type=int, metavar="N", help="Maximum number of downloadable items to pull.")
     files_pull.add_argument("--subdir", metavar="DIR", help="Relative destination under the v2 files root.")
+    files_pull.add_argument("--dest", metavar="PATH", help="Write into this directory instead of the managed files root.")
     files_pull.add_argument("--if-exists", choices=["skip", "overwrite"], default="skip", help="Behavior when the destination exists.")
     _set_defaults(files_pull, schema_name=f"{schema_prefix}.files.pull.v1", command_path="klms files pull", handler=handler)
 

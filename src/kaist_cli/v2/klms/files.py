@@ -103,6 +103,25 @@ def _sanitize_relpath(rel: str) -> Path:
     return Path(*parts)
 
 
+def _resolve_destination_root(*, files_root: Path, subdir: str | None, dest: str | None) -> Path:
+    if subdir and dest:
+        raise CommandError(
+            code="CONFIG_INVALID",
+            message="--subdir and --dest cannot be used together.",
+            hint="Use --dest for an explicit directory, or --subdir for a path under the managed files root.",
+            exit_code=40,
+        )
+    if dest:
+        target = Path(str(dest).strip()).expanduser()
+        if not str(target).strip():
+            raise CommandError(code="CONFIG_INVALID", message="--dest must not be empty.", exit_code=40)
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+    target = files_root / _sanitize_relpath(subdir) if subdir else files_root
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 def _slug_component(text: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text or "").strip())
     cleaned = re.sub(r"_+", "_", cleaned).strip("._-")
@@ -842,8 +861,16 @@ class FileService:
         *,
         filename: str | None = None,
         subdir: str | None = None,
+        dest: str | None = None,
         if_exists: str = "skip",
     ) -> CommandResult:
+        if subdir and dest:
+            raise CommandError(
+                code="CONFIG_INVALID",
+                message="--subdir and --dest cannot be used together.",
+                hint="Use --dest for an explicit directory, or --subdir for a path under the managed files root.",
+                exit_code=40,
+            )
         config = load_config(self._paths)
         target = str(file_id_or_url).strip()
         if not target:
@@ -866,6 +893,7 @@ class FileService:
                 item=item,
                 filename_override=filename,
                 subdir=subdir,
+                dest=dest,
                 if_exists=if_exists,
                 auth_mode=auth_mode,
             )
@@ -886,8 +914,16 @@ class FileService:
         course_query: str | None = None,
         limit: int | None = None,
         subdir: str | None = None,
+        dest: str | None = None,
         if_exists: str = "skip",
     ) -> CommandResult:
+        if subdir and dest:
+            raise CommandError(
+                code="CONFIG_INVALID",
+                message="--subdir and --dest cannot be used together.",
+                hint="Use --dest for an explicit directory, or --subdir for a path under the managed files root.",
+                exit_code=40,
+            )
         config = load_config(self._paths)
         if if_exists not in {"skip", "overwrite"}:
             raise CommandError(code="CONFIG_INVALID", message="if_exists must be 'skip' or 'overwrite'.", exit_code=40)
@@ -916,13 +952,12 @@ class FileService:
             downloaded_count = 0
             skipped_count = 0
             failed_count = 0
-            base_root = self._paths.files_root / _sanitize_relpath(subdir) if subdir else self._paths.files_root
-            base_root.mkdir(parents=True, exist_ok=True)
+            base_root = _resolve_destination_root(files_root=self._paths.files_root, subdir=subdir, dest=dest)
 
             total = len(candidates)
             for index, item in enumerate(candidates, start=1):
                 _emit_pull_progress(index, total, item.title)
-                target_subdir = _pull_subdir_for_item(item, base_subdir=subdir)
+                target_subdir = _pull_subdir_for_item(item, base_subdir=subdir if dest is None else None)
                 try:
                     result = self._download_resolved_item(
                         context=context,
@@ -930,6 +965,7 @@ class FileService:
                         item=item,
                         filename_override=None,
                         subdir=target_subdir,
+                        dest=str(base_root),
                         if_exists=if_exists,
                         auth_mode=auth_mode,
                     )
@@ -997,6 +1033,7 @@ class FileService:
                 "course_id": str(course_id).strip() or None if course_id else None,
                 "course_query": str(course_query).strip() or None if course_query else None,
                 "if_exists": if_exists,
+                "dest": str(base_root) if dest else None,
                 "requested_limit": limit,
                 "candidate_count": len(candidates),
                 "downloaded_count": downloaded_count,
@@ -1508,6 +1545,7 @@ class FileService:
         item: FileItem,
         filename_override: str | None,
         subdir: str | None,
+        dest: str | None,
         if_exists: str,
         auth_mode: str,
     ) -> dict[str, Any]:
@@ -1522,12 +1560,7 @@ class FileService:
                 exit_code=40,
             )
 
-        ensure_dir = self._paths.files_root
-        ensure_dir.mkdir(parents=True, exist_ok=True)
-        out_dir = ensure_dir
-        if subdir:
-            out_dir = ensure_dir / _sanitize_relpath(subdir)
-            out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = _resolve_destination_root(files_root=self._paths.files_root, subdir=subdir, dest=dest)
 
         final_name = str(filename_override or item.filename or _filename_from_url(download_url) or f"download-{item.id or 'file'}").strip()
         out_path = out_dir / final_name
@@ -1615,6 +1648,7 @@ class FileService:
         item: FileItem,
         filename_override: str | None = None,
         subdir: str | None = None,
+        dest: str | None = None,
         if_exists: str = "skip",
         auth_mode: str,
     ) -> dict[str, Any]:
@@ -1624,6 +1658,7 @@ class FileService:
             item=item,
             filename_override=filename_override,
             subdir=subdir,
+            dest=dest,
             if_exists=if_exists,
             auth_mode=auth_mode,
         )

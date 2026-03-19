@@ -91,6 +91,37 @@ def test_notice_attachments_pull_schema_is_stable(tmp_path: Path) -> None:
     assert payload["ok"] is False
 
 
+def test_files_pull_dest_and_subdir_conflict_returns_structured_error(tmp_path: Path) -> None:
+    cp = run_cli(tmp_path, "--agent", "klms", "files", "pull", "--dest", "/tmp/out", "--subdir", "managed")
+    assert cp.returncode == 40
+    payload = json.loads(cp.stdout)
+    assert payload["schema"] == "kaist.klms.files.pull.v1"
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "CONFIG_INVALID"
+
+
+def test_notice_attachments_pull_dest_and_subdir_conflict_returns_structured_error(tmp_path: Path) -> None:
+    cp = run_cli(
+        tmp_path,
+        "--agent",
+        "klms",
+        "notices",
+        "attachments",
+        "pull",
+        "--course-id",
+        "178223",
+        "--dest",
+        "/tmp/out",
+        "--subdir",
+        "managed",
+    )
+    assert cp.returncode == 40
+    payload = json.loads(cp.stdout)
+    assert payload["schema"] == "kaist.klms.notices.attachments.pull.v1"
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "CONFIG_INVALID"
+
+
 def test_sync_status_works_without_klms_config(tmp_path: Path) -> None:
     cp = run_cli(tmp_path, "--agent", "klms", "sync", "status")
     assert cp.returncode == 0

@@ -1151,11 +1151,19 @@ class NoticeService:
         since_iso: str | None = None,
         limit: int | None = None,
         subdir: str | None = None,
+        dest: str | None = None,
         if_exists: str = "skip",
     ) -> CommandResult:
-        from .files import FileService, _pull_subdir_for_item, _sanitize_relpath
+        from .files import FileService, _pull_subdir_for_item, _resolve_destination_root
         from .models import FileItem
 
+        if subdir and dest:
+            raise CommandError(
+                code="CONFIG_INVALID",
+                message="--subdir and --dest cannot be used together.",
+                hint="Use --dest for an explicit directory, or --subdir for a path under the managed files root.",
+                exit_code=40,
+            )
         config = load_config(self._paths)
         if if_exists not in {"skip", "overwrite"}:
             raise CommandError(code="CONFIG_INVALID", message="if_exists must be 'skip' or 'overwrite'.", exit_code=40)
@@ -1209,8 +1217,7 @@ class NoticeService:
             downloaded_count = 0
             skipped_count = 0
             failed_count = 0
-            base_root = self._paths.files_root / _sanitize_relpath(subdir) if subdir else self._paths.files_root
-            base_root.mkdir(parents=True, exist_ok=True)
+            base_root = _resolve_destination_root(files_root=self._paths.files_root, subdir=subdir, dest=dest)
 
             total = sum(1 for notice in notices for attachment in notice.attachments if str(attachment.get("url") or "").strip())
             current = 0
@@ -1241,7 +1248,7 @@ class NoticeService:
                         confidence=0.82,
                         auth_mode=auth_mode,
                     )
-                    target_subdir = _pull_subdir_for_item(item, base_subdir=subdir)
+                    target_subdir = _pull_subdir_for_item(item, base_subdir=subdir if dest is None else None)
                     try:
                         result = downloader.download_item_with_context(
                             context=context,
@@ -1249,6 +1256,7 @@ class NoticeService:
                             item=item,
                             filename_override=None,
                             subdir=target_subdir,
+                            dest=str(base_root),
                             if_exists=if_exists,
                             auth_mode=auth_mode,
                         )
@@ -1323,6 +1331,7 @@ class NoticeService:
                 "course_query": str(course_query).strip() or None if course_query else None,
                 "since_iso": since_iso,
                 "if_exists": if_exists,
+                "dest": str(base_root) if dest else None,
                 "requested_limit": limit,
                 "candidate_count": candidate_count,
                 "downloaded_count": downloaded_count,

@@ -1641,6 +1641,7 @@ def test_download_resolved_item_uses_http_for_direct_file_urls(tmp_path: Path, m
             item=item,
             filename_override=None,
             subdir="pull-http",
+            dest=None,
             if_exists="overwrite",
             auth_mode="profile",
         )
@@ -1652,6 +1653,66 @@ def test_download_resolved_item_uses_http_for_direct_file_urls(tmp_path: Path, m
 
     assert result["transport"] == "http"
     assert calls
+    assert Path(result["path"]).read_bytes() == b"%PDF-http"
+
+
+def test_download_resolved_item_uses_dest_directory(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        service = FileService(paths, AuthService(paths))
+        item = FileItem(
+            id="991",
+            title="Week 1 Slides",
+            url="https://klms.kaist.ac.kr/mod/resource/view.php?id=991",
+            download_url="https://klms.kaist.ac.kr/pluginfile.php/123/week1.pdf?forcedownload=1",
+            filename="week1.pdf",
+            kind="file",
+            downloadable=True,
+            course_id="180871",
+            course_title="Introduction to Algorithms",
+            course_code="CS.30000_2026_1",
+            course_code_base="CS.30000",
+            source="html:file-resolved",
+            confidence=0.8,
+            auth_mode="profile",
+        )
+        dest_root = tmp_path / "downloads" / "course"
+
+        class FakeHttpSession:
+            def __init__(self, context, *, base_url: str) -> None:  # type: ignore[no-untyped-def]
+                assert base_url == "https://klms.kaist.ac.kr"
+
+            def download_to_path(self, url_or_path: str, *, destination: Path, timeout_seconds: float = 120.0):  # type: ignore[no-untyped-def]
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"%PDF-http")
+                return SimpleNamespace(
+                    url=url_or_path,
+                    path=str(destination),
+                    bytes_written=9,
+                )
+
+        monkeypatch.setattr("kaist_cli.v2.klms.files.KlmsHttpSession", FakeHttpSession)
+        result = service._download_resolved_item(
+            context=SimpleNamespace(),
+            config=config,
+            item=item,
+            filename_override=None,
+            subdir=None,
+            dest=str(dest_root),
+            if_exists="overwrite",
+            auth_mode="profile",
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert Path(result["path"]).parent == dest_root
     assert Path(result["path"]).read_bytes() == b"%PDF-http"
 
 
@@ -1725,6 +1786,7 @@ def test_download_resolved_item_falls_back_to_browser_when_http_returns_html(tmp
             item=item,
             filename_override=None,
             subdir="pull-browser",
+            dest=None,
             if_exists="overwrite",
             auth_mode="profile",
         )
@@ -1778,8 +1840,8 @@ def test_files_pull_emits_stderr_progress(tmp_path: Path, monkeypatch) -> None:
 
         monkeypatch.setattr(service._auth, "run_authenticated", fake_run_authenticated)
 
-        def fake_download(*, context, config, item, filename_override=None, subdir=None, if_exists="skip", auth_mode):  # type: ignore[no-untyped-def]
-            out_dir = paths.files_root / (subdir or "")
+        def fake_download(*, context, config, item, filename_override=None, subdir=None, dest=None, if_exists="skip", auth_mode):  # type: ignore[no-untyped-def]
+            out_dir = Path(dest or paths.files_root) / (subdir or "")
             out_dir.mkdir(parents=True, exist_ok=True)
             out_path = out_dir / (item.filename or "file.bin")
             out_path.write_bytes(b"%PDF-http")
@@ -1803,6 +1865,72 @@ def test_files_pull_emits_stderr_progress(tmp_path: Path, monkeypatch) -> None:
 
     assert result.data["downloaded_count"] == 1
     assert "[1/1] downloading Week 1 Slides ..." in stderr.getvalue()
+
+
+def test_files_pull_uses_dest_root(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        service = FileService(paths, AuthService(paths))
+        dest_root = tmp_path / "exports"
+
+        monkeypatch.setattr(
+            "kaist_cli.v2.klms.files.build_session_bootstrap",
+            lambda *args, **kwargs: SimpleNamespace(),
+        )
+        monkeypatch.setattr(
+            service,
+            "_list_html",
+            lambda **kwargs: [
+                FileItem(
+                    id="991",
+                    title="Week 1 Slides",
+                    url="https://klms.kaist.ac.kr/mod/resource/view.php?id=991",
+                    download_url="https://klms.kaist.ac.kr/pluginfile.php/123/week1.pdf?forcedownload=1",
+                    filename="week1.pdf",
+                    kind="file",
+                    downloadable=True,
+                    course_id="180871",
+                    course_title="Introduction to Algorithms",
+                    course_code="CS.30000_2026_1",
+                    course_code_base="CS.30000",
+                    source="html:file-resolved",
+                    confidence=0.8,
+                    auth_mode="profile",
+                )
+            ],
+        )
+
+        def fake_run_authenticated(*, config, headless, accept_downloads, timeout_seconds, callback):  # type: ignore[no-untyped-def]
+            return callback(SimpleNamespace(), "profile")
+
+        monkeypatch.setattr(service._auth, "run_authenticated", fake_run_authenticated)
+
+        def fake_download(*, context, config, item, filename_override=None, subdir=None, dest=None, if_exists="skip", auth_mode):  # type: ignore[no-untyped-def]
+            out_dir = Path(dest or paths.files_root) / (subdir or "")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / (item.filename or "file.bin")
+            out_path.write_bytes(b"%PDF-http")
+            return {
+                "ok": True,
+                "path": str(out_path),
+                "filename": out_path.name,
+                "transport": "http",
+            }
+
+        monkeypatch.setattr(service, "_download_resolved_item", fake_download)
+        result = service.pull(course_id="180871", dest=str(dest_root))
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result.data["dest"] == str(dest_root)
+    assert result.data["root"] == str(dest_root)
+    assert str(dest_root) in result.data["results"][0]["path"]
 
 
 def test_pull_notice_attachments_downloads_attachment_urls(tmp_path: Path, monkeypatch) -> None:
@@ -1854,8 +1982,8 @@ def test_pull_notice_attachments_downloads_attachment_urls(tmp_path: Path, monke
 
         monkeypatch.setattr(service._auth, "run_authenticated", fake_run_authenticated)
 
-        def fake_download(self, *, context, config, item, filename_override=None, subdir=None, if_exists="skip", auth_mode):  # type: ignore[no-untyped-def]
-            out_dir = paths.files_root / (subdir or "")
+        def fake_download(self, *, context, config, item, filename_override=None, subdir=None, dest=None, if_exists="skip", auth_mode):  # type: ignore[no-untyped-def]
+            out_dir = Path(dest or paths.files_root) / (subdir or "")
             out_dir.mkdir(parents=True, exist_ok=True)
             out_path = out_dir / (item.filename or "attachment.bin")
             out_path.write_bytes(b"notice-attachment")
@@ -1880,6 +2008,81 @@ def test_pull_notice_attachments_downloads_attachment_urls(tmp_path: Path, monke
     assert result.data["results"][0]["transport"] == "http"
     assert result.data["results"][0]["course_id"] == "178223"
     assert "CH.10002_2026_1" in result.data["results"][0]["path"]
+
+
+def test_pull_notice_attachments_uses_dest_root(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        service = NoticeService(paths, AuthService(paths))
+        dest_root = tmp_path / "notice-exports"
+
+        monkeypatch.setattr(
+            "kaist_cli.v2.klms.notices.build_session_bootstrap",
+            lambda *args, **kwargs: SimpleNamespace(
+                dashboard_html='<a href="/course/view.php?id=178223">General Chemistry Lab I(CH.10002_2026_1)</a>'
+            ),
+        )
+        monkeypatch.setattr(
+            service,
+            "_resolve_notice_board_map",
+            lambda **kwargs: {"178223": ["838536"]},
+        )
+        monkeypatch.setattr(
+            service,
+            "_list_html",
+            lambda **kwargs: [
+                Notice(
+                    board_id="838536",
+                    id="423326",
+                    title="Lab Manual",
+                    url="https://klms.kaist.ac.kr/mod/courseboard/article.php?id=838536&bwid=423326",
+                    posted_raw="2026-03-16 18:57",
+                    posted_iso="2026-03-16T09:57:00Z",
+                    attachments=(
+                        {
+                            "title": "week1-manual.pdf",
+                            "filename": "week1-manual.pdf",
+                            "url": "https://klms.kaist.ac.kr/pluginfile.php/123/week1-manual.pdf?forcedownload=1",
+                        },
+                    ),
+                    source="html:courseboard-article",
+                    confidence=0.8,
+                    auth_mode="profile",
+                )
+            ],
+        )
+
+        def fake_run_authenticated(*, config, headless, accept_downloads, timeout_seconds, callback):  # type: ignore[no-untyped-def]
+            return callback(SimpleNamespace(), "profile")
+
+        monkeypatch.setattr(service._auth, "run_authenticated", fake_run_authenticated)
+
+        def fake_download(self, *, context, config, item, filename_override=None, subdir=None, dest=None, if_exists="skip", auth_mode):  # type: ignore[no-untyped-def]
+            out_dir = Path(dest or paths.files_root) / (subdir or "")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / (item.filename or "attachment.bin")
+            out_path.write_bytes(b"notice-attachment")
+            return {
+                "ok": True,
+                "path": str(out_path),
+                "filename": out_path.name,
+                "transport": "http",
+            }
+
+        monkeypatch.setattr("kaist_cli.v2.klms.files.FileService.download_item_with_context", fake_download)
+        result = service.pull_attachments(course_id="178223", dest=str(dest_root))
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result.data["dest"] == str(dest_root)
+    assert result.data["root"] == str(dest_root)
+    assert str(dest_root) in result.data["results"][0]["path"]
 
 
 def test_pull_notice_attachments_emits_stderr_progress(tmp_path: Path, monkeypatch) -> None:
@@ -1931,8 +2134,8 @@ def test_pull_notice_attachments_emits_stderr_progress(tmp_path: Path, monkeypat
 
         monkeypatch.setattr(service._auth, "run_authenticated", fake_run_authenticated)
 
-        def fake_download(self, *, context, config, item, filename_override=None, subdir=None, if_exists="skip", auth_mode):  # type: ignore[no-untyped-def]
-            out_dir = paths.files_root / (subdir or "")
+        def fake_download(self, *, context, config, item, filename_override=None, subdir=None, dest=None, if_exists="skip", auth_mode):  # type: ignore[no-untyped-def]
+            out_dir = Path(dest or paths.files_root) / (subdir or "")
             out_dir.mkdir(parents=True, exist_ok=True)
             out_path = out_dir / (item.filename or "attachment.bin")
             out_path.write_bytes(b"notice-attachment")
