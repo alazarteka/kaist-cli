@@ -36,6 +36,13 @@ This installs:
 
 Use `kaist update --check` and `kaist update` to manage release updates.
 
+Optional agent skill install helpers:
+- `kaist agent install codex`
+- `kaist agent install claude`
+- `kaist agent install gemini`
+- `kaist agent install custom --path /target/dir`
+- `kaist agent status`
+
 Linux note:
 - published standalone bundles support `x86_64` glibc hosts only
 - Alpine/musl is not supported
@@ -71,6 +78,7 @@ Other systems:
 - `kaist version`
 - `kaist update --check`
 - `kaist update`
+- `kaist agent install|status|uninstall`
 
 ## Output Modes
 

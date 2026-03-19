@@ -1,3 +1,3 @@
 from __future__ import annotations
 
-__all__ = ["version", "update", "klms"]
+__all__ = ["version", "update", "agent", "klms"]

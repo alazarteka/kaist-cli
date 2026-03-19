@@ -181,6 +181,11 @@ kaist --agent klms videos show VIDEO_ID
 kaist --agent version              # installed version
 kaist update --check               # check for updates
 kaist update                       # self-update
+kaist --agent agent status         # inspect Codex/Claude/Gemini skill installs
+kaist agent install codex          # install into $CODEX_HOME/skills
+kaist agent install claude         # install into ~/.claude/skills
+kaist agent install gemini         # install into ~/.gemini/skills
+kaist agent install custom --path ~/agent-skills
 kaist --agent klms sync reset      # clear cache without touching auth
 ```
 
