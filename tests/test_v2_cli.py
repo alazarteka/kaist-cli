@@ -142,6 +142,41 @@ def test_auth_status_includes_saved_auth_username(tmp_path: Path) -> None:
     assert payload["data"]["config"]["auth_username"] == "student123"
 
 
+def test_notice_cache_fallback_does_not_reuse_narrower_page_span(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        service = NoticeService(paths, AuthService(paths))
+        config = load_config(paths)
+        board_ids = ["1178962", "1178963"]
+        save_cache_value(
+            paths,
+            service._notice_list_cache_key(config, board_ids, 1),
+            [{"id": "notice-1", "attachments": []}],
+            ttl_seconds=600,
+        )
+
+        assert service._load_notice_cache_entry(config=config, board_ids=board_ids, max_pages=3) is None
+
+        save_cache_value(
+            paths,
+            service._notice_list_cache_key(config, board_ids, 3),
+            [{"id": "notice-2", "attachments": [{"url": "https://example.com/a.pdf"}]}],
+            ttl_seconds=600,
+        )
+
+        loaded = service._load_notice_cache_entry(config=config, board_ids=board_ids, max_pages=1)
+        assert loaded is not None
+        assert loaded["value"][0]["id"] == "notice-1"
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+
 def test_auth_refresh_uses_saved_auth_username(tmp_path: Path, monkeypatch) -> None:
     _write_config(tmp_path, auth_username="student123")
     old_home = os.environ.get("KAIST_CLI_HOME")

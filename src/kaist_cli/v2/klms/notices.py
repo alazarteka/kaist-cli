@@ -702,16 +702,25 @@ class NoticeService:
         prefix = f"notice-list-v2::{config.base_url.rstrip('/')}::"
         suffix = f"::{','.join(board_ids)}"
         candidates = list_cache_entries(self._paths, prefixes=(prefix,))
-        matches: list[tuple[float, dict[str, Any]]] = []
+        matches: list[tuple[bool, int, float, dict[str, Any]]] = []
         for key, entry in candidates.items():
             if not str(key).endswith(suffix):
                 continue
+            parts = str(key).split("::", 3)
+            if len(parts) < 4:
+                continue
+            try:
+                cached_max_pages = int(parts[2])
+            except ValueError:
+                continue
+            if cached_max_pages < max_pages:
+                continue
             stored_at = float(entry.get("stored_at") or 0.0)
-            matches.append((stored_at, entry))
+            matches.append((bool(entry.get("stale")), cached_max_pages, -stored_at, entry))
         if not matches:
             return None
-        matches.sort(key=lambda item: (bool(item[1].get("stale")), -item[0]))
-        return matches[0][1]
+        matches.sort(key=lambda item: (item[0], item[1], item[2]))
+        return matches[0][3]
 
     def list_with_context(
         self,
