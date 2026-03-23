@@ -31,8 +31,8 @@ from .provider_state import ProviderLoad
 from .session import KlmsDownloadFallback, KlmsHttpSession, KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
 from .validate import looks_klms_error_html
 
-ALLOWED_MODULES = {"resource", "folder", "url", "page"}
-DOWNLOADABLE_MODULES = {"resource"}
+ALLOWED_MODULES = {"resource", "folder", "url", "page", "coursefile"}
+DOWNLOADABLE_MODULES = {"resource", "coursefile"}
 FILE_LIST_TTL_SECONDS = 15 * 60
 FILE_CONTENT_API_STATUS_SUCCESS_TTL_SECONDS = 6 * 60 * 60
 FILE_CONTENT_API_STATUS_FAILURE_TTL_SECONDS = 30 * 60
@@ -81,6 +81,7 @@ def _looks_like_video_item(title: str, url: str) -> bool:
 def _material_kind_from_module(module: str | None) -> str:
     return {
         "resource": "file",
+        "coursefile": "file",
         "folder": "folder",
         "url": "link",
         "page": "page",

@@ -1437,6 +1437,29 @@ def test_extract_file_items_from_html_parses_onclick_downloadfile_nodes() -> Non
     assert items[0].download_url == "https://klms.kaist.ac.kr/pluginfile.php/1839743/mod_resource/content/0/intro.pdf"
 
 
+def test_extract_file_items_from_html_includes_coursefile_modules() -> None:
+    html = """
+    <html><body>
+      <a href="/mod/coursefile/view.php?id=1212207">Lecture 4</a>
+    </body></html>
+    """
+    items = _extract_file_items_from_html(
+        html,
+        base_url="https://klms.kaist.ac.kr",
+        course_id="178257",
+        course_title="근현대 미국사",
+        course_code="HSS.20015_2026_1",
+        auth_mode="storage_state",
+        source="html:course-view",
+    )
+    assert len(items) == 1
+    assert items[0].id == "1212207"
+    assert items[0].kind == "file"
+    assert items[0].downloadable is True
+    assert items[0].url == "https://klms.kaist.ac.kr/mod/coursefile/view.php?id=1212207"
+    assert items[0].download_url == "https://klms.kaist.ac.kr/mod/coursefile/view.php?id=1212207"
+
+
 def test_extract_file_items_from_course_contents_prefers_api_metadata() -> None:
     items = _extract_file_items_from_course_contents(
         [
@@ -1496,6 +1519,42 @@ def test_extract_file_items_from_course_contents_prefers_api_metadata() -> None:
     assert items[0].source == "api:core_course_get_contents"
     assert items[1].kind == "folder"
     assert items[2].kind == "link"
+
+
+def test_extract_file_items_from_course_contents_includes_coursefile_modules() -> None:
+    items = _extract_file_items_from_course_contents(
+        [
+            {
+                "modules": [
+                    {
+                        "id": 1212207,
+                        "modname": "coursefile",
+                        "name": "Lecture 4",
+                        "url": "https://klms.kaist.ac.kr/mod/coursefile/view.php?id=1212207",
+                        "contents": [
+                            {
+                                "type": "file",
+                                "filename": "Lecture4.docx",
+                                "fileurl": "https://klms.kaist.ac.kr/pluginfile.php/1846902/mod_coursefile/content/0/Lecture4.docx?forcedownload=1",
+                            }
+                        ],
+                    }
+                ]
+            }
+        ],
+        base_url="https://klms.kaist.ac.kr",
+        course_id="178257",
+        course_title="근현대 미국사",
+        course_code="HSS.20015_2026_1",
+        auth_mode="storage_state",
+    )
+    assert len(items) == 1
+    assert items[0].id == "1212207"
+    assert items[0].kind == "file"
+    assert items[0].downloadable is True
+    assert items[0].url == "https://klms.kaist.ac.kr/mod/coursefile/view.php?id=1212207"
+    assert items[0].download_url == "https://klms.kaist.ac.kr/pluginfile.php/1846902/mod_coursefile/content/0/Lecture4.docx?forcedownload=1"
+    assert items[0].filename == "Lecture4.docx"
 
 
 def test_unwrap_moodle_ajax_payload_reports_disabled_service() -> None:
@@ -1564,6 +1623,20 @@ def test_synthesize_file_item_from_url_preserves_direct_downloads() -> None:
     assert item.kind == "file"
     assert item.downloadable is True
     assert item.filename == "CS30000_Written_Assignment1.pdf"
+    assert item.download_url == item.url
+
+
+def test_synthesize_file_item_from_url_marks_coursefile_as_downloadable() -> None:
+    item = _synthesize_file_item_from_url(
+        "https://klms.kaist.ac.kr/mod/coursefile/view.php?id=1212207",
+        course_id=None,
+        course_title=None,
+        course_code=None,
+        auth_mode="storage_state",
+    )
+    assert item.kind == "file"
+    assert item.downloadable is True
+    assert item.id == "1212207"
     assert item.download_url == item.url
 
 
