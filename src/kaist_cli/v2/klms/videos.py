@@ -22,6 +22,7 @@ from .courses import (
     _select_dashboard_courses,
 )
 from .models import Video
+from .media_recency import observe_videos
 from .paths import KlmsPaths
 from .session import KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
 from .validate import looks_klms_error_html
@@ -97,6 +98,8 @@ def _merge_videos(items: list[Video]) -> list[Video]:
             course_title=winner.course_title or loser.course_title,
             course_code=winner.course_code or loser.course_code,
             course_code_base=winner.course_code_base or loser.course_code_base,
+            first_seen_at=winner.first_seen_at or loser.first_seen_at,
+            last_seen_at=winner.last_seen_at or loser.last_seen_at,
             source=winner.source if winner.source == loser.source else "mixed:vod-surface",
             confidence=max(winner.confidence, loser.confidence),
             auth_mode=winner.auth_mode or loser.auth_mode,
@@ -413,9 +416,15 @@ class VideoService:
             if limit is not None and len(_merge_videos(items)) >= limit:
                 break
 
-        deduped = _merge_videos(items)
+        deduped = observe_videos(self._paths, _merge_videos(items))
         if recent:
-            deduped.sort(key=lambda item: int(str(item.id or "0").strip() or "0"), reverse=True)
+            deduped.sort(
+                key=lambda item: (
+                    str(item.first_seen_at or item.last_seen_at or ""),
+                    int(str(item.id or "0").strip() or "0"),
+                ),
+                reverse=True,
+            )
         if limit is not None:
             deduped = deduped[: max(0, limit)]
         return deduped

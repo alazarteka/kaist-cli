@@ -7,6 +7,7 @@ import sys
 import time
 import fcntl
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
@@ -29,10 +30,11 @@ from kaist_cli.v2.klms.assignments import AssignmentService, _extract_assignment
 from kaist_cli.v2.klms.courses import _course_is_current_term, _course_matches_query, _discover_courses_from_dashboard, _parse_recent_courses_payload
 from kaist_cli.v2.klms.capture import _courseboard_runtime_capture_summary, _extract_courseboard_js_hints
 from kaist_cli.v2.klms.config import load_config
-from kaist_cli.v2.klms.dashboard import DashboardService, _build_inbox_items, _decorate_today_assignments, _filter_inbox_assignments, _select_recent_notices
+from kaist_cli.v2.klms.dashboard import DashboardService, _build_inbox_items, _decorate_today_assignments, _filter_inbox_assignments, _filter_inbox_files, _select_materials, _select_recent_notices
 from kaist_cli.v2.klms.discovery import load_recent_courses_args, map_discovery_report
 from kaist_cli.v2.klms.files import FileService, _extract_file_items_from_course_contents, _extract_file_items_from_html, _normalize_file_item_metadata, _pull_subdir_for_item, _sanitize_relpath, _synthesize_file_item_from_url, _unwrap_moodle_ajax_payload
-from kaist_cli.v2.klms.models import Assignment, Course, FileItem, Notice
+from kaist_cli.v2.klms.media_recency import load_media_recency, observe_files, observe_videos
+from kaist_cli.v2.klms.models import Assignment, Course, FileItem, Notice, Video
 from kaist_cli.v2.klms.notices import NoticeService, _discover_notice_board_ids_from_course_page, _extract_course_ids_from_dashboard, _parse_notice_detail_from_html, _parse_notice_items_from_soup
 from kaist_cli.v2.klms.paths import resolve_paths
 from kaist_cli.v2.klms.provider_state import ProviderLoad
@@ -2209,6 +2211,66 @@ def test_video_course_map_matches_recent_course_alias_variant(tmp_path: Path, mo
     assert set(course_map.keys()) == {"178434"}
 
 
+def test_video_list_recent_prefers_first_seen_at_over_id(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        service = VideoService(paths, AuthService(paths))
+        bootstrap = SimpleNamespace(
+            dashboard_html="""
+            <html><body>
+              <select name="year"><option selected>2026</option></select>
+              <select name="semester"><option selected>Spring</option></select>
+              <a href="/course/view.php?id=180871">Introduction to Algorithms(CS.30000_2026_1)</a>
+            </body></html>
+            """,
+            http=object(),
+        )
+        monkeypatch.setattr(
+            "kaist_cli.v2.klms.videos.fetch_html_batch",
+            lambda *_args, **_kwargs: {
+                "/course/view.php?id=180871&section=0": SimpleNamespace(
+                    url="https://klms.kaist.ac.kr/course/view.php?id=180871&section=0",
+                    text="""
+                    <html><body>
+                      <a class="aalink" href="/mod/vod/view.php?id=1205162">Older by id VOD</a>
+                      <a class="aalink" href="/mod/vod/view.php?id=1205161">Newer by seen time VOD</a>
+                    </body></html>
+                    """,
+                )
+            },
+        )
+        monkeypatch.setattr(
+            "kaist_cli.v2.klms.videos.observe_videos",
+            lambda _paths, items: [
+                replace(item, first_seen_at="2026-03-10T00:00:00Z")
+                if str(item.id) == "1205162"
+                else replace(item, first_seen_at="2026-03-20T00:00:00Z")
+                for item in items
+            ],
+        )
+        recent_items = service._list_html(
+            context=object(),
+            config=config,
+            auth_mode="storage_state",
+            course_id="180871",
+            course_query=None,
+            limit=None,
+            recent=True,
+            bootstrap=bootstrap,
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert [item.id for item in recent_items] == ["1205161", "1205162"]
+
+
 def test_resolve_target_item_rejects_non_material_url(tmp_path: Path, monkeypatch) -> None:
     old_home = os.environ.get("KAIST_CLI_HOME")
     os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
@@ -3120,6 +3182,34 @@ def test_build_inbox_items_sorts_recent_items_before_undated_files() -> None:
     assert [item["kind"] for item in items] == ["assignment", "notice", "file"]
 
 
+def test_filter_inbox_files_respects_since_iso_and_drops_undated_rows() -> None:
+    now = datetime.fromisoformat("2026-03-15T12:00:00+09:00")
+    rows = _filter_inbox_files(
+        [
+            {"id": "1", "downloadable": True, "first_seen_at": "2026-03-15T09:00:00+09:00"},
+            {"id": "2", "downloadable": True, "first_seen_at": "2026-03-10T09:00:00+09:00"},
+            {"id": "3", "downloadable": True},
+            {"id": "4", "downloadable": False, "first_seen_at": "2026-03-15T09:00:00+09:00"},
+        ],
+        since_iso="2026-03-14T00:00:00+09:00",
+        now=now,
+    )
+    assert [row["id"] for row in rows] == ["1"]
+
+
+def test_select_materials_prefers_recently_seen_files() -> None:
+    rows = _select_materials(
+        [
+            {"id": "old", "title": "Week 1", "downloadable": True, "course_title": "OS", "first_seen_at": "2026-03-10T09:00:00+09:00"},
+            {"id": "fresh", "title": "Week 2", "downloadable": True, "course_title": "OS", "first_seen_at": "2026-03-15T09:00:00+09:00"},
+            {"id": "undated", "title": "Week 0", "downloadable": True, "course_title": "OS"},
+        ],
+        limit=10,
+    )
+    assert [row["id"] for row in rows] == ["fresh", "old", "undated"]
+    assert rows[0]["hours_since_seen"] >= 0
+
+
 def test_decorate_today_assignments_marks_overdue_and_due_soon() -> None:
     now = datetime.fromisoformat("2026-03-15T12:00:00+09:00")
     rows = _decorate_today_assignments(
@@ -3174,6 +3264,64 @@ def test_cache_round_trip(tmp_path: Path) -> None:
             os.environ.pop("KAIST_CLI_HOME", None)
         else:
             os.environ["KAIST_CLI_HOME"] = old_home
+
+
+def test_media_recency_store_tracks_first_seen_and_last_seen(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        files_once = observe_files(
+            paths,
+            [
+                FileItem(
+                    id="1207628",
+                    title="01-course overview",
+                    url="https://klms.kaist.ac.kr/mod/coursefile/view.php?id=1207628",
+                    download_url="https://klms.kaist.ac.kr/mod/coursefile/view.php?id=1207628",
+                    filename=None,
+                    kind="file",
+                    downloadable=True,
+                    course_id="178434",
+                    course_title="Operating Systems and Lab",
+                    course_code="CS.30300_2026_1",
+                    course_code_base="CS.30300",
+                )
+            ],
+            observed_at="2026-03-20T00:00:00Z",
+        )
+        files_twice = observe_files(paths, files_once, observed_at="2026-03-22T00:00:00Z")
+        videos_once = observe_videos(
+            paths,
+            [
+                Video(
+                    id="1205162",
+                    title="Introduction",
+                    url="https://klms.kaist.ac.kr/mod/vod/view.php?id=1205162",
+                    viewer_url=None,
+                    stream_url=None,
+                    course_id="180871",
+                    course_title="Introduction to Algorithms",
+                    course_code="CS.30000_2026_1",
+                    course_code_base="CS.30000",
+                )
+            ],
+            observed_at="2026-03-20T00:00:00Z",
+        )
+        videos_twice = observe_videos(paths, videos_once, observed_at="2026-03-23T00:00:00Z")
+        store = load_media_recency(paths)
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert files_twice[0].first_seen_at == "2026-03-20T00:00:00Z"
+    assert files_twice[0].last_seen_at == "2026-03-22T00:00:00Z"
+    assert videos_twice[0].first_seen_at == "2026-03-20T00:00:00Z"
+    assert videos_twice[0].last_seen_at == "2026-03-23T00:00:00Z"
+    assert store["files"]
+    assert store["videos"]
 
 
 def test_cache_entry_supports_stale_fallback_metadata(tmp_path: Path) -> None:

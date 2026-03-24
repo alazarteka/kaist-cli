@@ -29,6 +29,7 @@ from .courses import (
 )
 from .deadline import RefreshDeadline
 from .file_metadata import file_extension, guess_mime_type, normalize_filename
+from .media_recency import enrich_files_with_recency, observe_files
 from .models import FileItem
 from .paths import KlmsPaths
 from .provider_state import ProviderLoad
@@ -704,7 +705,10 @@ class FileService:
         cache_key = self._file_list_cache_key(config, list(course_map.keys()))
         cache_entry = load_cache_entry(self._paths, cache_key)
         cached_rows = cache_entry.get("value") if isinstance(cache_entry, dict) else None
-        cached_items = [_normalize_file_item_metadata(FileItem(**row)) for row in cached_rows if isinstance(row, dict)] if isinstance(cached_rows, list) else []
+        cached_items = enrich_files_with_recency(
+            self._paths,
+            [_normalize_file_item_metadata(FileItem(**row)) for row in cached_rows if isinstance(row, dict)] if isinstance(cached_rows, list) else [],
+        )
         cached_items.sort(key=lambda item: (item.course_title or "", item.kind, item.title.lower()))
         cached_limited = cached_items[: max(0, limit)] if limit is not None else cached_items
         cached_source = _file_provider_source(cached_limited)
@@ -1144,7 +1148,10 @@ class FileService:
         cache_key = self._file_list_cache_key(config, list(course_map.keys()))
         cached_rows = load_cache_value(self._paths, cache_key)
         if isinstance(cached_rows, list):
-            cached_items = [_normalize_file_item_metadata(FileItem(**row)) for row in cached_rows if isinstance(row, dict)]
+            cached_items = enrich_files_with_recency(
+                self._paths,
+                [_normalize_file_item_metadata(FileItem(**row)) for row in cached_rows if isinstance(row, dict)],
+            )
             cached_items.sort(key=lambda item: (item.course_title or "", item.kind, item.title.lower()))
             if limit is not None:
                 cached_items = cached_items[: max(0, limit)]
@@ -1230,8 +1237,9 @@ class FileService:
         if limit is not None and sum(1 for item in _merge_file_items(items) if item.downloadable) >= limit:
             deduped = _merge_file_items(items)
             deduped.sort(key=lambda item: (item.course_title or "", item.kind, item.title.lower()))
-            save_cache_value(self._paths, self._file_list_cache_key(config, list(course_map.keys())), [item.to_dict() for item in deduped], ttl_seconds=FILE_LIST_TTL_SECONDS)
-            return deduped
+            observed = observe_files(self._paths, deduped)
+            save_cache_value(self._paths, self._file_list_cache_key(config, list(course_map.keys())), [item.to_dict() for item in observed], ttl_seconds=FILE_LIST_TTL_SECONDS)
+            return observed
 
         course_meta_list = [
             course_meta
@@ -1342,8 +1350,9 @@ class FileService:
 
         deduped = _merge_file_items(items)
         deduped.sort(key=lambda item: (item.course_title or "", item.kind, item.title.lower()))
-        save_cache_value(self._paths, self._file_list_cache_key(config, list(course_map.keys())), [item.to_dict() for item in deduped], ttl_seconds=FILE_LIST_TTL_SECONDS)
-        return deduped
+        observed = observe_files(self._paths, deduped)
+        save_cache_value(self._paths, self._file_list_cache_key(config, list(course_map.keys())), [item.to_dict() for item in observed], ttl_seconds=FILE_LIST_TTL_SECONDS)
+        return observed
 
     def _refresh_file_items_api(
         self,

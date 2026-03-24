@@ -89,6 +89,8 @@ class FileItem:
     course_title: str | None
     course_code: str | None
     course_code_base: str | None
+    first_seen_at: str | None = None
+    last_seen_at: str | None = None
     extension: str | None = None
     mime_type: str | None = None
     source: str = "unknown"
@@ -110,6 +112,8 @@ class Video:
     course_title: str | None
     course_code: str | None
     course_code_base: str | None
+    first_seen_at: str | None = None
+    last_seen_at: str | None = None
     source: str = "unknown"
     confidence: float = 0.0
     auth_mode: str | None = None

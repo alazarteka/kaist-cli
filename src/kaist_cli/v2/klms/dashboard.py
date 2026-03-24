@@ -94,7 +94,9 @@ def _build_inbox_items(
                 "download_url": row.get("download_url"),
                 "course_id": row.get("course_id"),
                 "course_title": row.get("course_title"),
-                "time_iso": None,
+                "time_iso": row.get("first_seen_at"),
+                "first_seen_at": row.get("first_seen_at"),
+                "last_seen_at": row.get("last_seen_at"),
                 "source": row.get("source"),
                 "confidence": row.get("confidence"),
                 "downloadable": row.get("downloadable"),
@@ -127,6 +129,26 @@ def _filter_inbox_assignments(
         if due_dt is None:
             continue
         if floor <= due_dt <= ceiling:
+            out.append(row)
+    return out
+
+
+def _filter_inbox_files(
+    files: list[dict[str, Any]],
+    *,
+    since_iso: str | None,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    floor = _parse_iso_datetime(since_iso, local_tz=now.tzinfo) if since_iso else None
+    out: list[dict[str, Any]] = []
+    for row in files:
+        if not bool(row.get("downloadable")):
+            continue
+        if floor is None:
+            out.append(row)
+            continue
+        seen_dt = _parse_iso_datetime(str(row.get("first_seen_at") or row.get("last_seen_at") or ""), local_tz=now.tzinfo)
+        if seen_dt is not None and seen_dt >= floor:
             out.append(row)
     return out
 
@@ -201,7 +223,18 @@ def _select_recent_notices(
 
 def _select_materials(files: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
     materials = [dict(row) for row in files if bool(row.get("downloadable"))]
-    materials.sort(key=lambda row: (str(row.get("course_title") or ""), str(row.get("title") or "").lower()))
+    local_tz = _local_now().tzinfo
+    for row in materials:
+        seen_dt = _parse_iso_datetime(str(row.get("first_seen_at") or row.get("last_seen_at") or ""), local_tz=local_tz)
+        if seen_dt is not None:
+            row["hours_since_seen"] = round((_local_now() - seen_dt).total_seconds() / 3600, 2)
+    materials.sort(
+        key=lambda row: (
+            -_ranked_timestamp({"time_iso": row.get("first_seen_at") or row.get("last_seen_at")}, local_tz=local_tz),
+            str(row.get("course_title") or ""),
+            str(row.get("title") or "").lower(),
+        )
+    )
     return materials[: max(0, limit)]
 
 
@@ -315,11 +348,12 @@ class DashboardService:
             files_load = loads["files"]
             if files_load.ok:
                 successes.append(files_load)
+            files_data = _filter_inbox_files(files_load.items, since_iso=since_iso, now=now)
 
             items = _build_inbox_items(
                 assignments=assignments_data,
                 notices=notices_load.items,
-                files=files_load.items,
+                files=files_data,
                 limit=limit,
             )
             payload = {
