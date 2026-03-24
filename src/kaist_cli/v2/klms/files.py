@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 
@@ -28,6 +28,7 @@ from .courses import (
     _select_dashboard_courses,
 )
 from .deadline import RefreshDeadline
+from .file_metadata import file_extension, guess_mime_type, normalize_filename
 from .models import FileItem
 from .paths import KlmsPaths
 from .provider_state import ProviderLoad
@@ -92,12 +93,41 @@ def _material_kind_from_module(module: str | None) -> str:
 
 
 def _filename_from_url(url: str | None) -> str | None:
-    if not url:
-        return None
-    try:
-        return Path(unquote(urlparse(url).path or "")).name or None
-    except Exception:
-        return None
+    return normalize_filename(url)
+
+
+def _normalize_material_filename(
+    *,
+    url: str | None,
+    title: str | None,
+    filename: str | None = None,
+) -> str | None:
+    for candidate in (filename, url, title if file_extension(title) else None):
+        normalized = normalize_filename(candidate)
+        if normalized:
+            return normalized
+    return None
+
+
+def _normalize_file_item_metadata(item: FileItem) -> FileItem:
+    direct_url = None
+    for candidate in (item.download_url, item.url):
+        normalized = str(candidate or "").strip() or None
+        if normalized and _looks_like_direct_file_url(normalized):
+            direct_url = normalized
+            break
+    normalized_filename = _normalize_material_filename(
+        url=direct_url,
+        title=item.title,
+        filename=item.filename,
+    )
+    title_with_extension = item.title if file_extension(item.title) else None
+    return replace(
+        item,
+        filename=normalized_filename,
+        extension=file_extension(normalized_filename or direct_url or title_with_extension),
+        mime_type=guess_mime_type(normalized_filename, direct_url, title_with_extension),
+    )
 
 
 def _sanitize_relpath(rel: str) -> Path:
@@ -252,7 +282,7 @@ def _build_file_item(
         return None
     kind = "file" if is_direct_file else _material_kind_from_module(module)
     downloadable = is_direct_file or module in DOWNLOADABLE_MODULES
-    filename = _filename_from_url(url) if is_direct_file else None
+    filename = _normalize_material_filename(url=url, title=title) if is_direct_file else _normalize_material_filename(url=None, title=title)
     normalized_title = _norm_text(title) or filename or (f"material-{module_id}" if module_id else None)
     if not normalized_title:
         return None
@@ -260,21 +290,25 @@ def _build_file_item(
         return None
     if _looks_like_video_item(normalized_title, url) or (filename and _is_video_filename(filename)) or _is_video_url(url):
         return None
-    return FileItem(
-        id=module_id,
-        title=normalized_title,
-        url=url,
-        download_url=url if downloadable else None,
-        filename=filename,
-        kind=kind,
-        downloadable=bool(downloadable),
-        course_id=course_id,
-        course_title=course_title,
-        course_code=course_code,
-        course_code_base=_course_code_base(course_code),
-        source=source,
-        confidence=confidence,
-        auth_mode=auth_mode,
+    return _normalize_file_item_metadata(
+        FileItem(
+            id=module_id,
+            title=normalized_title,
+            url=url,
+            download_url=url if downloadable else None,
+            filename=filename,
+            extension=file_extension(filename or (url if is_direct_file else title)),
+            mime_type=guess_mime_type(filename, url if is_direct_file else None, title if file_extension(title) else None),
+            kind=kind,
+            downloadable=bool(downloadable),
+            course_id=course_id,
+            course_title=course_title,
+            course_code=course_code,
+            course_code_base=_course_code_base(course_code),
+            source=source,
+            confidence=confidence,
+            auth_mode=auth_mode,
+        )
     )
 
 
@@ -296,6 +330,8 @@ def _merge_file_items(items: list[FileItem]) -> list[FileItem]:
             title=winner.title if len(winner.title) >= len(loser.title) else loser.title,
             download_url=winner.download_url or loser.download_url,
             filename=winner.filename or loser.filename,
+            extension=winner.extension or loser.extension,
+            mime_type=winner.mime_type or loser.mime_type,
             course_id=winner.course_id or loser.course_id,
             course_title=winner.course_title or loser.course_title,
             course_code=winner.course_code or loser.course_code,
@@ -304,7 +340,7 @@ def _merge_file_items(items: list[FileItem]) -> list[FileItem]:
             confidence=max(winner.confidence, loser.confidence),
             auth_mode=winner.auth_mode or loser.auth_mode,
         )
-    return list(merged.values())
+    return [_normalize_file_item_metadata(item) for item in merged.values()]
 
 
 def _extract_file_items_from_html(
@@ -377,7 +413,13 @@ def _extract_file_items_from_html(
                 replace(
                     item,
                     id=item.id or _extract_module_id_from_node(node),
-                    filename=item.filename or _norm_text(_html.unescape(match.group(2))) or _filename_from_url(url),
+                    filename=_normalize_material_filename(
+                        url=url,
+                        title=_html.unescape(match.group(2)),
+                        filename=item.filename,
+                    ),
+                    extension=file_extension(item.filename or _html.unescape(match.group(2)) or url),
+                    mime_type=guess_mime_type(item.filename, _html.unescape(match.group(2)), url),
                     download_url=url,
                     downloadable=True,
                 )
@@ -432,6 +474,8 @@ def _synthesize_file_item_from_url(
             url=url,
             download_url=url if _looks_like_direct_file_url(url) else None,
             filename=_filename_from_url(url),
+            extension=file_extension(_filename_from_url(url) or (url if _looks_like_direct_file_url(url) else None)),
+            mime_type=guess_mime_type(_filename_from_url(url), url if _looks_like_direct_file_url(url) else None),
             kind=_material_kind_from_module(module),
             downloadable=_looks_like_direct_file_url(url) or module in DOWNLOADABLE_MODULES,
             course_id=course_id,
@@ -561,26 +605,30 @@ def _extract_file_items_from_course_contents(
             if modname in DOWNLOADABLE_MODULES:
                 download_url = content_file_url or module_url
                 downloadable = bool(download_url)
-                filename = content_filename or _filename_from_url(download_url)
+                filename = _normalize_material_filename(url=download_url, title=title, filename=content_filename)
             kind = _material_kind_from_module(modname)
             if _looks_like_video_item(title, download_url or item_url) or (filename and _is_video_filename(filename)):
                 continue
             out.append(
-                FileItem(
-                    id=module_id,
-                    title=title,
-                    url=item_url,
-                    download_url=download_url,
-                    filename=filename,
-                    kind=kind,
-                    downloadable=downloadable,
-                    course_id=course_id,
-                    course_title=course_title,
-                    course_code=course_code,
-                    course_code_base=_course_code_base(course_code),
-                    source=f"api:{FILE_CONTENTS_METHOD}",
-                    confidence=0.88 if downloadable else 0.82,
-                    auth_mode=auth_mode,
+                _normalize_file_item_metadata(
+                    FileItem(
+                        id=module_id,
+                        title=title,
+                        url=item_url,
+                        download_url=download_url,
+                        filename=filename,
+                        extension=file_extension(filename or (content_file_url if downloadable else title)),
+                        mime_type=guess_mime_type(filename, content_file_url if downloadable else None, title if file_extension(title) else None),
+                        kind=kind,
+                        downloadable=downloadable,
+                        course_id=course_id,
+                        course_title=course_title,
+                        course_code=course_code,
+                        course_code_base=_course_code_base(course_code),
+                        source=f"api:{FILE_CONTENTS_METHOD}",
+                        confidence=0.88 if downloadable else 0.82,
+                        auth_mode=auth_mode,
+                    )
                 )
             )
     return _merge_file_items(out)
@@ -656,7 +704,7 @@ class FileService:
         cache_key = self._file_list_cache_key(config, list(course_map.keys()))
         cache_entry = load_cache_entry(self._paths, cache_key)
         cached_rows = cache_entry.get("value") if isinstance(cache_entry, dict) else None
-        cached_items = [FileItem(**row) for row in cached_rows if isinstance(row, dict)] if isinstance(cached_rows, list) else []
+        cached_items = [_normalize_file_item_metadata(FileItem(**row)) for row in cached_rows if isinstance(row, dict)] if isinstance(cached_rows, list) else []
         cached_items.sort(key=lambda item: (item.course_title or "", item.kind, item.title.lower()))
         cached_limited = cached_items[: max(0, limit)] if limit is not None else cached_items
         cached_source = _file_provider_source(cached_limited)
@@ -1096,7 +1144,7 @@ class FileService:
         cache_key = self._file_list_cache_key(config, list(course_map.keys()))
         cached_rows = load_cache_value(self._paths, cache_key)
         if isinstance(cached_rows, list):
-            cached_items = [FileItem(**row) for row in cached_rows if isinstance(row, dict)]
+            cached_items = [_normalize_file_item_metadata(FileItem(**row)) for row in cached_rows if isinstance(row, dict)]
             cached_items.sort(key=lambda item: (item.course_title or "", item.kind, item.title.lower()))
             if limit is not None:
                 cached_items = cached_items[: max(0, limit)]

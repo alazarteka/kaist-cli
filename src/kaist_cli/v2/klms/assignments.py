@@ -26,6 +26,7 @@ from .courses import (
 )
 from .deadline import RefreshDeadline
 from .discovery import load_json_summary
+from .file_metadata import normalize_filename
 from .models import Assignment
 from .paths import KlmsPaths
 from .provider_state import ProviderLoad
@@ -912,10 +913,7 @@ def _looks_like_attachment_url(url: str) -> bool:
 
 
 def _attachment_filename_from_url(url: str) -> str | None:
-    match = re.search(r"/([^/?#]+)(?:\?|#|$)", url)
-    if not match:
-        return None
-    return match.group(1) or None
+    return normalize_filename(url)
 
 
 def _collect_assignment_attachments(soup: BeautifulSoup, *, base_url: str) -> tuple[dict[str, Any], ...]:

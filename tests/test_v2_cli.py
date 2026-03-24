@@ -31,7 +31,7 @@ from kaist_cli.v2.klms.capture import _courseboard_runtime_capture_summary, _ext
 from kaist_cli.v2.klms.config import load_config
 from kaist_cli.v2.klms.dashboard import DashboardService, _build_inbox_items, _decorate_today_assignments, _filter_inbox_assignments, _select_recent_notices
 from kaist_cli.v2.klms.discovery import load_recent_courses_args, map_discovery_report
-from kaist_cli.v2.klms.files import FileService, _extract_file_items_from_course_contents, _extract_file_items_from_html, _pull_subdir_for_item, _sanitize_relpath, _synthesize_file_item_from_url, _unwrap_moodle_ajax_payload
+from kaist_cli.v2.klms.files import FileService, _extract_file_items_from_course_contents, _extract_file_items_from_html, _normalize_file_item_metadata, _pull_subdir_for_item, _sanitize_relpath, _synthesize_file_item_from_url, _unwrap_moodle_ajax_payload
 from kaist_cli.v2.klms.models import Assignment, Course, FileItem, Notice
 from kaist_cli.v2.klms.notices import NoticeService, _discover_notice_board_ids_from_course_page, _extract_course_ids_from_dashboard, _parse_notice_detail_from_html, _parse_notice_items_from_soup
 from kaist_cli.v2.klms.paths import resolve_paths
@@ -1686,7 +1686,7 @@ def test_parse_notice_detail_from_html_extracts_body_and_attachments() -> None:
         <tr><th>작성자</th><td>Prof. Kim</td></tr>
         <tr><th>작성일</th><td>2026-03-10 09:00</td></tr>
       </table>
-      <div class="article-content"><p>시험 범위를 확인하세요.</p><a href="/pluginfile.php/123/file.pdf">file.pdf</a></div>
+      <div class="article-content"><p>시험 범위를 확인하세요.</p><a href="/pluginfile.php/123/file%20one.pdf">file one.pdf</a></div>
     </body></html>
     """
     notice = _parse_notice_detail_from_html(
@@ -1700,7 +1700,9 @@ def test_parse_notice_detail_from_html_extracts_body_and_attachments() -> None:
     assert notice.title == "Midterm 안내"
     assert notice.author == "Prof. Kim"
     assert notice.detail_available is True
-    assert notice.attachments[0]["filename"] == "file.pdf"
+    assert notice.attachments[0]["filename"] == "file one.pdf"
+    assert notice.attachments[0]["extension"] == "pdf"
+    assert notice.attachments[0]["mime_type"] == "application/pdf"
 
 
 def test_notice_refresh_enriches_returned_items_with_detail_timestamp(tmp_path: Path) -> None:
@@ -1843,6 +1845,9 @@ def test_extract_file_items_from_html_parses_onclick_downloadfile_nodes() -> Non
     assert items[0].id == "1205280"
     assert items[0].title == "Introduction"
     assert items[0].downloadable is True
+    assert items[0].filename == "intro.pdf"
+    assert items[0].extension == "pdf"
+    assert items[0].mime_type == "application/pdf"
     assert items[0].download_url == "https://klms.kaist.ac.kr/pluginfile.php/1839743/mod_resource/content/0/intro.pdf"
 
 
@@ -1867,6 +1872,34 @@ def test_extract_file_items_from_html_includes_coursefile_modules() -> None:
     assert items[0].downloadable is True
     assert items[0].url == "https://klms.kaist.ac.kr/mod/coursefile/view.php?id=1212207"
     assert items[0].download_url == "https://klms.kaist.ac.kr/mod/coursefile/view.php?id=1212207"
+    assert items[0].extension is None
+    assert items[0].mime_type is None
+
+
+def test_normalize_file_item_metadata_clears_cached_coursefile_script_extension() -> None:
+    item = _normalize_file_item_metadata(
+        FileItem(
+            id="1212207",
+            title="Lecture 4",
+            url="https://klms.kaist.ac.kr/mod/coursefile/view.php?id=1212207",
+            download_url="https://klms.kaist.ac.kr/mod/coursefile/view.php?id=1212207",
+            filename=None,
+            extension="php",
+            mime_type="application/x-httpd-php",
+            kind="file",
+            downloadable=True,
+            course_id="178257",
+            course_title="근현대 미국사",
+            course_code="HSS.20015_2026_1",
+            course_code_base="HSS.20015",
+            source="cache",
+            confidence=0.7,
+            auth_mode="storage_state",
+        )
+    )
+    assert item.filename is None
+    assert item.extension is None
+    assert item.mime_type is None
 
 
 def test_extract_file_items_from_course_contents_prefers_api_metadata() -> None:
@@ -1964,6 +1997,8 @@ def test_extract_file_items_from_course_contents_includes_coursefile_modules() -
     assert items[0].url == "https://klms.kaist.ac.kr/mod/coursefile/view.php?id=1212207"
     assert items[0].download_url == "https://klms.kaist.ac.kr/pluginfile.php/1846902/mod_coursefile/content/0/Lecture4.docx?forcedownload=1"
     assert items[0].filename == "Lecture4.docx"
+    assert items[0].extension == "docx"
+    assert items[0].mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 
 def test_unwrap_moodle_ajax_payload_reports_disabled_service() -> None:

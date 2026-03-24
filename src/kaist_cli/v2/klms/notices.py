@@ -25,6 +25,7 @@ from .courses import (
     _select_dashboard_courses,
 )
 from .deadline import RefreshDeadline
+from .file_metadata import file_extension, guess_mime_type
 from .models import Notice
 from .paths import KlmsPaths
 from .provider_state import ProviderLoad
@@ -647,6 +648,8 @@ def _collect_notice_attachments(soup: BeautifulSoup, *, base_url: str) -> tuple[
                 "title": title,
                 "url": url,
                 "filename": _attachment_filename_from_url(url),
+                "extension": file_extension(url),
+                "mime_type": guess_mime_type(url, title),
             }
         )
     return tuple(out)
@@ -1447,6 +1450,12 @@ class NoticeService:
                         url=attachment_url,
                         download_url=attachment_url,
                         filename=str(attachment.get("filename") or _attachment_filename_from_url(attachment_url) or "").strip() or None,
+                        extension=file_extension(str(attachment.get("filename") or attachment_url or "").strip() or None),
+                        mime_type=guess_mime_type(
+                            str(attachment.get("filename") or "").strip() or None,
+                            attachment_url,
+                            attachment_title,
+                        ),
                         kind="file",
                         downloadable=True,
                         course_id=resolved_course_id,
