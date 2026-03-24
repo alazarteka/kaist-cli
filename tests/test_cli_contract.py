@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import fcntl
 from pathlib import Path
 
 
@@ -120,6 +121,38 @@ def test_notice_attachments_pull_dest_and_subdir_conflict_returns_structured_err
     assert payload["schema"] == "kaist.klms.notices.attachments.pull.v1"
     assert payload["ok"] is False
     assert payload["error"]["code"] == "CONFIG_INVALID"
+
+
+def test_agent_reports_concurrent_access_when_profile_lock_is_held(tmp_path: Path) -> None:
+    private_root = tmp_path / "kaist-home" / "private" / "klms"
+    private_root.mkdir(parents=True, exist_ok=True)
+    (private_root / "config.toml").write_text(
+        'base_url = "https://klms.kaist.ac.kr"\n'
+        'dashboard_path = "/my/"\n'
+        'auth_username = ""\n'
+        "course_ids = []\n"
+        "notice_board_ids = []\n"
+        "exclude_course_title_patterns = []\n",
+        encoding="utf-8",
+    )
+    profile_dir = private_root / "profile"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    (profile_dir / "session-cookie").write_text("present", encoding="utf-8")
+
+    lock_handle = open(private_root / ".lock", "a+b")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        cp = run_cli(tmp_path, "--agent", "klms", "courses", "list")
+    finally:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+
+    assert cp.returncode == 20
+    payload = json.loads(cp.stdout)
+    assert payload["ok"] is False
+    assert payload["schema"] == "kaist.klms.courses.list.v1"
+    assert payload["error"]["code"] == "CONCURRENT_ACCESS"
+    assert payload["error"]["retryable"] is True
 
 
 def test_sync_status_works_without_klms_config(tmp_path: Path) -> None:

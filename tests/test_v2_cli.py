@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import time
+import fcntl
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from io import StringIO
@@ -24,7 +25,7 @@ from kaist_cli.v2.klms.cache import load_cache_entry, load_cache_value, save_cac
 from kaist_cli.v2.klms import dashboard as dashboard_module
 from kaist_cli.v2.klms.auth import AuthService
 from kaist_cli.v2.klms.auth import _EasyLoginSignals, _extract_easy_login_error_message, _extract_easy_login_number, _extract_sso_login_view_url, looks_login_url
-from kaist_cli.v2.klms.assignments import _extract_assignment_detail_from_html, _extract_assignment_rows_from_calendar_data, _filter_assignments
+from kaist_cli.v2.klms.assignments import AssignmentService, _extract_assignment_detail_from_html, _extract_assignment_rows_from_calendar_data, _filter_assignments
 from kaist_cli.v2.klms.courses import _course_is_current_term, _course_matches_query, _discover_courses_from_dashboard, _parse_recent_courses_payload
 from kaist_cli.v2.klms.capture import _courseboard_runtime_capture_summary, _extract_courseboard_js_hints
 from kaist_cli.v2.klms.config import load_config
@@ -36,7 +37,7 @@ from kaist_cli.v2.klms.notices import NoticeService, _discover_notice_board_ids_
 from kaist_cli.v2.klms.paths import resolve_paths
 from kaist_cli.v2.klms.provider_state import ProviderLoad
 from kaist_cli.v2.klms.session import KlmsDownloadFallback
-from kaist_cli.v2.klms.videos import _extract_video_items_from_html, _parse_video_detail_from_html, _parse_video_viewer_from_html
+from kaist_cli.v2.klms.videos import VideoService, _extract_video_items_from_html, _parse_video_detail_from_html, _parse_video_viewer_from_html
 
 
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -254,6 +255,69 @@ def test_run_authenticated_configures_playwright_env_before_launch(tmp_path: Pat
 
     assert exc_info.value.code == "AUTH_EXPIRED"
     assert calls[:2] == ["configure", "sync_playwright"]
+
+
+def test_run_authenticated_raises_concurrent_access_when_profile_lock_is_held(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        auth = AuthService(paths)
+        config = load_config(paths)
+        paths.profile_dir.mkdir(parents=True, exist_ok=True)
+        (paths.profile_dir / "session-cookie").write_text("present", encoding="utf-8")
+
+        lock_handle = open(paths.profile_lock_path, "a+b")
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with pytest.raises(CommandError) as exc_info:
+                auth.run_authenticated(
+                    config=config,
+                    headless=True,
+                    accept_downloads=False,
+                    timeout_seconds=1.0,
+                    callback=lambda context, auth_mode: None,
+                )
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            lock_handle.close()
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert exc_info.value.code == "CONCURRENT_ACCESS"
+    assert exc_info.value.retryable is True
+
+
+def test_v2_json_envelope_reports_concurrent_access_when_profile_lock_is_held(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        paths.profile_dir.mkdir(parents=True, exist_ok=True)
+        (paths.profile_dir / "session-cookie").write_text("present", encoding="utf-8")
+
+        lock_handle = open(paths.profile_lock_path, "a+b")
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        cp = run_v2(tmp_path, "--json", "klms", "courses", "list")
+    finally:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert cp.returncode == 20
+    payload = json.loads(cp.stdout)
+    assert payload["ok"] is False
+    assert payload["schema"] == "kaist.klms.courses.list.v1"
+    assert payload["error"]["code"] == "CONCURRENT_ACCESS"
+    assert payload["error"]["retryable"] is True
 
 
 def test_dev_plan_json_envelope(tmp_path: Path) -> None:
@@ -920,6 +984,7 @@ def test_parse_recent_courses_payload_extracts_courses_and_term() -> None:
                     {
                         "id": 183085,
                         "fullname": "전산학특강",
+                        "fullnamedisplay": "Special Topics in CS",
                         "shortname": "CS.49900(F)_2026_1",
                         "viewurl": "https://klms.kaist.ac.kr/course/view.php?id=183085",
                     }
@@ -942,6 +1007,7 @@ def test_parse_recent_courses_payload_extracts_courses_and_term() -> None:
     assert courses[0].course_code_base == "CS.49900(F)"
     assert courses[0].term_label == "2026 Spring"
     assert courses[0].source == "ajax:core_course_get_recent_courses"
+    assert _course_matches_query(courses[0], "Special Topics") is True
 
 
 def test_course_without_term_label_is_not_current_term() -> None:
@@ -973,6 +1039,34 @@ def test_discover_courses_from_dashboard_extracts_course_code_from_parent_card()
     assert courses[0].term_label is None
 
 
+def test_course_matches_query_accepts_english_title_variants_and_abbreviation() -> None:
+    course = Course(
+        id="178434",
+        title="Operating Systems and Lab(CS.30300_2026_1)",
+        url="https://klms.kaist.ac.kr/course/view.php?id=178434",
+        course_code="CS.30300_2026_1",
+        course_code_base="CS.30300",
+        term_label="2026 Spring",
+    )
+    assert _course_matches_query(course, "Operating Systems")
+    assert _course_matches_query(course, "OS")
+    assert _course_matches_query(course, "CS.30300")
+
+
+def test_course_matches_query_accepts_korean_title_variant() -> None:
+    course = Course(
+        id="180871",
+        title="운영체제 및 실험",
+        url="https://klms.kaist.ac.kr/course/view.php?id=180871",
+        course_code="CS.30300_2026_1",
+        course_code_base="CS.30300",
+        term_label="2026 Spring",
+        title_variants=("Operating Systems and Lab",),
+    )
+    assert _course_matches_query(course, "운영체제")
+    assert _course_matches_query(course, "Operating Systems")
+
+
 def test_courses_list_requires_auth_artifact(tmp_path: Path) -> None:
     _write_config(tmp_path)
     cp = run_v2(tmp_path, "--json", "klms", "courses", "list")
@@ -999,6 +1093,7 @@ def test_extract_assignment_rows_from_calendar_data_uses_nested_course() -> None
                     "course": {
                         "id": 147038,
                         "fullname": "미적분학 I",
+                        "fullnamedisplay": "Calculus I",
                         "shortname": "MAS101-(AP)",
                     },
                 }
@@ -1012,9 +1107,37 @@ def test_extract_assignment_rows_from_calendar_data_uses_nested_course() -> None
     assert assignments[0].title == "Quiz 2 10AM"
     assert assignments[0].course_id == "147038"
     assert assignments[0].course_title == "미적분학 I"
+    assert assignments[0].course_title_variants == ("미적분학 I", "Calculus I")
     assert assignments[0].course_code == "MAS101-(AP)"
     assert assignments[0].due_raw == "Friday, 24 March, 10:25"
     assert assignments[0].due_iso == "2023-03-24T01:25:00Z"
+
+
+def test_filter_assignments_matches_course_query_via_shared_course_aliases() -> None:
+    assignments = [
+        Assignment(
+            id="1210948",
+            title="Lab 1 submission",
+            url="https://klms.kaist.ac.kr/mod/assign/view.php?id=1210948",
+            due_raw="Sunday, 29 March, 23:59",
+            due_iso="2026-03-29T14:59:00Z",
+            course_id="178434",
+            course_title="Operating Systems and Lab(CS.30300_2026_1)",
+            course_code="CS.30300_2026_1",
+            course_code_base="CS.30300",
+        )
+    ]
+    filtered = _filter_assignments(
+        assignments,
+        course_id=None,
+        course_query="OS",
+        since_iso=None,
+        limit=None,
+        current_term_label="2026 Spring",
+        current_term_course_ids={"178434"},
+        include_past=False,
+    )
+    assert [assignment.id for assignment in filtered] == ["1210948"]
 
 
 def test_filter_assignments_defaults_to_current_term_course_ids() -> None:
@@ -1138,6 +1261,8 @@ def test_parse_assignment_detail_from_html_extracts_fields() -> None:
     assert assignment.course_title == "알고리즘 개론"
     assert assignment.due_iso == "2026-03-17T14:59:00Z"
     assert assignment.body_text == "Submit the written assignment PDF."
+    assert assignment.body_html is not None
+    assert assignment.detail_note is None
     assert assignment.detail_available is True
 
 
@@ -1164,6 +1289,123 @@ def test_parse_assignment_detail_prefers_non_noise_course_link_and_real_attachme
     assert assignment.course_id == "180871"
     assert assignment.course_title == "알고리즘 개론"
     assert [item["filename"] for item in assignment.attachments] == ["CS30000_Written_Assignment1.pdf"]
+
+
+def test_parse_assignment_detail_extracts_description_from_detail_table() -> None:
+    html = """
+    <html><body>
+      <div id="page-header"><h1>Written Assignment 2</h1></div>
+      <nav><a href="/course/view.php?id=180871">알고리즘 개론</a></nav>
+      <table>
+        <tr><th>설명</th><td><div class="assignment-rich"><p>Implement Dijkstra.</p><p>Submit code and report.</p></div></td></tr>
+      </table>
+    </body></html>
+    """
+    assignment = _extract_assignment_detail_from_html(
+        html,
+        base_url="https://klms.kaist.ac.kr",
+        url="https://klms.kaist.ac.kr/mod/assign/view.php?id=1210517",
+        assignment_id="1210517",
+        auth_mode="profile",
+    )
+    assert assignment.body_text == "Implement Dijkstra. Submit code and report."
+    assert assignment.body_html is not None
+    assert "assignment-rich" in assignment.body_html
+    assert assignment.detail_note is None
+    assert assignment.detail_available is True
+
+
+def test_parse_assignment_detail_reports_when_body_is_missing() -> None:
+    html = """
+    <html><body>
+      <div id="page-header"><h1>Written Assignment 3</h1></div>
+      <nav><a href="/course/view.php?id=180871">알고리즘 개론</a></nav>
+      <div id="intro">
+        <a href="/pluginfile.php/1845156/mod_assign/introattachment/0/spec.pdf?forcedownload=1">spec.pdf</a>
+      </div>
+    </body></html>
+    """
+    assignment = _extract_assignment_detail_from_html(
+        html,
+        base_url="https://klms.kaist.ac.kr",
+        url="https://klms.kaist.ac.kr/mod/assign/view.php?id=1210518",
+        assignment_id="1210518",
+        auth_mode="profile",
+    )
+    assert assignment.body_text is None
+    assert assignment.detail_available is True
+    assert assignment.detail_note == "Assignment attachments were available, but the KLMS page did not expose an extractable description body."
+
+
+def test_parse_assignment_detail_ignores_submission_action_box() -> None:
+    html = """
+    <html><body>
+      <div id="page-header"><h1>Lab 1 submission</h1></div>
+      <nav><a href="/course/view.php?id=178434">Operating Systems and Lab(CS.30300_2026_1)</a></nav>
+      <div class="box py-3 generalbox submissionaction">
+        <div class="singlebutton"><button>Add submission</button></div>
+        <div class="box py-3 boxaligncenter submithelp">You have not made a submission yet.</div>
+      </div>
+    </body></html>
+    """
+    assignment = _extract_assignment_detail_from_html(
+        html,
+        base_url="https://klms.kaist.ac.kr",
+        url="https://klms.kaist.ac.kr/mod/assign/view.php?id=1210948",
+        assignment_id="1210948",
+        auth_mode="profile",
+    )
+    assert assignment.body_text is None
+    assert assignment.detail_available is False
+    assert assignment.detail_note == "The KLMS assignment page did not expose an extractable description body."
+
+
+def test_assignments_show_ignores_mismatched_course_hint(tmp_path: Path, monkeypatch) -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = "https://klms.kaist.ac.kr/mod/assign/view.php?id=1210516"
+
+        def goto(self, url: str, **kwargs: Any) -> None:  # noqa: ARG002
+            self.url = url
+
+        def content(self) -> str:
+            return """
+            <html><body>
+              <div id="page-header"><h1>Written Assignment 1</h1></div>
+              <nav><a href="/course/view.php?id=180871">알고리즘 개론</a></nav>
+              <div class="activity-description"><p>Submit the written assignment PDF.</p></div>
+            </body></html>
+            """
+
+        def close(self) -> None:
+            return None
+
+    class FakeContext:
+        def new_page(self) -> FakePage:
+            return FakePage()
+
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        auth = AuthService(paths)
+        service = AssignmentService(paths, auth)
+
+        def fake_run_authenticated(*, config, headless, accept_downloads, timeout_seconds, callback):  # type: ignore[no-untyped-def]
+            return callback(FakeContext(), "profile")
+
+        monkeypatch.setattr(auth, "run_authenticated", fake_run_authenticated)
+        result = service.show("1210516", course_id_hint="999999")
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result.data["id"] == "1210516"
+    assert result.data["course_id"] == "180871"
+    assert result.data["body_text"] == "Submit the written assignment PDF."
 
 
 def test_assignments_show_requires_auth_artifact(tmp_path: Path) -> None:
@@ -1247,6 +1489,173 @@ def test_course_matches_query_accepts_numeric_course_id() -> None:
         term_label=None,
     )
     assert _course_matches_query(course, "178223") is True
+
+
+def test_notice_board_resolution_matches_recent_course_alias_variant(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        service = NoticeService(paths, AuthService(paths))
+        bootstrap = SimpleNamespace(
+            dashboard_html="""
+            <html><body>
+              <select name="year"><option selected>2026</option></select>
+              <select name="semester"><option selected>Spring</option></select>
+              <a href="/course/view.php?id=178434">Operating Systems and Lab(CS.30300_2026_1)</a>
+            </body></html>
+            """
+        )
+        monkeypatch.setattr(
+            "kaist_cli.v2.klms.notices._load_recent_courses_from_bootstrap",
+            lambda *args, **kwargs: [
+                Course(
+                    id="178434",
+                    title="Operating Systems and Lab(CS.30300_2026_1)",
+                    url="https://klms.kaist.ac.kr/course/view.php?id=178434",
+                    course_code="CS.30300_2026_1",
+                    course_code_base="CS.30300",
+                    term_label="2026 Spring",
+                    title_variants=("운영체제 및 실험",),
+                )
+            ],
+        )
+        save_cache_value(
+            paths,
+            service._notice_board_cache_key(config, ["178434"]),
+            {"178434": ["838536"]},
+            ttl_seconds=3600,
+        )
+        board_map = service._resolve_notice_board_map(
+            context=SimpleNamespace(),
+            config=config,
+            explicit_board_id=None,
+            course_query="운영체제",
+            bootstrap=bootstrap,
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert board_map == {"178434": ["838536"]}
+
+
+def test_refresh_notice_items_persists_durable_store_and_stops_after_known_page(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        service = NoticeService(paths, AuthService(paths))
+        list_html = """
+        <html><body>
+          <table>
+            <tr><th>Title</th><th>Date</th></tr>
+            <tr>
+              <td><a href="/mod/courseboard/article.php?id=838536&bwid=423326">Exam notice</a></td>
+              <td>2026-03-16 18:57</td>
+            </tr>
+          </table>
+          <a href="/mod/courseboard/view.php?id=838536&page=1">2</a>
+        </body></html>
+        """
+        requested_paths: list[str] = []
+
+        class FakeHttp:
+            def get_html(self, path: str, *, timeout_seconds: float = 20.0, context: Any | None = None):  # type: ignore[no-untyped-def]  # noqa: ARG002
+                requested_paths.append(path)
+                if "page=1" in path:
+                    raise AssertionError("Incremental refresh should stop before requesting older known pages.")
+                return SimpleNamespace(
+                    url=f"https://klms.kaist.ac.kr{path}",
+                    text=list_html,
+                    via="http",
+                )
+
+        monkeypatch.setattr(
+            "kaist_cli.v2.klms.notices.fetch_html_batch",
+            lambda http, paths, **kwargs: {path: http.get_html(path) for path in paths},
+        )
+
+        bootstrap = SimpleNamespace(http=FakeHttp())
+        enrich_calls: list[list[str | None]] = []
+
+        def fake_enrich(items: list[Notice], **kwargs: Any) -> list[Notice]:  # type: ignore[no-untyped-def]
+            enrich_calls.append([item.id for item in items])
+            return [
+                Notice(
+                    board_id="838536",
+                    id="423326",
+                    title="Exam notice",
+                    url="https://klms.kaist.ac.kr/mod/courseboard/article.php?id=838536&bwid=423326",
+                    posted_raw="2026-03-16 18:57",
+                    posted_iso="2026-03-16T09:57:00Z",
+                    author="Prof. Kim",
+                    body_text="Important exam note.",
+                    attachments=(
+                        {
+                            "filename": "exam.pdf",
+                            "title": "exam.pdf",
+                            "url": "https://klms.kaist.ac.kr/pluginfile.php/123/exam.pdf?forcedownload=1",
+                        },
+                    ),
+                    detail_available=True,
+                    source="html:courseboard-article",
+                    confidence=0.78,
+                    auth_mode="profile",
+                )
+            ]
+
+        monkeypatch.setattr("kaist_cli.v2.klms.notices._enrich_notice_items_from_detail", fake_enrich)
+
+        first = service._refresh_notice_items(
+            config=config,
+            auth_mode="profile",
+            board_ids=["838536"],
+            max_pages=1,
+            since_iso=None,
+            limit=None,
+            bootstrap=bootstrap,
+            deadline=None,
+        )
+
+        payload = json.loads(paths.notice_store_path.read_text(encoding="utf-8"))
+        assert "838536:423326" in payload["notices"]
+        assert enrich_calls == [["423326"]]
+        assert first[0].body_text == "Important exam note."
+
+        monkeypatch.setattr(
+            "kaist_cli.v2.klms.notices._enrich_notice_items_from_detail",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Stored notice detail should be reused.")),
+        )
+
+        second = service._refresh_notice_items(
+            config=config,
+            auth_mode="profile",
+            board_ids=["838536"],
+            max_pages=3,
+            since_iso=None,
+            limit=None,
+            bootstrap=bootstrap,
+            deadline=None,
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert [item.id for item in second] == ["423326"]
+    assert second[0].body_text == "Important exam note."
+    assert requested_paths == [
+        "/mod/courseboard/view.php?id=838536",
+        "/mod/courseboard/view.php?id=838536",
+    ]
 
 
 def test_parse_notice_items_from_soup_skips_hidden_rows() -> None:
@@ -1671,6 +2080,98 @@ def test_file_course_map_falls_back_to_termless_dashboard_courses(tmp_path: Path
             os.environ["KAIST_CLI_HOME"] = old_home
 
     assert set(course_map.keys()) == {"180871", "178223"}
+
+
+def test_file_course_map_matches_recent_course_alias_variant(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        service = FileService(paths, AuthService(paths))
+        bootstrap = SimpleNamespace(
+            dashboard_html="""
+            <html><body>
+              <select name="year"><option selected>2026</option></select>
+              <select name="semester"><option selected>Spring</option></select>
+              <a href="/course/view.php?id=178434">Operating Systems and Lab(CS.30300_2026_1)</a>
+            </body></html>
+            """
+        )
+        monkeypatch.setattr(
+            "kaist_cli.v2.klms.files._load_recent_courses_from_bootstrap",
+            lambda *args, **kwargs: [
+                Course(
+                    id="178434",
+                    title="Operating Systems and Lab(CS.30300_2026_1)",
+                    url="https://klms.kaist.ac.kr/course/view.php?id=178434",
+                    course_code="CS.30300_2026_1",
+                    course_code_base="CS.30300",
+                    term_label="2026 Spring",
+                    title_variants=("운영체제 및 실험",),
+                )
+            ],
+        )
+        course_map = service._course_map_for_request(
+            bootstrap=bootstrap,
+            config=config,
+            course_id=None,
+            course_query="운영체제",
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert set(course_map.keys()) == {"178434"}
+
+
+def test_video_course_map_matches_recent_course_alias_variant(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        service = VideoService(paths, AuthService(paths))
+        bootstrap = SimpleNamespace(
+            dashboard_html="""
+            <html><body>
+              <select name="year"><option selected>2026</option></select>
+              <select name="semester"><option selected>Spring</option></select>
+              <a href="/course/view.php?id=178434">Operating Systems and Lab(CS.30300_2026_1)</a>
+            </body></html>
+            """
+        )
+        monkeypatch.setattr(
+            "kaist_cli.v2.klms.videos._load_recent_courses_from_bootstrap",
+            lambda *args, **kwargs: [
+                Course(
+                    id="178434",
+                    title="Operating Systems and Lab(CS.30300_2026_1)",
+                    url="https://klms.kaist.ac.kr/course/view.php?id=178434",
+                    course_code="CS.30300_2026_1",
+                    course_code_base="CS.30300",
+                    term_label="2026 Spring",
+                    title_variants=("운영체제 및 실험",),
+                )
+            ],
+        )
+        course_map = service._course_map_for_request(
+            bootstrap=bootstrap,
+            config=config,
+            course_id=None,
+            course_query="운영체제",
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert set(course_map.keys()) == {"178434"}
 
 
 def test_resolve_target_item_rejects_non_material_url(tmp_path: Path, monkeypatch) -> None:

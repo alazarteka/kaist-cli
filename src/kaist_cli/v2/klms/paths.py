@@ -10,11 +10,13 @@ class KlmsPaths:
     home_root: Path
     private_root: Path
     files_root: Path
+    profile_lock_path: Path
     profile_dir: Path
     config_path: Path
     storage_state_path: Path
     snapshot_path: Path
     cache_path: Path
+    notice_store_path: Path
     endpoint_discovery_path: Path
     api_map_path: Path
     playwright_browsers_dir: Path
@@ -28,11 +30,13 @@ def resolve_paths() -> KlmsPaths:
         home_root=home_root,
         private_root=private_root,
         files_root=files_root,
+        profile_lock_path=private_root / ".lock",
         profile_dir=private_root / "profile",
         config_path=private_root / "config.toml",
         storage_state_path=private_root / "storage_state.json",
         snapshot_path=private_root / "snapshot.json",
         cache_path=private_root / "cache.json",
+        notice_store_path=private_root / "notice_store.json",
         endpoint_discovery_path=private_root / "endpoint_discovery.json",
         api_map_path=private_root / "api_map.json",
         playwright_browsers_dir=private_root / "playwright-browsers",
@@ -58,4 +62,3 @@ def configure_playwright_env(paths: KlmsPaths) -> Path:
     chmod_best_effort(paths.playwright_browsers_dir, 0o700)
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(paths.playwright_browsers_dir))
     return paths.playwright_browsers_dir
-

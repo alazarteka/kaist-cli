@@ -8,7 +8,7 @@ from typing import Any, Callable, Iterator
 
 
 @contextmanager
-def file_lock(lock_path: Path) -> Iterator[None]:
+def file_lock(lock_path: Path, *, blocking: bool = True) -> Iterator[None]:
     """
     Process-level advisory lock for file-backed state.
 
@@ -22,7 +22,10 @@ def file_lock(lock_path: Path) -> Iterator[None]:
             import fcntl
         except Exception as exc:  # pragma: no cover
             raise RuntimeError("Process file locking requires fcntl on this platform") from exc
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        flags = fcntl.LOCK_EX
+        if not blocking:
+            flags |= fcntl.LOCK_NB
+        fcntl.flock(handle.fileno(), flags)
         yield
     finally:
         try:

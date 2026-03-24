@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,7 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 
+from ...core.state_store import file_lock
 from ..contracts import CommandError, CommandResult
 from .config import KlmsConfig, maybe_load_config, save_config
 from .paths import KlmsPaths, chmod_best_effort, configure_playwright_env, ensure_private_dirs
@@ -515,6 +517,28 @@ def _browser_fallback_error(prefix: str, errors: list[str]) -> RuntimeError:
     return RuntimeError(f"{prefix}. Details:\n{detail}")
 
 
+def _concurrent_profile_access_error(*, lock_path: Path) -> CommandError:
+    return CommandError(
+        code="CONCURRENT_ACCESS",
+        message="Another `kaist klms` command is already using the shared KLMS browser profile.",
+        hint=(
+            "Wait for the other KLMS command to finish, then retry. "
+            f"If needed, check the lock file at {lock_path}."
+        ),
+        exit_code=20,
+        retryable=True,
+    )
+
+
+@contextmanager
+def _hold_profile_lock(paths: KlmsPaths) -> Any:
+    try:
+        with file_lock(paths.profile_lock_path, blocking=False):
+            yield
+    except BlockingIOError as exc:
+        raise _concurrent_profile_access_error(lock_path=paths.profile_lock_path) from exc
+
+
 def _playwright_install_cmd(paths: KlmsPaths) -> tuple[list[str], dict[str, str]]:
     configure_playwright_env(paths)
     from playwright._impl._driver import compute_driver_executable, get_driver_env  # type: ignore[import-untyped]
@@ -784,20 +808,21 @@ class AuthService:
             )
         print(f"Opening browser to: {config.base_url}", file=sys.stderr)
         print("Log in fully, navigate to a course page, then return here and press Enter.", file=sys.stderr)
-        with sync_playwright() as playwright:
-            context = _launch_chromium_persistent_context_sync(
-                playwright,
-                paths=self._paths,
-                user_data_dir=str(self._paths.profile_dir),
-                headless=False,
-                accept_downloads=False,
-            )
-            page = context.new_page()
-            page.goto(config.base_url, wait_until="domcontentloaded", timeout=30_000)
-            print("Press Enter to save session and exit... ", end="", file=sys.stderr, flush=True)
-            input()
-            self._persist_context_state(context)
-            context.close()
+        with _hold_profile_lock(self._paths):
+            with sync_playwright() as playwright:
+                context = _launch_chromium_persistent_context_sync(
+                    playwright,
+                    paths=self._paths,
+                    user_data_dir=str(self._paths.profile_dir),
+                    headless=False,
+                    accept_downloads=False,
+                )
+                page = context.new_page()
+                page.goto(config.base_url, wait_until="domcontentloaded", timeout=30_000)
+                print("Press Enter to save session and exit... ", end="", file=sys.stderr, flush=True)
+                input()
+                self._persist_context_state(context)
+                context.close()
 
         return CommandResult(
             data={
@@ -989,60 +1014,61 @@ class AuthService:
 
         wait_seconds = max(15.0, min(float(wait_seconds), 600.0))
         printed_login_number: str | None = None
-        with sync_playwright() as playwright:
-            context = _launch_chromium_persistent_context_sync(
-                playwright,
-                paths=self._paths,
-                user_data_dir=str(self._paths.profile_dir),
-                headless=True,
-                accept_downloads=False,
-            )
-            signals = _EasyLoginSignals()
-            response_listener = lambda response: _observe_easy_login_response(signals, response)  # noqa: E731
-            try:
-                page = context.new_page()
-                context.on("response", response_listener)
-                page.goto(config.base_url, wait_until="domcontentloaded", timeout=30_000)
-                html = _safe_page_content(page) or ""
-                current_url = str(page.url or "")
-                sso_url = _extract_sso_login_view_url(current_url, html)
-                if not sso_url:
-                    if _looks_like_easy_login_page(current_url):
-                        sso_url = current_url
-                    else:
-                        raise CommandError(
-                            code="AUTH_FLOW_UNSUPPORTED",
-                            message="Could not locate the KAIST SSO Easy Login page from the KLMS login flow.",
-                            hint="Run `kaist klms auth login` without `--username` to use the manual browser flow.",
-                            exit_code=10,
-                            retryable=False,
-                        )
-                page.goto(sso_url, wait_until="networkidle", timeout=30_000)
-                page.fill("#login_id_mfa", username)
-                page.click("a.btn_login")
-                html = self._wait_for_easy_login_init(page, timeout_seconds=12.0)
-                login_number = _extract_easy_login_number(html)
-                if login_number:
-                    printed_login_number = login_number
-                    print(f"KAIST SSO Easy Login number: {login_number}", file=sys.stderr)
-                    print("Approve this login in the KAIST auth app. Waiting for KLMS session...", file=sys.stderr)
-                else:
-                    print("KAIST SSO Easy Login initialized. Waiting for approval in the KAIST auth app...", file=sys.stderr)
-                return self._wait_for_easy_login_approval(
-                    page=page,
-                    context=context,
-                    config=config,
-                    username=username,
-                    wait_seconds=wait_seconds,
-                    login_number=printed_login_number,
-                    signals=signals,
+        with _hold_profile_lock(self._paths):
+            with sync_playwright() as playwright:
+                context = _launch_chromium_persistent_context_sync(
+                    playwright,
+                    paths=self._paths,
+                    user_data_dir=str(self._paths.profile_dir),
+                    headless=True,
+                    accept_downloads=False,
                 )
-            finally:
+                signals = _EasyLoginSignals()
+                response_listener = lambda response: _observe_easy_login_response(signals, response)  # noqa: E731
                 try:
-                    context.remove_listener("response", response_listener)
-                except Exception:
-                    pass
-                context.close()
+                    page = context.new_page()
+                    context.on("response", response_listener)
+                    page.goto(config.base_url, wait_until="domcontentloaded", timeout=30_000)
+                    html = _safe_page_content(page) or ""
+                    current_url = str(page.url or "")
+                    sso_url = _extract_sso_login_view_url(current_url, html)
+                    if not sso_url:
+                        if _looks_like_easy_login_page(current_url):
+                            sso_url = current_url
+                        else:
+                            raise CommandError(
+                                code="AUTH_FLOW_UNSUPPORTED",
+                                message="Could not locate the KAIST SSO Easy Login page from the KLMS login flow.",
+                                hint="Run `kaist klms auth login` without `--username` to use the manual browser flow.",
+                                exit_code=10,
+                                retryable=False,
+                            )
+                    page.goto(sso_url, wait_until="networkidle", timeout=30_000)
+                    page.fill("#login_id_mfa", username)
+                    page.click("a.btn_login")
+                    html = self._wait_for_easy_login_init(page, timeout_seconds=12.0)
+                    login_number = _extract_easy_login_number(html)
+                    if login_number:
+                        printed_login_number = login_number
+                        print(f"KAIST SSO Easy Login number: {login_number}", file=sys.stderr)
+                        print("Approve this login in the KAIST auth app. Waiting for KLMS session...", file=sys.stderr)
+                    else:
+                        print("KAIST SSO Easy Login initialized. Waiting for approval in the KAIST auth app...", file=sys.stderr)
+                    return self._wait_for_easy_login_approval(
+                        page=page,
+                        context=context,
+                        config=config,
+                        username=username,
+                        wait_seconds=wait_seconds,
+                        login_number=printed_login_number,
+                        signals=signals,
+                    )
+                finally:
+                    try:
+                        context.remove_listener("response", response_listener)
+                    except Exception:
+                        pass
+                    context.close()
 
     def login(
         self,
@@ -1157,52 +1183,55 @@ class AuthService:
         configure_playwright_env(self._paths)
         timeout_ms = max(1_000, int(timeout_seconds * 1000))
         attempts: list[dict[str, Any]] = []
+        profile_session_exists = has_profile_session(self._paths)
+        profile_lock = _hold_profile_lock(self._paths) if profile_session_exists else nullcontext()
 
-        from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
+        with profile_lock:
+            from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
 
-        with sync_playwright() as playwright:
-            if has_profile_session(self._paths):
-                try:
-                    profile_context = _launch_chromium_persistent_context_sync(
-                        playwright,
-                        paths=self._paths,
-                        user_data_dir=str(self._paths.profile_dir),
-                        headless=headless,
-                        accept_downloads=accept_downloads,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    attempts.append({"auth_mode": "profile", "launch_error": str(exc)})
-                else:
+            with sync_playwright() as playwright:
+                if profile_session_exists:
                     try:
-                        state = self._context_dashboard_state(profile_context, config=config, timeout_ms=timeout_ms)
-                        attempts.append({"auth_mode": "profile", **state})
-                        if state["authenticated"]:
-                            if include_dashboard_state:
-                                return callback(profile_context, "profile", state)
-                            return callback(profile_context, "profile")
-                    finally:
-                        profile_context.close()
+                        profile_context = _launch_chromium_persistent_context_sync(
+                            playwright,
+                            paths=self._paths,
+                            user_data_dir=str(self._paths.profile_dir),
+                            headless=headless,
+                            accept_downloads=accept_downloads,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        attempts.append({"auth_mode": "profile", "launch_error": str(exc)})
+                    else:
+                        try:
+                            state = self._context_dashboard_state(profile_context, config=config, timeout_ms=timeout_ms)
+                            attempts.append({"auth_mode": "profile", **state})
+                            if state["authenticated"]:
+                                if include_dashboard_state:
+                                    return callback(profile_context, "profile", state)
+                                return callback(profile_context, "profile")
+                        finally:
+                            profile_context.close()
 
-            if has_storage_state_session(self._paths):
-                try:
-                    browser = _launch_chromium_browser_sync(playwright, paths=self._paths, headless=headless)
-                    storage_context = browser.new_context(
-                        storage_state=str(self._paths.storage_state_path),
-                        accept_downloads=accept_downloads,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    attempts.append({"auth_mode": "storage_state", "launch_error": str(exc)})
-                else:
+                if has_storage_state_session(self._paths):
                     try:
-                        state = self._context_dashboard_state(storage_context, config=config, timeout_ms=timeout_ms)
-                        attempts.append({"auth_mode": "storage_state", **state})
-                        if state["authenticated"]:
-                            if include_dashboard_state:
-                                return callback(storage_context, "storage_state", state)
-                            return callback(storage_context, "storage_state")
-                    finally:
-                        storage_context.close()
-                        browser.close()
+                        browser = _launch_chromium_browser_sync(playwright, paths=self._paths, headless=headless)
+                        storage_context = browser.new_context(
+                            storage_state=str(self._paths.storage_state_path),
+                            accept_downloads=accept_downloads,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        attempts.append({"auth_mode": "storage_state", "launch_error": str(exc)})
+                    else:
+                        try:
+                            state = self._context_dashboard_state(storage_context, config=config, timeout_ms=timeout_ms)
+                            attempts.append({"auth_mode": "storage_state", **state})
+                            if state["authenticated"]:
+                                if include_dashboard_state:
+                                    return callback(storage_context, "storage_state", state)
+                                return callback(storage_context, "storage_state")
+                        finally:
+                            storage_context.close()
+                            browser.close()
 
         attempt_summaries = [
             (
@@ -1341,50 +1370,56 @@ class AuthService:
                 "reason": "No saved auth artifacts available for browser-assisted probing.",
             }
 
-        with sync_playwright() as playwright:
-            if has_profile_session(self._paths):
-                profile_context = _launch_chromium_persistent_context_sync(
-                    playwright,
-                    paths=self._paths,
-                    user_data_dir=str(self._paths.profile_dir),
-                    headless=True,
-                    accept_downloads=False,
-                )
-                try:
-                    profile_result = probe_context(profile_context, auth_mode="profile")
-                    if profile_result.get("dashboard_authenticated"):
+        profile_session_exists = has_profile_session(self._paths)
+        profile_lock = _hold_profile_lock(self._paths) if profile_session_exists else nullcontext()
+
+        with profile_lock:
+            from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
+
+            with sync_playwright() as playwright:
+                if profile_session_exists:
+                    profile_context = _launch_chromium_persistent_context_sync(
+                        playwright,
+                        paths=self._paths,
+                        user_data_dir=str(self._paths.profile_dir),
+                        headless=True,
+                        accept_downloads=False,
+                    )
+                    try:
+                        profile_result = probe_context(profile_context, auth_mode="profile")
+                        if profile_result.get("dashboard_authenticated"):
+                            return {
+                                "enabled": True,
+                                "status": "ok",
+                                "attempts": [profile_result],
+                                "selected_auth_mode": "profile",
+                            }
+                    finally:
+                        profile_context.close()
+                else:
+                    profile_result = None
+
+                if has_storage_state_session(self._paths):
+                    browser = _launch_chromium_browser_sync(playwright, paths=self._paths, headless=True)
+                    storage_context = browser.new_context(
+                        storage_state=str(self._paths.storage_state_path),
+                        accept_downloads=False,
+                    )
+                    try:
+                        storage_result = probe_context(storage_context, auth_mode="storage_state")
                         return {
                             "enabled": True,
-                            "status": "ok",
-                            "attempts": [profile_result],
-                            "selected_auth_mode": "profile",
+                            "status": "ok" if storage_result.get("dashboard_authenticated") else "warning",
+                            "attempts": [attempt for attempt in [profile_result, storage_result] if attempt is not None],
+                            "selected_auth_mode": "storage_state" if storage_result.get("dashboard_authenticated") else None,
                         }
-                finally:
-                    profile_context.close()
-            else:
-                profile_result = None
+                    finally:
+                        storage_context.close()
+                        browser.close()
 
-            if has_storage_state_session(self._paths):
-                browser = _launch_chromium_browser_sync(playwright, paths=self._paths, headless=True)
-                storage_context = browser.new_context(
-                    storage_state=str(self._paths.storage_state_path),
-                    accept_downloads=False,
-                )
-                try:
-                    storage_result = probe_context(storage_context, auth_mode="storage_state")
-                    return {
-                        "enabled": True,
-                        "status": "ok" if storage_result.get("dashboard_authenticated") else "warning",
-                        "attempts": [attempt for attempt in [profile_result, storage_result] if attempt is not None],
-                        "selected_auth_mode": "storage_state" if storage_result.get("dashboard_authenticated") else None,
-                    }
-                finally:
-                    storage_context.close()
-                    browser.close()
-
-            return {
-                "enabled": True,
-                "status": "warning",
-                "attempts": [attempt for attempt in [profile_result] if attempt is not None],
-                "selected_auth_mode": None,
-            }
+                return {
+                    "enabled": True,
+                    "status": "warning",
+                    "attempts": [attempt for attempt in [profile_result] if attempt is not None],
+                    "selected_auth_mode": None,
+                }

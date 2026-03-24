@@ -28,6 +28,27 @@ def _norm_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+def _normalize_course_match_value(value: str | None) -> str:
+    text = _norm_text(str(value or "")).lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _course_title_variants(*values: str | None) -> tuple[str, ...]:
+    variants: list[str] = []
+    for value in values:
+        text = _norm_text(str(value or ""))
+        if text and text not in variants:
+            variants.append(text)
+    return tuple(variants)
+
+
+def _course_identity_value(course: Any, key: str) -> Any:
+    if isinstance(course, dict):
+        return course.get(key)
+    return getattr(course, key, None)
+
+
 def _course_code_base(course_code: str | None) -> str | None:
     if not course_code:
         return None
@@ -73,18 +94,145 @@ def _term_label_from_course_code(course_code: str | None) -> str | None:
     return f"{year} {season}"
 
 
+def _course_aliases(course: Any) -> tuple[str, ...]:
+    aliases: list[str] = []
+
+    def push(value: str | None) -> None:
+        normalized = _normalize_course_match_value(value)
+        if normalized and normalized not in aliases:
+            aliases.append(normalized)
+
+    course_id = str(_course_identity_value(course, "id") or _course_identity_value(course, "course_id") or "").strip() or None
+    course_title = str(_course_identity_value(course, "title") or _course_identity_value(course, "course_title") or "").strip() or None
+    course_code = str(_course_identity_value(course, "course_code") or "").strip() or None
+    course_code_base = str(_course_identity_value(course, "course_code_base") or "").strip() or None
+    title_variants = _course_identity_value(course, "title_variants")
+    if not isinstance(title_variants, (list, tuple)):
+        title_variants = _course_identity_value(course, "course_title_variants")
+    title_candidates = _course_title_variants(course_title, *(str(value) for value in title_variants or ()))
+
+    push(course_id)
+    push(course_code)
+    push(course_code_base)
+    for title in title_candidates:
+        push(title)
+
+    for title in title_candidates:
+        title_no_code = re.sub(r"\([^)]*_[0-9]{4}_\d+\)\s*$", "", title).strip()
+        push(title_no_code)
+        title_without_parens = re.sub(r"\([^)]*\)", " ", title)
+        push(title_without_parens)
+
+        acronym_tokens = re.findall(r"[A-Za-z]+", title_no_code)
+        if len(acronym_tokens) >= 2:
+            push("".join(token[0] for token in acronym_tokens if token))
+        if acronym_tokens:
+            push(" ".join(acronym_tokens))
+
+    if course_code:
+        dotted = course_code.replace("_", " ")
+        push(dotted)
+    if course_code_base:
+        push(course_code_base.replace(".", ""))
+
+    return tuple(aliases)
+
+
+def _course_metadata_row(course: Course) -> dict[str, str | None | tuple[str, ...]]:
+    return {
+        "course_id": str(course.id),
+        "course_title": course.title,
+        "course_title_variants": _course_title_variants(course.title, *course.title_variants),
+        "course_code": course.course_code,
+        "course_code_base": course.course_code_base,
+        "term_label": course.term_label,
+    }
+
+
+def _merge_course_metadata_rows(
+    rows: dict[str, dict[str, str | None | tuple[str, ...]]],
+    courses: list[Course],
+) -> dict[str, dict[str, str | None | tuple[str, ...]]]:
+    merged = {str(key): dict(value) for key, value in rows.items()}
+    for course in courses:
+        course_id = str(course.id).strip()
+        if not course_id:
+            continue
+        row = merged.get(course_id) or {
+            "course_id": course_id,
+            "course_title": None,
+            "course_title_variants": (),
+            "course_code": None,
+            "course_code_base": None,
+            "term_label": None,
+        }
+        existing_title = str(row.get("course_title") or "").strip() or None
+        existing_variants = row.get("course_title_variants")
+        if not isinstance(existing_variants, (list, tuple)):
+            existing_variants = ()
+        row["course_title"] = existing_title or course.title
+        row["course_title_variants"] = _course_title_variants(
+            existing_title,
+            *(str(value) for value in existing_variants),
+            course.title,
+            *course.title_variants,
+        )
+        row["course_code"] = str(row.get("course_code") or "").strip() or course.course_code
+        row["course_code_base"] = str(row.get("course_code_base") or "").strip() or course.course_code_base
+        row["term_label"] = str(row.get("term_label") or "").strip() or course.term_label
+        merged[course_id] = row
+    return merged
+
+
+def _load_recent_courses_from_bootstrap(
+    paths: KlmsPaths,
+    bootstrap: Any,
+    *,
+    exclude_patterns: tuple[str, ...],
+) -> list[Course]:
+    sesskey = str(getattr(bootstrap, "dashboard_sesskey", "") or "").strip()
+    http = getattr(bootstrap, "http", None)
+    config = getattr(bootstrap, "config", None)
+    if not sesskey or http is None or config is None or not hasattr(http, "post_text"):
+        return []
+    try:
+        args = load_recent_courses_args(paths, limit=200)
+        args["limit"] = max(200, int(args.get("limit") or 0))
+        response = http.post_text(
+            f"/lib/ajax/service.php?sesskey={sesskey}&info=core_course_get_recent_courses",
+            body=json.dumps([{"index": 0, "methodname": "core_course_get_recent_courses", "args": args}]),
+            headers={"Content-Type": "application/json"},
+            timeout_seconds=10.0,
+        )
+        return _parse_recent_courses_payload(
+            response.text,
+            base_url=config.base_url,
+            auth_mode=str(getattr(bootstrap, "auth_mode", "") or "") or None,
+            exclude_patterns=exclude_patterns,
+            include_all=True,
+            include_past=True,
+            limit=None,
+            course_query=None,
+        )
+    except Exception:
+        return []
+
+
 def _course_matches_query(course: Course, query: str | None) -> bool:
-    needle = _norm_text(str(query or "")).lower()
+    needle = _normalize_course_match_value(query)
     if not needle:
         return True
-    course_id = str(getattr(course, "id", "") or "").strip() or None
-    haystacks = (
-        course_id,
-        course.title,
-        course.course_code,
-        course.course_code_base,
-    )
-    return any(needle in _norm_text(value or "").lower() for value in haystacks if value)
+    aliases = _course_aliases(course)
+    if any(needle == alias or needle in alias for alias in aliases):
+        return True
+    needle_compact = re.sub(r"[^a-z0-9가-힣]+", "", needle)
+    if not needle_compact:
+        return False
+    for alias in aliases:
+        alias_compact = re.sub(r"[^a-z0-9가-힣]+", "", alias)
+        if alias_compact and needle_compact == alias_compact:
+            return True
+    return False
 
 
 def _course_is_current_term(course: Course, current_term_label: str | None, *, include_past: bool) -> bool:
@@ -207,6 +355,7 @@ def _discover_courses_from_dashboard(html: str, *, base_url: str) -> list[Course
             course_code=course_code,
             course_code_base=_course_code_base(course_code),
             term_label=_term_label_from_course_code(course_code),
+            title_variants=_course_title_variants(title),
             source="html:dashboard",
             confidence=0.72,
         )
@@ -344,7 +493,10 @@ def _parse_recent_courses_payload(
         course_id = str(row.get("id") or "").strip()
         if not course_id:
             continue
-        title = _norm_text(str(row.get("fullname") or row.get("fullnamedisplay") or f"course-{course_id}"))
+        fullname = _norm_text(str(row.get("fullname") or "")) or None
+        fullnamedisplay = _norm_text(str(row.get("fullnamedisplay") or "")) or None
+        title_variants = _course_title_variants(fullname, fullnamedisplay)
+        title = next(iter(title_variants), f"course-{course_id}")
         if not include_all and _is_noise_course(title, exclude_patterns):
             continue
         course_code = str(row.get("shortname") or "").strip() or None
@@ -355,6 +507,7 @@ def _parse_recent_courses_payload(
             course_code=course_code,
             course_code_base=_course_code_base(course_code),
             term_label=_term_label_from_course_code(course_code),
+            title_variants=title_variants,
             source="ajax:core_course_get_recent_courses",
             confidence=0.9,
             auth_mode=auth_mode,
@@ -486,6 +639,7 @@ class CourseService:
                 course_code=course.course_code,
                 course_code_base=course.course_code_base,
                 term_label=course.term_label,
+                title_variants=course.title_variants,
                 professors=professors_by_id.get(course.id, course.professors),
                 source=course.source,
                 confidence=course.confidence,
@@ -525,6 +679,7 @@ class CourseService:
                 course_code=course.course_code,
                 course_code_base=course.course_code_base,
                 term_label=course.term_label,
+                title_variants=course.title_variants,
                 source="html:dashboard",
                 confidence=0.72,
                 auth_mode=auth_mode,
@@ -640,6 +795,7 @@ class CourseService:
                 course_code=course_code,
                 course_code_base=_course_code_base(course_code),
                 term_label=_term_label_from_course_code(course_code),
+                title_variants=_course_title_variants(title),
                 professors=professors,
                 source="html:course-page",
                 confidence=0.78,

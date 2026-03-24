@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import sys
 from datetime import datetime, timezone
@@ -12,8 +13,17 @@ from ..contracts import CommandError, CommandResult
 from .auth import AuthService, looks_logged_out_html, looks_login_url
 from .cache import list_cache_entries, load_cache_entry, save_cache_value
 from .assignments import _attachment_filename_from_url, _looks_like_attachment_url, _parse_datetime_guess
+from ...core.state_store import read_json_file, update_json_file
 from .config import KlmsConfig, abs_url, load_config
-from .courses import _course_code_base, _norm_text, _select_dashboard_courses
+from .courses import (
+    _course_code_base,
+    _course_matches_query,
+    _course_metadata_row,
+    _load_recent_courses_from_bootstrap,
+    _merge_course_metadata_rows,
+    _norm_text,
+    _select_dashboard_courses,
+)
 from .deadline import RefreshDeadline
 from .models import Notice
 from .paths import KlmsPaths
@@ -23,6 +33,7 @@ from .validate import looks_klms_error_html
 
 NOTICE_BOARD_TTL_SECONDS = 6 * 3600
 NOTICE_LIST_TTL_SECONDS = 5 * 60
+NOTICE_STORE_VERSION = 1
 MAX_NOTICE_HTTP_WORKERS = 4
 
 
@@ -77,6 +88,7 @@ def _course_meta_map_from_dashboard(
     *,
     base_url: str,
     exclude_patterns: tuple[str, ...],
+    configured_ids: tuple[str, ...] = (),
     course_query: str | None = None,
     course_id: str | None = None,
 ) -> dict[str, dict[str, str | None]]:
@@ -89,25 +101,69 @@ def _course_meta_map_from_dashboard(
         allow_termless_fallback=True,
     )
     out = {
-        str(course.id): {
-            "course_id": str(course.id),
-            "course_title": course.title,
-            "course_code": course.course_code,
-            "course_code_base": _course_code_base(course.course_code),
-        }
+        str(course.id): _course_metadata_row(course)
         for course in selected
         if str(course.id).strip()
     }
+    for configured_id in configured_ids:
+        target = str(configured_id).strip()
+        if target and target not in out:
+            out[target] = {
+                "course_id": target,
+                "course_title": None,
+                "course_title_variants": (),
+                "course_code": None,
+                "course_code_base": None,
+                "term_label": None,
+            }
     if course_id:
         target = str(course_id).strip()
         if target and target not in out:
             out[target] = {
                 "course_id": target,
                 "course_title": None,
+                "course_title_variants": (),
                 "course_code": None,
                 "course_code_base": None,
+                "term_label": None,
             }
     return out
+
+
+def _course_meta_map_for_request(
+    paths: KlmsPaths,
+    bootstrap: KlmsSessionBootstrap,
+    *,
+    config: KlmsConfig,
+    course_id: str | None = None,
+    course_query: str | None = None,
+) -> dict[str, dict[str, str | None]]:
+    course_meta = _course_meta_map_from_dashboard(
+        bootstrap.dashboard_html,
+        base_url=config.base_url,
+        exclude_patterns=config.exclude_course_title_patterns,
+        configured_ids=config.course_ids,
+        course_query=None,
+        course_id=course_id,
+    )
+    course_meta = _merge_course_metadata_rows(
+        course_meta,
+        _load_recent_courses_from_bootstrap(
+            paths,
+            bootstrap,
+            exclude_patterns=config.exclude_course_title_patterns,
+        ),
+    )
+    if course_id:
+        target = str(course_id).strip()
+        return {target: course_meta.get(target) or {"course_id": target, "course_title": None, "course_title_variants": (), "course_code": None, "course_code_base": None, "term_label": None}} if target else {}
+    if not course_query:
+        return course_meta
+    return {
+        key: value
+        for key, value in course_meta.items()
+        if _course_matches_query(value, course_query)
+    }
 
 
 def _discover_notice_board_ids_from_course_page(html: str) -> list[str]:
@@ -291,6 +347,142 @@ def _extract_notice_ids_from_url(url: str | None) -> tuple[str | None, str | Non
     board_id = (query.get("id") or [None])[0]
     notice_id = (query.get("bwid") or [None])[0]
     return (str(board_id).strip() or None) if isinstance(board_id, str) else None, (str(notice_id).strip() or None) if isinstance(notice_id, str) else None
+
+
+def _notice_store_default() -> dict[str, Any]:
+    return {"version": NOTICE_STORE_VERSION, "notices": {}}
+
+
+def _stable_notice_key(notice: Notice) -> str | None:
+    board_id = str(notice.board_id or "").strip() or None
+    notice_id = str(notice.id or "").strip() or None
+    url = str(notice.url or "").strip() or None
+    if board_id and notice_id:
+        return f"{board_id}:{notice_id}"
+    if notice_id:
+        return f"id:{notice_id}"
+    if url:
+        return f"url:{url}"
+    return None
+
+
+def _stable_attachment_key(row: dict[str, Any]) -> str | None:
+    url = str(row.get("url") or "").strip()
+    if url:
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        attachment_id = (query.get("attachment") or [None])[0]
+        if isinstance(attachment_id, str) and attachment_id.strip():
+            return f"attachment:{attachment_id.strip()}"
+        path = str(parsed.path or "").strip()
+        if path:
+            return f"url:{path}"
+    filename = str(row.get("filename") or row.get("title") or "").strip()
+    return f"filename:{filename}" if filename else None
+
+
+def _notice_summary_fingerprint(notice: Notice) -> str:
+    payload = {
+        "board_id": str(notice.board_id or "").strip() or None,
+        "id": str(notice.id or "").strip() or None,
+        "title": notice.title,
+        "url": notice.url,
+        "posted_raw": notice.posted_raw,
+        "posted_iso": notice.posted_iso,
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _notice_has_persistent_detail(notice: Notice) -> bool:
+    return bool(
+        notice.author
+        or notice.body_text
+        or notice.body_html
+        or notice.attachments
+        or notice.detail_available
+    )
+
+
+def _notice_from_store_record(record: dict[str, Any]) -> Notice | None:
+    row = record.get("notice")
+    if not isinstance(row, dict):
+        return None
+    try:
+        return Notice(**row)
+    except Exception:
+        return None
+
+
+def _load_notice_store_records(paths: KlmsPaths, *, board_ids: list[str] | None = None) -> dict[str, dict[str, Any]]:
+    payload = read_json_file(paths.notice_store_path, default=_notice_store_default())
+    notices = payload.get("notices")
+    if not isinstance(notices, dict):
+        return {}
+    allowed_board_ids = {str(board_id).strip() for board_id in board_ids or [] if str(board_id).strip()}
+    out: dict[str, dict[str, Any]] = {}
+    for key, record in notices.items():
+        if not isinstance(record, dict):
+            continue
+        if allowed_board_ids:
+            board_id = str(record.get("board_id") or "").strip()
+            if board_id not in allowed_board_ids:
+                continue
+        out[str(key)] = record
+    return out
+
+
+def _notice_store_record_from_notice(
+    notice: Notice,
+    *,
+    existing: dict[str, Any] | None,
+    observed_at: str,
+) -> dict[str, Any]:
+    notice_payload = notice.to_dict()
+    attachment_keys = [
+        key
+        for key in (_stable_attachment_key(row) for row in notice_payload.get("attachments") or [])
+        if key
+    ]
+    previous_notice = existing.get("notice") if isinstance(existing, dict) and isinstance(existing.get("notice"), dict) else None
+    updated_at = observed_at
+    if previous_notice == notice_payload:
+        updated_at = str(existing.get("updated_at") or observed_at) if isinstance(existing, dict) else observed_at
+    return {
+        "board_id": str(notice.board_id or "").strip() or None,
+        "notice_id": str(notice.id or "").strip() or None,
+        "summary_fingerprint": _notice_summary_fingerprint(notice),
+        "attachment_keys": attachment_keys,
+        "first_seen_at": str(existing.get("first_seen_at") or observed_at) if isinstance(existing, dict) else observed_at,
+        "last_seen_at": observed_at,
+        "updated_at": updated_at,
+        "notice": notice_payload,
+    }
+
+
+def _persist_notice_store(paths: KlmsPaths, notices: list[Notice]) -> None:
+    observed_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    def updater(payload: dict[str, Any]) -> dict[str, Any]:
+        current = payload.get("notices")
+        merged: dict[str, Any] = current if isinstance(current, dict) else {}
+        merged = {str(key): value for key, value in merged.items() if isinstance(value, dict)}
+        for notice in notices:
+            key = _stable_notice_key(notice)
+            if not key:
+                continue
+            merged[key] = _notice_store_record_from_notice(
+                notice,
+                existing=merged.get(key) if isinstance(merged.get(key), dict) else None,
+                observed_at=observed_at,
+            )
+        return {"version": NOTICE_STORE_VERSION, "notices": merged}
+
+    update_json_file(
+        paths.notice_store_path,
+        default=_notice_store_default(),
+        updater=updater,
+        chmod_mode=0o600,
+    )
 
 
 def _extract_notice_title_from_soup(soup: BeautifulSoup) -> str | None:
@@ -1184,12 +1376,12 @@ class NoticeService:
                 config=config,
                 auth_mode=auth_mode,
             )
-            course_meta = _course_meta_map_from_dashboard(
-                bootstrap.dashboard_html,
-                base_url=config.base_url,
-                exclude_patterns=config.exclude_course_title_patterns,
-                course_query=course_query,
+            course_meta = _course_meta_map_for_request(
+                self._paths,
+                bootstrap,
+                config=config,
                 course_id=course_id,
+                course_query=course_query,
             )
             board_map = self._resolve_notice_board_map(
                 context=context,
@@ -1445,9 +1637,14 @@ class NoticeService:
             max_workers=MAX_NOTICE_HTTP_WORKERS,
         )
 
+        stored_records = _load_notice_store_records(self._paths, board_ids=board_ids)
+        stored_notices = {
+            key: notice
+            for key, record in stored_records.items()
+            if (notice := _notice_from_store_record(record)) is not None
+        }
         all_items: list[Notice] = []
-        extra_paths: list[str] = []
-        by_board_id: dict[str, list[tuple[str, str]]] = {}
+        seen_keys: set[tuple[str, str, str]] = set()
         for board_id, first_path in zip(board_ids, first_paths):
             response = first_responses.get(first_path)
             if response is None:
@@ -1462,41 +1659,25 @@ class NoticeService:
                 )
             first_soup = BeautifulSoup(response.text, "html.parser")
             first_page_index, page_sequence = _plan_notice_page_sequence(first_soup, max_pages=max_pages)
-            by_board_id.setdefault(board_id, []).append((first_path, response.text))
             for page_index in page_sequence:
-                if page_index == first_page_index:
-                    continue
-                extra_paths.append(f"/mod/courseboard/view.php?id={board_id}&page={page_index}")
-
-        if extra_paths and (deadline is None or not deadline.hard_expired()):
-            extra_responses = fetch_html_batch(
-                bootstrap.http,
-                extra_paths,
-                deadline=deadline,
-                max_workers=MAX_NOTICE_HTTP_WORKERS,
-            )
-            for path in extra_paths:
-                response = extra_responses.get(path)
-                if response is None:
-                    continue
-                if looks_login_url(response.url) or looks_logged_out_html(response.text):
-                    raise CommandError(
-                        code="AUTH_EXPIRED",
-                        message="Saved KLMS auth did not stay authenticated while loading notice pages.",
-                        hint="Run `kaist klms auth refresh` and try again.",
-                        exit_code=10,
-                        retryable=True,
-                    )
-                match = re.search(r"[?&]id=(\d+)", path)
-                if not match:
-                    continue
-                by_board_id.setdefault(match.group(1), []).append((path, response.text))
-
-        seen_keys: set[tuple[str, str, str]] = set()
-        for board_id in board_ids:
-            for page_path, page_html in by_board_id.get(board_id, []):
                 if deadline is not None and deadline.hard_expired():
                     raise TimeoutError("Interactive notice refresh budget expired.")
+                if page_index == first_page_index:
+                    page_path = first_path
+                    page_html = response.text
+                else:
+                    page_path = f"/mod/courseboard/view.php?id={board_id}&page={page_index}"
+                    timeout_seconds = deadline.request_timeout(20.0, use_soft=False) if deadline is not None else 20.0
+                    page_response = bootstrap.http.get_html(page_path, timeout_seconds=timeout_seconds)
+                    if looks_login_url(page_response.url) or looks_logged_out_html(page_response.text):
+                        raise CommandError(
+                            code="AUTH_EXPIRED",
+                            message="Saved KLMS auth did not stay authenticated while loading notice pages.",
+                            hint="Run `kaist klms auth refresh` and try again.",
+                            exit_code=10,
+                            retryable=True,
+                        )
+                    page_html = page_response.text
                 page_soup = BeautifulSoup(page_html, "html.parser")
                 parsed = _parse_notice_items_from_soup(
                     page_soup,
@@ -1504,25 +1685,39 @@ class NoticeService:
                     base_url=config.base_url,
                     fallback_url_path=page_path,
                 )
+                page_has_new_or_changed = False
                 for item in parsed:
-                    key = (board_id, str(item.id or ""), str(item.url or ""))
-                    if key in seen_keys:
+                    dedupe_key = (board_id, str(item.id or ""), str(item.url or ""))
+                    if dedupe_key in seen_keys:
                         continue
-                    seen_keys.add(key)
-                    all_items.append(
-                        Notice(
-                            board_id=item.board_id,
-                            id=item.id,
-                            title=item.title,
-                            url=item.url,
-                            posted_raw=item.posted_raw,
-                            posted_iso=item.posted_iso,
-                            source=item.source,
-                            confidence=item.confidence,
-                            auth_mode=auth_mode,
-                        )
+                    seen_keys.add(dedupe_key)
+                    notice = Notice(
+                        board_id=item.board_id,
+                        id=item.id,
+                        title=item.title,
+                        url=item.url,
+                        posted_raw=item.posted_raw,
+                        posted_iso=item.posted_iso,
+                        source=item.source,
+                        confidence=item.confidence,
+                        auth_mode=auth_mode,
                     )
+                    stable_key = _stable_notice_key(notice)
+                    stored_record = stored_records.get(stable_key or "")
+                    stored_notice = stored_notices.get(stable_key or "")
+                    summary_matches = bool(
+                        stable_key
+                        and isinstance(stored_record, dict)
+                        and str(stored_record.get("summary_fingerprint") or "") == _notice_summary_fingerprint(notice)
+                    )
+                    if summary_matches and stored_notice is not None:
+                        notice = _merge_notice_rows(notice, stored_notice, auth_mode=auth_mode)
+                    else:
+                        page_has_new_or_changed = True
+                    all_items.append(notice)
                 if limit is not None and _matching_notice_count(all_items, since_iso=since_iso) >= limit:
+                    break
+                if parsed and not page_has_new_or_changed:
                     break
             if limit is not None and _matching_notice_count(all_items, since_iso=since_iso) >= limit:
                 break
@@ -1533,23 +1728,39 @@ class NoticeService:
             for item in final_items
         }
         if final_items:
-            enriched = _enrich_notice_items_from_detail(
-                final_items,
-                base_url=config.base_url,
-                auth_mode=auth_mode,
-                bootstrap=bootstrap,
-                deadline=deadline,
-            )
-            enriched_map = {
-                (str(item.board_id or ""), str(item.id or ""), str(item.url or "")): item
-                for item in enriched
-            }
+            needs_detail: list[Notice] = []
+            for item in final_items:
+                stable_key = _stable_notice_key(item)
+                stored_record = stored_records.get(stable_key or "")
+                stored_notice = stored_notices.get(stable_key or "")
+                summary_matches = bool(
+                    stable_key
+                    and isinstance(stored_record, dict)
+                    and str(stored_record.get("summary_fingerprint") or "") == _notice_summary_fingerprint(item)
+                )
+                if summary_matches and stored_notice is not None and _notice_has_persistent_detail(stored_notice):
+                    continue
+                needs_detail.append(item)
+            enriched_map: dict[tuple[str, str, str], Notice] = {}
+            if needs_detail:
+                enriched = _enrich_notice_items_from_detail(
+                    needs_detail,
+                    base_url=config.base_url,
+                    auth_mode=auth_mode,
+                    bootstrap=bootstrap,
+                    deadline=deadline,
+                )
+                enriched_map = {
+                    (str(item.board_id or ""), str(item.id or ""), str(item.url or "")): item
+                    for item in enriched
+                }
             updated_items: list[Notice] = []
             for item in all_items:
                 key = (str(item.board_id or ""), str(item.id or ""), str(item.url or ""))
                 updated_items.append(enriched_map.get(key, item) if key in final_keys else item)
             all_items = updated_items
 
+        _persist_notice_store(self._paths, all_items)
         save_cache_value(self._paths, self._notice_list_cache_key(config, board_ids, max_pages), [item.to_dict() for item in all_items], ttl_seconds=NOTICE_LIST_TTL_SECONDS)
         return all_items
 
@@ -1579,14 +1790,24 @@ class NoticeService:
                 exit_code=40,
             )
 
-        course_ids = _extract_course_ids_from_dashboard(
-            bootstrap.dashboard_html,
-            base_url=config.base_url,
-            configured_ids=config.course_ids,
-            exclude_patterns=config.exclude_course_title_patterns,
-            course_query=course_query,
-            course_id=course_id,
-        )
+        if course_query and not course_id:
+            course_meta = _course_meta_map_for_request(
+                self._paths,
+                bootstrap,
+                config=config,
+                course_id=None,
+                course_query=course_query,
+            )
+            course_ids = [str(course_id_value).strip() for course_id_value in course_meta.keys() if str(course_id_value).strip()]
+        else:
+            course_ids = _extract_course_ids_from_dashboard(
+                bootstrap.dashboard_html,
+                base_url=config.base_url,
+                configured_ids=config.course_ids,
+                exclude_patterns=config.exclude_course_title_patterns,
+                course_query=course_query,
+                course_id=course_id,
+            )
         if not course_ids:
             cached_board_ids = self._fallback_notice_board_ids_from_cache(self._paths, config)
             return {"": cached_board_ids} if cached_board_ids else {}

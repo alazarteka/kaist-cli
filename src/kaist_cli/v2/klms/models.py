@@ -12,6 +12,7 @@ class Course:
     course_code: str | None
     course_code_base: str | None
     term_label: str | None
+    title_variants: tuple[str, ...] = ()
     professors: tuple[str, ...] = ()
     source: str = "unknown"
     confidence: float = 0.0
@@ -19,6 +20,7 @@ class Course:
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
+        payload.pop("title_variants", None)
         payload["professors"] = list(self.professors)
         return payload
 
@@ -34,8 +36,10 @@ class Assignment:
     course_title: str | None
     course_code: str | None
     course_code_base: str | None
+    course_title_variants: tuple[str, ...] = ()
     body_text: str | None = None
     body_html: str | None = None
+    detail_note: str | None = None
     attachments: tuple[dict[str, Any], ...] = ()
     detail_available: bool = False
     source: str = "unknown"
@@ -44,6 +48,7 @@ class Assignment:
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
+        payload.pop("course_title_variants", None)
         payload["attachments"] = list(self.attachments)
         return payload
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -15,6 +16,7 @@ from .courses import (
     _course_code_base,
     _course_is_current_term,
     _course_matches_query,
+    _course_title_variants,
     _discover_courses_from_dashboard,
     _extract_current_term_from_dashboard,
     _is_noise_course,
@@ -142,15 +144,18 @@ def _discover_current_term_course_ids_from_dashboard(
 
 
 def _assignment_matches_course_query(assignment: Assignment, query: str | None) -> bool:
-    needle = _norm_text(str(query or "")).lower()
-    if not needle:
-        return True
-    haystacks = (
-        assignment.course_title,
-        assignment.course_code,
-        assignment.course_code_base,
+    carrier = type(
+        "_AssignmentCourseQueryCarrier",
+        (),
+        {
+            "id": str(assignment.course_id or "").strip() or None,
+            "title": assignment.course_title or "",
+            "course_title_variants": assignment.course_title_variants,
+            "course_code": assignment.course_code,
+            "course_code_base": assignment.course_code_base,
+        },
     )
-    return any(needle in _norm_text(value or "").lower() for value in haystacks if value)
+    return _course_matches_query(carrier, query)
 
 
 def _assignment_is_current_term(assignment: Assignment, current_term_label: str | None, *, include_past: bool) -> bool:
@@ -216,7 +221,8 @@ def _extract_assignment_rows_from_calendar_data(
 
         course = row.get("course") if isinstance(row.get("course"), dict) else {}
         course_id = str(row.get("courseid") or row.get("course_id") or course.get("id") or "").strip() or None
-        course_title = _norm_text(str(course.get("fullname") or course.get("fullnamedisplay") or "")) or None
+        course_title_variants = _course_title_variants(course.get("fullname"), course.get("fullnamedisplay"))
+        course_title = next(iter(course_title_variants), None)
         course_code = str(course.get("shortname") or "").strip() or None
         title = _norm_text(str(row.get("name") or row.get("title") or "assignment"))
         title = re.sub(r"\s+is due$", "", title, flags=re.IGNORECASE).strip() or title
@@ -234,6 +240,7 @@ def _extract_assignment_rows_from_calendar_data(
                 due_iso=due_iso,
                 course_id=course_id,
                 course_title=course_title,
+                course_title_variants=course_title_variants,
                 course_code=course_code,
                 course_code_base=_course_code_base(course_code),
                 source="api:core_calendar_get_action_events_by_timesort",
@@ -331,6 +338,7 @@ def _extract_assignments_from_index_html(
                     due_iso=None,
                     course_id=course_id,
                     course_title=None,
+                    course_title_variants=(),
                     course_code=None,
                     course_code_base=None,
                     source="html:assign-index-fallback",
@@ -376,6 +384,7 @@ def _extract_assignments_from_index_html(
                 due_iso=_parse_datetime_guess(due_raw) if due_raw else None,
                 course_id=course_id,
                 course_title=None,
+                course_title_variants=(),
                 course_code=None,
                 course_code_base=None,
                 source="html:assign-index",
@@ -432,6 +441,67 @@ def _extract_course_context_from_assignment_page(soup: BeautifulSoup) -> tuple[s
         if not _is_noise_course(course_title, ()):
             return course_id, course_title
     return candidates[0] if candidates else (None, None)
+
+
+def _looks_meaningful_assignment_body(text: str | None, *, title: str, course_title: str | None) -> bool:
+    normalized = _norm_text(str(text or ""))
+    if len(normalized) < 8:
+        return False
+    lowered = normalized.lower()
+    if lowered in {title.lower(), str(course_title or "").lower()}:
+        return False
+    if lowered in {
+        "due date",
+        "submission status",
+        "last modified",
+        "grading status",
+        "file submissions",
+        "online text",
+    }:
+        return False
+    return True
+
+
+def _extract_assignment_body_from_node(node: Any, *, title: str, course_title: str | None) -> tuple[str | None, str | None]:
+    if node is None:
+        return None, None
+    class_names = {str(value).strip().lower() for value in (node.get("class") or []) if str(value).strip()}
+    if class_names.intersection(
+        {
+            "submissionaction",
+            "submissionsummarytable",
+            "submissionstatustable",
+            "feedbackstatus",
+            "feedbackactions",
+            "submissionstatement",
+        }
+    ):
+        return None, None
+    text = _norm_text(node.get_text("\n", strip=True))
+    if not _looks_meaningful_assignment_body(text, title=title, course_title=course_title):
+        return None, None
+    lowered = text.lower()
+    if any(
+        phrase in lowered
+        for phrase in (
+            "add submission",
+            "edit submission",
+            "you have not made a submission yet",
+            "submission status",
+            "grading status",
+            "view all submissions",
+        )
+    ):
+        return None, None
+    links = [anchor for anchor in node.find_all("a", href=True)]
+    if links:
+        link_texts = [_norm_text(anchor.get_text(" ", strip=True)) for anchor in links]
+        link_texts = [value for value in link_texts if value]
+        if link_texts and text == " ".join(link_texts):
+            hrefs = [str(anchor.get("href") or "").strip() for anchor in links]
+            if all(_looks_like_attachment_url(href) for href in hrefs):
+                return None, None
+    return text, str(node)
 
 
 class AssignmentService:
@@ -618,13 +688,8 @@ class AssignmentService:
                 assignment_id=target_id,
                 auth_mode=auth_mode,
             )
-            if target_course_id and assignment.course_id and assignment.course_id != target_course_id:
-                raise CommandError(
-                    code="NOT_FOUND",
-                    message=f"Assignment {target_id} was not found in course {target_course_id}.",
-                    hint="Drop `--course-id` or pass the correct course scope.",
-                    exit_code=44,
-                )
+            if target_course_id and not assignment.course_id:
+                assignment = replace(assignment, course_id=target_course_id)
             return CommandResult(data=assignment.to_dict(), source="html", capability="partial")
 
         return self._auth.run_authenticated(
@@ -911,7 +976,7 @@ def _extract_assignment_detail_from_html(
 
     due_raw = None
     body_text = None
-    body_node = None
+    body_html = None
     for row in soup.select("table tr"):
         th = row.find("th")
         td = row.find("td")
@@ -923,20 +988,32 @@ def _extract_assignment_detail_from_html(
             continue
         if due_raw is None and any(token in key for token in ("due", "마감", "기한", "cut-off")):
             due_raw = value
-        if body_text is None and any(token in key for token in ("description", "설명", "instructions", "과제")) and len(value) > 20:
-            body_text = value
+        if body_text is None and any(token in key for token in ("description", "설명", "instructions", "과제", "내용", "개요")):
+            body_text, body_html = _extract_assignment_body_from_node(td, title=title, course_title=course_title)
 
     if body_text is None:
-        for selector in (".activity-description", ".box.py-3.generalbox", "#intro", ".no-overflow"):
-            node = soup.select_one(selector)
-            if not node:
-                continue
-            text = _norm_text(node.get_text("\n", strip=True))
-            if len(text) > 20:
-                body_text = text
-                body_node = node
+        for selector in (
+            ".activity-description",
+            ".assignintro",
+            "#intro",
+            "[data-region='activity-description']",
+            "[data-region='assignment-description']",
+            ".box.py-3.generalbox",
+            ".no-overflow",
+        ):
+            for node in soup.select(selector):
+                body_text, body_html = _extract_assignment_body_from_node(node, title=title, course_title=course_title)
+                if body_text:
+                    break
+            if body_text:
                 break
     attachments = _collect_assignment_attachments(soup, base_url=base_url)
+    detail_note = None
+    if body_text is None:
+        if attachments:
+            detail_note = "Assignment attachments were available, but the KLMS page did not expose an extractable description body."
+        else:
+            detail_note = "The KLMS assignment page did not expose an extractable description body."
 
     return Assignment(
         id=assignment_id,
@@ -946,13 +1023,15 @@ def _extract_assignment_detail_from_html(
         due_iso=_parse_datetime_guess(due_raw) if due_raw else None,
         course_id=course_id,
         course_title=course_title,
+        course_title_variants=_course_title_variants(course_title),
         course_code=course_code,
         course_code_base=_course_code_base(course_code),
         body_text=body_text,
-        body_html=str(body_node) if body_node is not None else None,
+        body_html=body_html,
+        detail_note=detail_note,
         attachments=attachments,
         detail_available=bool(body_text or attachments),
         source="html:assign-view",
-        confidence=0.76,
+        confidence=0.78 if body_text else 0.68,
         auth_mode=auth_mode,
     )

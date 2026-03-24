@@ -18,9 +18,12 @@ from .cache import load_cache_entry, load_cache_value, save_cache_value
 from .config import KlmsConfig, abs_url, load_config
 from .courses import (
     _course_code_base,
+    _course_metadata_row,
     _course_matches_query,
     _extract_course_code_from_resource_index,
     _is_noise_course,
+    _load_recent_courses_from_bootstrap,
+    _merge_course_metadata_rows,
     _norm_text,
     _select_dashboard_courses,
 )
@@ -204,12 +207,7 @@ def _extract_material_title_from_page(html: str) -> str | None:
 
 def _course_map_from_dashboard(html: str, *, base_url: str, configured_ids: tuple[str, ...]) -> dict[str, dict[str, str | None]]:
     courses = {
-        str(course.id): {
-            "course_id": str(course.id),
-            "course_title": course.title,
-            "course_code": course.course_code,
-            "term_label": course.term_label,
-        }
+        str(course.id): _course_metadata_row(course)
         for course in _select_dashboard_courses(
             html,
             base_url=base_url,
@@ -223,7 +221,17 @@ def _course_map_from_dashboard(html: str, *, base_url: str, configured_ids: tupl
         course_id = str(configured_id).strip()
         if not course_id:
             continue
-        courses.setdefault(course_id, {"course_id": course_id, "course_title": None, "course_code": None, "term_label": None})
+        courses.setdefault(
+            course_id,
+            {
+                "course_id": course_id,
+                "course_title": None,
+                "course_title_variants": (),
+                "course_code": None,
+                "course_code_base": None,
+                "term_label": None,
+            },
+        )
     return courses
 
 
@@ -1115,15 +1123,30 @@ class FileService:
         course_query: str | None = None,
     ) -> dict[str, dict[str, str | None]]:
         course_map = _course_map_from_dashboard(bootstrap.dashboard_html, base_url=config.base_url, configured_ids=config.course_ids)
+        course_map = _merge_course_metadata_rows(
+            course_map,
+            _load_recent_courses_from_bootstrap(
+                self._paths,
+                bootstrap,
+                exclude_patterns=config.exclude_course_title_patterns,
+            ),
+        )
         if course_id:
             target = str(course_id).strip()
-            course_meta = course_map.get(target) or {"course_id": target, "course_title": None, "course_code": None, "term_label": None}
+            course_meta = course_map.get(target) or {
+                "course_id": target,
+                "course_title": None,
+                "course_title_variants": (),
+                "course_code": None,
+                "course_code_base": None,
+                "term_label": None,
+            }
             return {target: course_meta}
         discovered = _select_dashboard_courses(
             bootstrap.dashboard_html,
             base_url=config.base_url,
             exclude_patterns=config.exclude_course_title_patterns,
-            course_query=course_query,
+            course_query=None,
             include_past=False,
             allow_termless_fallback=True,
         )
@@ -1133,19 +1156,7 @@ class FileService:
             for key, value in course_map.items()
             if key in selected_ids
             and not _is_noise_course(str(value.get("course_title") or ""), config.exclude_course_title_patterns)
-            and _course_matches_query(
-                type(
-                    "_CourseQueryCarrier",
-                    (),
-                    {
-                        "id": key,
-                        "title": str(value.get("course_title") or ""),
-                        "course_code": value.get("course_code"),
-                        "course_code_base": _course_code_base(str(value.get("course_code") or "").strip() or None),
-                    },
-                ),
-                course_query,
-            )
+            and _course_matches_query(value, course_query)
         }
 
     def _refresh_file_items(
