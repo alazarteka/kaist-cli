@@ -91,6 +91,25 @@ kaist klms auth doctor
 The manual browser login (no `--username`) requires an interactive terminal with a display and is not suitable for headless or non-interactive shells. The Easy Login flow (`--username`) runs headless and works in non-interactive shells — it just needs the user to approve the push notification in the KAIST auth app. Once logged in, `auth refresh` handles renewal automatically when a username was saved.
 The explicit non-interactive setup command is `kaist klms auth login --base-url https://klms.kaist.ac.kr --username KAIST_ID`.
 
+### Agent auth recovery behavior
+
+When a KLMS task fails with `AUTH_MISSING` or `AUTH_EXPIRED`, prefer running `kaist klms auth refresh` yourself before telling the user to do it manually, as long as saved auth config exists and a saved Easy Login username is available.
+
+During `auth refresh`:
+
+- keep the refresh process running instead of abandoning it after the first output
+- poll output continuously while the refresh is waiting
+- as soon as an Easy Login approval number appears, immediately tell the user the number and ask them to approve it in the KAIST auth app
+- do not wait for the command to finish before relaying the number
+- after the user approves and refresh succeeds, continue the original KLMS task automatically
+
+Only hand the auth step back to the user when:
+
+- refresh fails or times out
+- the flow requires manual browser interaction
+- no saved Easy Login username exists
+- the user explicitly wants to run the auth command themselves
+
 ## Common workflows
 
 ### Check what's due and new
