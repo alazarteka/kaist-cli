@@ -146,30 +146,25 @@ def _extract_easy_login_number(html: str) -> str | None:
 
     text = " ".join(soup.get_text("\n", strip=True).split())
     patterns = (
-        r"(?:verification\s*code|login|easy login|authentication|approval)\s*(?:number|code)?\s*[:：]?\s*([0-9]{2,8})",
-        r"(?:인증\s*코드|로그인|간편\s*로그인|인증|승인)\s*(?:번호|코드)?\s*[:：]?\s*([0-9]{2,8})",
-        r"(?:번호|number)\s*[:：]?\s*([0-9]{4,8})",
+        r"(?:verification\s*code|login\s*number|easy login\s*number|authentication\s*number|approval\s*number)\s*[:：]?\s*([0-9]{2,6})",
+        r"(?:인증\s*코드|로그인\s*번호|간편\s*로그인\s*번호|인증\s*번호|승인\s*번호)\s*[:：]?\s*([0-9]{2,6})",
+        r"(?:^|[\s(])number\s*[:：]?\s*([0-9]{4,6})(?:$|[\s)])",
     )
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
             return match.group(1)
-
-    for node in soup.find_all(attrs={"id": True}):
-        node_id = str(node.get("id") or "").lower()
-        if any(token in node_id for token in ("auth", "approve", "login", "number", "code")):
-            text = " ".join(node.get_text(" ", strip=True).split())
-            match = re.search(r"\b([0-9]{4,8})\b", text)
-            if match:
-                return match.group(1)
-    for node in soup.find_all(attrs={"class": True}):
-        classes = " ".join(str(value).lower() for value in (node.get("class") or []))
-        if any(token in classes for token in ("auth", "approve", "login", "number", "code")):
-            text = " ".join(node.get_text(" ", strip=True).split())
-            match = re.search(r"\b([0-9]{4,8})\b", text)
-            if match:
-                return match.group(1)
     return None
+
+
+def _should_update_easy_login_number(*, previous: str | None, current: str | None) -> bool:
+    if not current or current == previous:
+        return False
+    if previous is None:
+        return True
+    if len(current) != len(previous):
+        return False
+    return True
 
 
 def _looks_like_easy_login_page(url: str) -> bool:
@@ -952,7 +947,7 @@ class AuthService:
                         retryable=False,
                     )
                 current_number = _extract_easy_login_number(current_html)
-                if current_number and current_number != printed_login_number:
+                if _should_update_easy_login_number(previous=printed_login_number, current=current_number):
                     printed_login_number = current_number
                     print(f"KAIST SSO Easy Login number: {current_number}", file=sys.stderr)
 

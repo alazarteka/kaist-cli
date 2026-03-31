@@ -25,7 +25,7 @@ from kaist_cli.v2.contracts import CommandError, CommandResult
 from kaist_cli.v2.klms.cache import load_cache_entry, load_cache_value, save_cache_value
 from kaist_cli.v2.klms import dashboard as dashboard_module
 from kaist_cli.v2.klms.auth import AuthService
-from kaist_cli.v2.klms.auth import _EasyLoginSignals, _extract_easy_login_error_message, _extract_easy_login_number, _extract_sso_login_view_url, looks_login_url
+from kaist_cli.v2.klms.auth import _EasyLoginSignals, _extract_easy_login_error_message, _extract_easy_login_number, _extract_sso_login_view_url, _should_update_easy_login_number, looks_login_url
 from kaist_cli.v2.klms.assignments import AssignmentService, _extract_assignment_detail_from_html, _extract_assignment_rows_from_calendar_data, _filter_assignments
 from kaist_cli.v2.klms.courses import _course_is_current_term, _course_matches_query, _discover_courses_from_dashboard, _parse_recent_courses_payload
 from kaist_cli.v2.klms.capture import _courseboard_runtime_capture_summary, _extract_courseboard_js_hints
@@ -397,6 +397,30 @@ def test_extract_easy_login_number_from_verification_widget() -> None:
     assert _extract_easy_login_number(html) == "50"
 
 
+def test_extract_easy_login_number_ignores_countdown_digits() -> None:
+    html = """
+    <html><body>
+      <div class="auth_contents_wrap">
+        <div class="auth_number">
+          <div class="nember_wrap">
+            <span>1</span>
+            <span>4</span>
+          </div>
+        </div>
+        <div class="auth_time_wrap">
+          <strong id="countdown">88</strong>
+        </div>
+      </div>
+    </body></html>
+    """
+    assert _extract_easy_login_number(html) == "14"
+
+
+def test_should_update_easy_login_number_rejects_mutated_longer_code() -> None:
+    assert _should_update_easy_login_number(previous="15", current="1488") is False
+    assert _should_update_easy_login_number(previous="15", current="28") is True
+
+
 def test_wait_for_easy_login_init_accepts_verification_page_without_second_redirect(tmp_path: Path) -> None:
     class FakePage:
         def __init__(self) -> None:
@@ -593,6 +617,63 @@ def test_wait_for_easy_login_approval_times_out_on_repeated_waiting_state(tmp_pa
 
     error = excinfo.value
     assert getattr(error, "code", None) == "AUTH_TIMEOUT"
+
+
+def test_wait_for_easy_login_approval_keeps_original_number_when_extractor_mutates(tmp_path: Path, monkeypatch) -> None:
+    class FakePage:
+        def __init__(self) -> None:
+            self.url = "https://sso.kaist.ac.kr/auth/twofactor/mfa/login2Factor"
+            self.html = _read_fixture("kaist_sso_login2factor.html")
+
+        def content(self) -> str:
+            return self.html
+
+        def wait_for_timeout(self, ms: int) -> None:  # noqa: ARG002
+            return None
+
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        auth = AuthService(paths)
+        signals = _EasyLoginSignals(latest_mfa_payload={"result": False, "error_code": "ESY020"})
+        tick = {"value": 0.0}
+
+        def fake_monotonic() -> float:
+            tick["value"] += 5.0
+            return tick["value"]
+
+        monkeypatch.setattr(auth_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
+        monkeypatch.setattr(auth_module.time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(auth_module, "_extract_easy_login_number", lambda html: "1488")
+        monkeypatch.setattr(
+            auth,
+            "_context_dashboard_state",
+            lambda context, *, config, timeout_ms: {  # type: ignore[no-untyped-def]
+                "authenticated": False,
+                "final_url": config.base_url.rstrip("/") + config.dashboard_path,
+                "html": "<html></html>",
+            },
+        )
+        with pytest.raises(CommandError) as excinfo:
+            auth._wait_for_easy_login_approval(
+                page=FakePage(),
+                context=object(),
+                config=config,
+                username="student123",
+                wait_seconds=15.0,
+                login_number="15",
+                signals=signals,
+            )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert "Login number: 15." in str(excinfo.value)
 
 
 def test_wait_for_easy_login_approval_completes_device_registration_and_succeeds(tmp_path: Path, monkeypatch) -> None:
