@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from ..contracts import CommandError
 from .paths import KlmsPaths, ensure_private_dirs
+
+AuthStrategy = Literal["easy_login", "email_otp"]
 
 
 @dataclass(frozen=True)
@@ -14,6 +16,8 @@ class KlmsConfig:
     base_url: str
     dashboard_path: str
     auth_username: str | None
+    auth_strategy: AuthStrategy
+    otp_source: str | None
     course_ids: tuple[str, ...]
     notice_board_ids: tuple[str, ...]
     exclude_course_title_patterns: tuple[str, ...]
@@ -48,6 +52,23 @@ def _normalize_dashboard_path(value: str | None) -> str:
 def _normalize_auth_username(value: str | None) -> str | None:
     username = (value or "").strip()
     return username or None
+
+
+def _normalize_auth_strategy(value: str | None) -> AuthStrategy:
+    text = str(value or "easy_login").strip().lower() or "easy_login"
+    if text not in {"easy_login", "email_otp"}:
+        raise CommandError(
+            code="CONFIG_INVALID",
+            message=f"Unsupported auth_strategy: {value}",
+            hint="Use `easy_login` or `email_otp`.",
+            exit_code=40,
+        )
+    return text  # type: ignore[return-value]
+
+
+def _normalize_otp_source(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    return text or None
 
 
 def _coerce_list(raw: Any, *, field_name: str) -> tuple[str, ...]:
@@ -93,6 +114,8 @@ def load_config(paths: KlmsPaths) -> KlmsConfig:
         base_url=_normalize_base_url(str(data.get("base_url", ""))),
         dashboard_path=_normalize_dashboard_path(str(data.get("dashboard_path", "/my/"))),
         auth_username=_normalize_auth_username(data.get("auth_username")),
+        auth_strategy=_normalize_auth_strategy(data.get("auth_strategy")),
+        otp_source=_normalize_otp_source(data.get("otp_source")),
         course_ids=_coerce_list(data.get("course_ids"), field_name="course_ids"),
         notice_board_ids=_coerce_list(data.get("notice_board_ids"), field_name="notice_board_ids"),
         exclude_course_title_patterns=_coerce_list(
@@ -115,6 +138,8 @@ def save_config(
     base_url: str | None = None,
     dashboard_path: str | None = None,
     auth_username: str | None = None,
+    auth_strategy: AuthStrategy | None = None,
+    otp_source: str | None = None,
 ) -> KlmsConfig:
     ensure_private_dirs(paths)
     existing = maybe_load_config(paths)
@@ -125,6 +150,16 @@ def save_config(
         if auth_username is not None
         else (existing.auth_username if existing else None)
     )
+    resolved_auth_strategy = (
+        _normalize_auth_strategy(auth_strategy)
+        if auth_strategy is not None
+        else (existing.auth_strategy if existing else "easy_login")
+    )
+    resolved_otp_source = (
+        _normalize_otp_source(otp_source)
+        if otp_source is not None
+        else (existing.otp_source if existing else None)
+    )
 
     course_ids = existing.course_ids if existing else ()
     notice_board_ids = existing.notice_board_ids if existing else ()
@@ -134,6 +169,8 @@ def save_config(
         f"base_url = {_toml_quote(resolved_base_url)}",
         f"dashboard_path = {_toml_quote(resolved_dashboard_path)}",
         f"auth_username = {_toml_quote(resolved_auth_username or '')}",
+        f"auth_strategy = {_toml_quote(resolved_auth_strategy)}",
+        f"otp_source = {_toml_quote(resolved_otp_source or '')}",
         f"course_ids = {json.dumps(list(course_ids), ensure_ascii=False)}",
         f"notice_board_ids = {json.dumps(list(notice_board_ids), ensure_ascii=False)}",
         f"exclude_course_title_patterns = {json.dumps(list(exclude_course_title_patterns), ensure_ascii=False)}",
@@ -145,6 +182,8 @@ def save_config(
         base_url=resolved_base_url,
         dashboard_path=resolved_dashboard_path,
         auth_username=resolved_auth_username,
+        auth_strategy=resolved_auth_strategy,
+        otp_source=resolved_otp_source,
         course_ids=course_ids,
         notice_board_ids=notice_board_ids,
         exclude_course_title_patterns=exclude_course_title_patterns,

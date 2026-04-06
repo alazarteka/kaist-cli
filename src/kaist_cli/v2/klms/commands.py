@@ -16,6 +16,14 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
         )
     if args.group == "auth" and args.action == "install-browser":
         return facade.auth_install_browser(force=args.force)
+    if args.group == "auth" and args.action == "setup-email-otp":
+        return facade.auth_setup_email_otp(
+            base_url=args.base_url,
+            dashboard_path=args.dashboard_path,
+            username=args.username,
+            otp_source=args.otp_source,
+            password_env=args.password_env,
+        )
     if args.group == "auth" and args.action == "status":
         return facade.auth_status()
     if args.group == "auth" and args.action == "refresh":
@@ -25,6 +33,17 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
             username=args.username,
             wait_seconds=args.wait_seconds,
         )
+    if args.group == "auth" and args.action == "begin-refresh":
+        return facade.auth_begin_refresh(
+            base_url=args.base_url,
+            dashboard_path=args.dashboard_path,
+            username=args.username,
+            wait_seconds=args.wait_seconds,
+        )
+    if args.group == "auth" and args.action == "complete-refresh":
+        return facade.auth_complete_refresh(args.session_id, otp=args.otp, wait_seconds=args.wait_seconds)
+    if args.group == "auth" and args.action == "cancel-refresh":
+        return facade.auth_cancel_refresh(args.session_id)
     if args.group == "auth" and args.action == "doctor":
         return facade.auth_doctor()
     if args.group == "today":

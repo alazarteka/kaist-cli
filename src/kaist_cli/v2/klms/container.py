@@ -58,6 +58,23 @@ class KlmsFacade:
     def auth_install_browser(self, *, force: bool = False) -> CommandResult:
         return self._auth.install_browser(force=force)
 
+    def auth_setup_email_otp(
+        self,
+        *,
+        base_url: str | None = None,
+        dashboard_path: str | None = None,
+        username: str,
+        otp_source: str = "manual",
+        password_env: str | None = None,
+    ) -> CommandResult:
+        return self._auth.setup_email_otp(
+            base_url=base_url,
+            dashboard_path=dashboard_path,
+            username=username,
+            otp_source=otp_source,
+            password_env=password_env,
+        )
+
     def auth_status(self) -> CommandResult:
         return self._auth.status()
 
@@ -75,6 +92,33 @@ class KlmsFacade:
             username=username,
             wait_seconds=wait_seconds,
         )
+
+    def auth_begin_refresh(
+        self,
+        *,
+        base_url: str | None = None,
+        dashboard_path: str | None = None,
+        username: str | None = None,
+        wait_seconds: float = 180.0,
+    ) -> CommandResult:
+        return self._auth.begin_refresh(
+            base_url=base_url,
+            dashboard_path=dashboard_path,
+            username=username,
+            wait_seconds=wait_seconds,
+        )
+
+    def auth_complete_refresh(
+        self,
+        session_id: str,
+        *,
+        otp: str,
+        wait_seconds: float = 180.0,
+    ) -> CommandResult:
+        return self._auth.complete_refresh(session_id, otp=otp, wait_seconds=wait_seconds)
+
+    def auth_cancel_refresh(self, session_id: str) -> CommandResult:
+        return self._auth.cancel_refresh(session_id)
 
     def auth_doctor(self) -> CommandResult:
         return self._auth.doctor()

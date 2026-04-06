@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html as _html
+import getpass
 import json
 import os
 import re
@@ -19,8 +20,10 @@ from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 
 from ...core.state_store import file_lock
 from ..contracts import CommandError, CommandResult
+from .auth_session import clear_auth_session, load_auth_session, new_auth_session_id, save_auth_session, session_expiry_iso, utc_now_iso
 from .config import KlmsConfig, maybe_load_config, save_config
 from .paths import KlmsPaths, chmod_best_effort, configure_playwright_env, ensure_private_dirs
+from .secrets import KeychainSecretStore
 
 
 AuthMode = Literal["profile", "storage_state", "none"]
@@ -51,6 +54,8 @@ EASY_LOGIN_VIEW_NEEDLE = "/auth/kaist/user/login/view"
 EASY_LOGIN_SUBMIT_NEEDLE = "/auth/twofactor/mfa/login2Factor"
 EASY_LOGIN_POLL_SECONDS = 1.0
 EASY_LOGIN_DEFAULT_WAIT_SECONDS = 180.0
+EMAIL_OTP_DEFAULT_WAIT_SECONDS = 180.0
+EMAIL_OTP_SESSION_TTL_SECONDS = 10 * 60
 
 
 def epoch_to_iso_utc(epoch: float) -> str:
@@ -201,6 +206,140 @@ def _looks_like_easy_login_verification_page(html: str) -> bool:
         )
     )
 
+
+def _looks_like_email_otp_page(url: str, html: str) -> bool:
+    lowered_url = (url or "").lower()
+    lowered_html = (html or "").lower()
+    url_markers = ("otp", "email", "mail", "verify", "cert", "2factor")
+    text_markers = (
+        "verification code",
+        "one-time code",
+        "one time code",
+        "email verification",
+        "sent to your email",
+        "sent to email",
+        "인증번호",
+        "이메일",
+        "메일",
+        "보안코드",
+        "otp",
+    )
+    has_input = bool(re.search(r"<input[^>]+(?:type=['\"]?(?:text|tel|number)['\"]?)", lowered_html))
+    return (any(marker in lowered_url for marker in url_markers) or any(marker in lowered_html for marker in text_markers)) and has_input
+
+
+def _extract_email_otp_error_message(html: str) -> str | None:
+    soup = BeautifulSoup(html, "html.parser")
+    for selector in ("#otpResultMsg", "#resultMsg", "#mfaResultMsg", ".alert-danger", ".error", ".txt_error"):
+        node = soup.select_one(selector)
+        if node is None:
+            continue
+        text = " ".join(node.get_text(" ", strip=True).split())
+        if text:
+            return text
+    return None
+
+
+def _submit_password_login(page: Any, *, username: str, password: str) -> bool:
+    script = """
+    ([username, password]) => {
+      const findFirst = (selectors) => {
+        for (const selector of selectors) {
+          const node = document.querySelector(selector);
+          if (node) return node;
+        }
+        return null;
+      };
+      const userInput = findFirst([
+        '#login_id', '#loginId', '#username', '#userId', 'input[name="login_id"]',
+        'input[name="loginId"]', 'input[name="username"]', 'input[name="userId"]',
+        'input[type="text"][name*="id"]', 'input[type="email"]'
+      ]);
+      const passInput = findFirst([
+        '#login_pw', '#loginPw', '#password', '#userPw', 'input[name="login_pw"]',
+        'input[name="loginPw"]', 'input[name="password"]', 'input[name="userPw"]',
+        'input[type="password"]'
+      ]);
+      if (!userInput || !passInput) return false;
+      userInput.focus();
+      userInput.value = username;
+      userInput.dispatchEvent(new Event('input', { bubbles: true }));
+      userInput.dispatchEvent(new Event('change', { bubbles: true }));
+      passInput.focus();
+      passInput.value = password;
+      passInput.dispatchEvent(new Event('input', { bubbles: true }));
+      passInput.dispatchEvent(new Event('change', { bubbles: true }));
+      const submit = findFirst([
+        'button[type="submit"]', 'input[type="submit"]', 'a.btn_login', '.btn_login'
+      ]);
+      if (submit) {
+        submit.click();
+        return true;
+      }
+      if (passInput.form) {
+        passInput.form.submit();
+        return true;
+      }
+      return false;
+    }
+    """
+    try:
+        return bool(page.evaluate(script, [username, password]))
+    except Exception:
+        return False
+
+
+def _submit_email_otp_code(page: Any, *, otp: str) -> bool:
+    script = """
+    (otp) => {
+      const visible = (node) => {
+        if (!node) return false;
+        const style = window.getComputedStyle(node);
+        return style.display !== 'none' && style.visibility !== 'hidden';
+      };
+      const inputs = Array.from(document.querySelectorAll('input'))
+        .filter((node) => visible(node))
+        .filter((node) => !['hidden', 'password'].includes((node.type || '').toLowerCase()));
+      const splitInputs = inputs.filter((node) => ['1', 1].includes(node.maxLength));
+      if (splitInputs.length === otp.length && splitInputs.length > 1) {
+        splitInputs.forEach((node, index) => {
+          node.focus();
+          node.value = otp[index] || '';
+          node.dispatchEvent(new Event('input', { bubbles: true }));
+          node.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+      } else {
+        const candidate = inputs.find((node) => {
+          const hint = [node.id, node.name, node.className].join(' ').toLowerCase();
+          return ['otp', 'code', 'auth', 'verify', 'cert'].some((token) => hint.includes(token));
+        }) || inputs[0];
+        if (!candidate) return false;
+        candidate.focus();
+        candidate.value = otp;
+        candidate.dispatchEvent(new Event('input', { bubbles: true }));
+        candidate.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      const buttons = Array.from(document.querySelectorAll('button, input[type="submit"], a'));
+      const submit = buttons.find((node) => {
+        const text = ((node.textContent || '') + ' ' + (node.value || '') + ' ' + (node.id || '') + ' ' + (node.className || '')).toLowerCase();
+        return ['submit', 'verify', 'confirm', 'continue', '인증', '확인', '로그인'].some((token) => text.includes(token));
+      });
+      if (submit) {
+        submit.click();
+        return true;
+      }
+      const form = inputs[0]?.form;
+      if (form) {
+        form.submit();
+        return true;
+      }
+      return false;
+    }
+    """
+    try:
+        return bool(page.evaluate(script, otp))
+    except Exception:
+        return False
 
 @dataclass
 class _EasyLoginSignals:
@@ -668,8 +807,9 @@ def _launch_chromium_browser_sync(playwright: Any, *, paths: KlmsPaths, headless
 
 
 class AuthService:
-    def __init__(self, paths: KlmsPaths) -> None:
+    def __init__(self, paths: KlmsPaths, *, secret_store: KeychainSecretStore | None = None) -> None:
         self._paths = paths
+        self._secret_store = secret_store or KeychainSecretStore()
 
     def _config_payload(self, config: KlmsConfig | None) -> dict[str, Any] | None:
         if config is None:
@@ -678,6 +818,8 @@ class AuthService:
             "base_url": config.base_url,
             "dashboard_path": config.dashboard_path,
             "auth_username": config.auth_username,
+            "auth_strategy": config.auth_strategy,
+            "otp_source": config.otp_source,
             "course_ids": list(config.course_ids),
             "notice_board_ids": list(config.notice_board_ids),
             "exclude_course_title_patterns": list(config.exclude_course_title_patterns),
@@ -699,12 +841,14 @@ class AuthService:
             "config_path": str(self._paths.config_path),
             "profile_path": str(self._paths.profile_dir),
             "storage_state_path": str(self._paths.storage_state_path),
+            "auth_session_path": str(self._paths.auth_session_path),
             "auth_mode": mode,
             "session_artifacts": {
                 "profile": has_profile_session(self._paths),
                 "storage_state": has_storage_state_session(self._paths),
             },
             "storage_state_cookie_stats": storage_state_cookie_stats(self._paths),
+            "staged_auth_session": self._session_snapshot(),
             "config": self._config_payload(config),
             "validation_mode": "offline-only",
             "login_detection": {
@@ -715,11 +859,415 @@ class AuthService:
             "recommended_action": self._recommended_action(config=config, mode=mode),
         }
 
+    def _session_snapshot(self) -> dict[str, Any] | None:
+        payload = load_auth_session(self._paths)
+        if payload is None:
+            return None
+        return {
+            "session_id": str(payload.get("session_id") or "").strip() or None,
+            "strategy": str(payload.get("strategy") or "").strip() or None,
+            "stage": str(payload.get("stage") or "").strip() or None,
+            "username": str(payload.get("username") or "").strip() or None,
+            "started_at": str(payload.get("started_at") or "").strip() or None,
+            "expires_at": str(payload.get("expires_at") or "").strip() or None,
+            "otp_source": str(payload.get("otp_source") or "").strip() or None,
+        }
+
     def status(self) -> CommandResult:
         return CommandResult(data=self.snapshot(), source="bootstrap", capability="partial")
 
     def install_browser(self, *, force: bool = False) -> CommandResult:
         return CommandResult(data=install_browser(self._paths, force=force), source="bootstrap", capability="partial")
+
+    def _resolve_password_input(self, *, username: str, password_env: str | None) -> str:
+        env_name = str(password_env or "").strip()
+        if env_name:
+            value = os.environ.get(env_name, "")
+            if value:
+                return value
+            raise CommandError(
+                code="CONFIG_INVALID",
+                message=f"Environment variable {env_name} was empty or unset.",
+                hint="Set the variable first, or rerun without `--password-env` to enter the password interactively.",
+                exit_code=40,
+                retryable=False,
+            )
+        if not sys.stdin or not sys.stdin.isatty():
+            raise CommandError(
+                code="AUTH_SECRET_UNAVAILABLE",
+                message="Email OTP setup requires an interactive terminal or `--password-env`.",
+                hint="Run `kaist klms auth setup-email-otp --password-env VAR ...` in non-interactive shells.",
+                exit_code=10,
+                retryable=False,
+            )
+        password = getpass.getpass(f"KAIST password for {username}: ")
+        if not password.strip():
+            raise CommandError(
+                code="CONFIG_INVALID",
+                message="Password must not be empty.",
+                hint="Rerun `kaist klms auth setup-email-otp` and enter the KAIST password.",
+                exit_code=40,
+                retryable=False,
+            )
+        return password
+
+    def setup_email_otp(
+        self,
+        *,
+        base_url: str | None = None,
+        dashboard_path: str | None = None,
+        username: str,
+        otp_source: str = "manual",
+        password_env: str | None = None,
+    ) -> CommandResult:
+        normalized_username = str(username or "").strip()
+        if not normalized_username:
+            raise CommandError(code="CONFIG_INVALID", message="KAIST username is required.", exit_code=40)
+        password = self._resolve_password_input(username=normalized_username, password_env=password_env)
+        config = save_config(
+            self._paths,
+            base_url=base_url,
+            dashboard_path=dashboard_path,
+            auth_username=normalized_username,
+            auth_strategy="email_otp",
+            otp_source=otp_source,
+        )
+        self._secret_store.store_email_otp_password(username=normalized_username, password=password)
+        return CommandResult(
+            data={
+                "ok": True,
+                "base_url": config.base_url,
+                "dashboard_path": config.dashboard_path,
+                "config_path": str(self._paths.config_path),
+                "auth_strategy": config.auth_strategy,
+                "otp_source": config.otp_source,
+                "username": normalized_username,
+                "secret_storage": "macos_keychain",
+            },
+            source="bootstrap",
+            capability="partial",
+        )
+
+    def _require_email_otp_config(
+        self,
+        *,
+        base_url: str | None = None,
+        dashboard_path: str | None = None,
+        username: str | None = None,
+    ) -> tuple[KlmsConfig, str]:
+        existing = maybe_load_config(self._paths)
+        resolved_username = str(username or "").strip() or (existing.auth_username if existing else None)
+        config = save_config(
+            self._paths,
+            base_url=base_url,
+            dashboard_path=dashboard_path,
+            auth_username=resolved_username,
+        )
+        if config.auth_strategy != "email_otp":
+            raise CommandError(
+                code="AUTH_FLOW_UNSUPPORTED",
+                message="KLMS auth is not configured for staged email OTP refresh.",
+                hint="Run `kaist klms auth setup-email-otp --username <KAIST_ID>` first.",
+                exit_code=10,
+                retryable=False,
+            )
+        if not config.auth_username:
+            raise CommandError(
+                code="CONFIG_INVALID",
+                message="KLMS email OTP auth requires a saved KAIST username.",
+                hint="Run `kaist klms auth setup-email-otp --username <KAIST_ID>` first.",
+                exit_code=40,
+                retryable=False,
+            )
+        return config, config.auth_username
+
+    def _auth_session_payload(
+        self,
+        *,
+        config: KlmsConfig,
+        username: str,
+        challenge_url: str,
+    ) -> dict[str, Any]:
+        return {
+            "session_id": new_auth_session_id(),
+            "strategy": "email_otp",
+            "stage": "waiting_for_email_otp",
+            "username": username,
+            "otp_source": config.otp_source or "manual",
+            "base_url": config.base_url,
+            "dashboard_path": config.dashboard_path,
+            "challenge_url": challenge_url,
+            "started_at": utc_now_iso(),
+            "expires_at": session_expiry_iso(ttl_seconds=EMAIL_OTP_SESSION_TTL_SECONDS),
+        }
+
+    def _require_active_auth_session(self, session_id: str) -> dict[str, Any]:
+        payload = load_auth_session(self._paths)
+        if payload is None:
+            raise CommandError(
+                code="AUTH_SESSION_MISSING",
+                message="No staged KLMS auth session was found.",
+                hint="Run `kaist klms auth begin-refresh` first.",
+                exit_code=10,
+                retryable=True,
+            )
+        if str(payload.get("session_id") or "").strip() != str(session_id).strip():
+            raise CommandError(
+                code="AUTH_SESSION_MISSING",
+                message=f"Staged KLMS auth session not found: {session_id}",
+                hint="Run `kaist klms auth begin-refresh` again to create a fresh session.",
+                exit_code=10,
+                retryable=True,
+            )
+        expires_at = str(payload.get("expires_at") or "").strip()
+        if expires_at:
+            normalized = expires_at.replace("Z", "+00:00")
+            try:
+                expires_dt = datetime.fromisoformat(normalized)
+            except ValueError:
+                expires_dt = None
+            if expires_dt is not None and expires_dt <= datetime.now(timezone.utc):
+                clear_auth_session(self._paths)
+                raise CommandError(
+                    code="AUTH_SESSION_EXPIRED",
+                    message=f"Staged KLMS auth session expired: {session_id}",
+                    hint="Run `kaist klms auth begin-refresh` again to request a fresh OTP challenge.",
+                    exit_code=10,
+                    retryable=True,
+                )
+        return payload
+
+    def _wait_for_email_otp_challenge(
+        self,
+        *,
+        page: Any,
+        context: Any,
+        config: KlmsConfig,
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + max(1.0, timeout_seconds)
+        while time.monotonic() < deadline:
+            current_url = _safe_page_url(page) or ""
+            current_html = _safe_page_content(page) or ""
+            if _page_has_authenticated_klms_session(page, config=config) or self._context_has_authenticated_page(context, config=config):
+                self._persist_context_state(context)
+                clear_auth_session(self._paths)
+                return {"status": "completed"}
+            if error_message := _extract_email_otp_error_message(current_html):
+                raise CommandError(
+                    code="AUTH_FAILED",
+                    message=f"KAIST email OTP login failed before the OTP challenge ({error_message}).",
+                    hint="Check the KAIST username/password, then rerun `kaist klms auth begin-refresh`.",
+                    exit_code=10,
+                    retryable=False,
+                )
+            if _looks_like_email_otp_page(current_url, current_html):
+                return {"status": "waiting_for_email_otp", "challenge_url": current_url}
+            page.wait_for_timeout(250)
+        raise CommandError(
+            code="AUTH_OTP_REQUIRED",
+            message="Timed out waiting for the KAIST email OTP challenge page.",
+            hint="Retry `kaist klms auth begin-refresh`; if KAIST changed the login flow, inspect it manually once.",
+            exit_code=10,
+            retryable=True,
+        )
+
+    def _wait_for_email_otp_completion(
+        self,
+        *,
+        page: Any,
+        context: Any,
+        config: KlmsConfig,
+        wait_seconds: float,
+    ) -> None:
+        deadline = time.monotonic() + max(1.0, wait_seconds)
+        while time.monotonic() < deadline:
+            if _page_has_authenticated_klms_session(page, config=config) or self._context_has_authenticated_page(context, config=config):
+                self._persist_context_state(context)
+                return
+            current_html = _safe_page_content(page) or ""
+            if error_message := _extract_email_otp_error_message(current_html):
+                raise CommandError(
+                    code="AUTH_OTP_INVALID",
+                    message=f"KAIST rejected the email OTP code ({error_message}).",
+                    hint="Check the newest KAIST email OTP and rerun `kaist klms auth complete-refresh <SESSION_ID> --otp CODE`.",
+                    exit_code=10,
+                    retryable=True,
+                )
+            state = self._context_dashboard_state(context, config=config, timeout_ms=5_000)
+            if state["authenticated"]:
+                self._persist_context_state(context)
+                return
+            page.wait_for_timeout(500)
+        raise CommandError(
+            code="AUTH_OTP_TIMEOUT",
+            message="Timed out waiting for KLMS session completion after submitting the email OTP.",
+            hint="Retry `kaist klms auth complete-refresh <SESSION_ID> --otp CODE`, or begin a fresh staged refresh.",
+            exit_code=10,
+            retryable=True,
+        )
+
+    def begin_refresh(
+        self,
+        *,
+        base_url: str | None = None,
+        dashboard_path: str | None = None,
+        username: str | None = None,
+        wait_seconds: float = EMAIL_OTP_DEFAULT_WAIT_SECONDS,
+    ) -> CommandResult:
+        config, resolved_username = self._require_email_otp_config(
+            base_url=base_url,
+            dashboard_path=dashboard_path,
+            username=username,
+        )
+        password = self._secret_store.load_email_otp_password(username=resolved_username)
+        wait_seconds = max(15.0, min(float(wait_seconds), 600.0))
+        configure_playwright_env(self._paths)
+        self._paths.profile_dir.mkdir(parents=True, exist_ok=True)
+        chmod_best_effort(self._paths.profile_dir, 0o700)
+
+        from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
+
+        clear_auth_session(self._paths)
+        with _hold_profile_lock(self._paths):
+            with sync_playwright() as playwright:
+                context = _launch_chromium_persistent_context_sync(
+                    playwright,
+                    paths=self._paths,
+                    user_data_dir=str(self._paths.profile_dir),
+                    headless=True,
+                    accept_downloads=False,
+                )
+                try:
+                    page = context.new_page()
+                    page.goto(config.base_url, wait_until="domcontentloaded", timeout=30_000)
+                    current_url = _safe_page_url(page) or ""
+                    html = _safe_page_content(page) or ""
+                    sso_url = _extract_sso_login_view_url(current_url, html) or current_url
+                    page.goto(sso_url, wait_until="domcontentloaded", timeout=30_000)
+                    if not _submit_password_login(page, username=resolved_username, password=password):
+                        raise CommandError(
+                            code="AUTH_FLOW_UNSUPPORTED",
+                            message="Could not find the KAIST username/password login form for staged email OTP auth.",
+                            hint="Use the manual browser login flow once, or update the staged email OTP selectors.",
+                            exit_code=10,
+                            retryable=False,
+                        )
+                    state = self._wait_for_email_otp_challenge(
+                        page=page,
+                        context=context,
+                        config=config,
+                        timeout_seconds=min(wait_seconds, 30.0),
+                    )
+                    if state["status"] == "completed":
+                        return CommandResult(
+                            data={
+                                "ok": True,
+                                "state": "completed",
+                                "login_strategy": "email_otp",
+                                "username": resolved_username,
+                            },
+                            source="browser",
+                            capability="full",
+                        )
+                    payload = save_auth_session(
+                        self._paths,
+                        self._auth_session_payload(
+                            config=config,
+                            username=resolved_username,
+                            challenge_url=str(state.get("challenge_url") or _safe_page_url(page) or config.base_url),
+                        ),
+                    )
+                    return CommandResult(
+                        data={
+                            "ok": True,
+                            "state": "waiting_for_email_otp",
+                            "session_id": payload["session_id"],
+                            "strategy": payload["strategy"],
+                            "username": resolved_username,
+                            "otp_source": payload["otp_source"],
+                            "started_at": payload["started_at"],
+                            "expires_at": payload["expires_at"],
+                        },
+                        source="browser",
+                        capability="partial",
+                    )
+                finally:
+                    context.close()
+
+    def complete_refresh(self, session_id: str, *, otp: str, wait_seconds: float = EMAIL_OTP_DEFAULT_WAIT_SECONDS) -> CommandResult:
+        payload = self._require_active_auth_session(session_id)
+        config = save_config(
+            self._paths,
+            base_url=str(payload.get("base_url") or "").strip() or None,
+            dashboard_path=str(payload.get("dashboard_path") or "").strip() or None,
+            auth_username=str(payload.get("username") or "").strip() or None,
+        )
+        otp_code = re.sub(r"\D+", "", str(otp or "").strip())
+        if not otp_code:
+            raise CommandError(
+                code="CONFIG_INVALID",
+                message="OTP code must contain digits.",
+                hint="Pass the code from the KAIST email with `--otp CODE`.",
+                exit_code=40,
+                retryable=False,
+            )
+        wait_seconds = max(15.0, min(float(wait_seconds), 600.0))
+
+        from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
+
+        with _hold_profile_lock(self._paths):
+            with sync_playwright() as playwright:
+                context = _launch_chromium_persistent_context_sync(
+                    playwright,
+                    paths=self._paths,
+                    user_data_dir=str(self._paths.profile_dir),
+                    headless=True,
+                    accept_downloads=False,
+                )
+                try:
+                    page = context.new_page()
+                    resume_url = str(payload.get("challenge_url") or "").strip() or config.base_url
+                    page.goto(resume_url, wait_until="domcontentloaded", timeout=30_000)
+                    if _page_has_authenticated_klms_session(page, config=config) or self._context_has_authenticated_page(context, config=config):
+                        self._persist_context_state(context)
+                        clear_auth_session(self._paths)
+                        return CommandResult(
+                            data={"ok": True, "state": "completed", "login_strategy": "email_otp", "username": config.auth_username},
+                            source="browser",
+                            capability="full",
+                        )
+                    if not _submit_email_otp_code(page, otp=otp_code):
+                        raise CommandError(
+                            code="AUTH_FLOW_UNSUPPORTED",
+                            message="Could not find the KAIST email OTP input form while resuming the staged refresh.",
+                            hint="Run `kaist klms auth begin-refresh` again to create a fresh challenge page.",
+                            exit_code=10,
+                            retryable=False,
+                        )
+                    self._wait_for_email_otp_completion(page=page, context=context, config=config, wait_seconds=wait_seconds)
+                    clear_auth_session(self._paths)
+                    return CommandResult(
+                        data={"ok": True, "state": "completed", "login_strategy": "email_otp", "username": config.auth_username},
+                        source="browser",
+                        capability="full",
+                    )
+                finally:
+                    context.close()
+
+    def cancel_refresh(self, session_id: str) -> CommandResult:
+        payload = self._require_active_auth_session(session_id)
+        clear_auth_session(self._paths)
+        return CommandResult(
+            data={
+                "ok": True,
+                "state": "canceled",
+                "session_id": str(payload.get("session_id") or "").strip() or session_id,
+                "strategy": str(payload.get("strategy") or "").strip() or None,
+            },
+            source="bootstrap",
+            capability="partial",
+        )
 
     def doctor(self) -> CommandResult:
         snapshot = self.snapshot()
@@ -1097,6 +1645,13 @@ class AuthService:
     ) -> CommandResult:
         existing = maybe_load_config(self._paths)
         resolved_username = str(username or "").strip() or (existing.auth_username if existing else None)
+        if existing is not None and existing.auth_strategy == "email_otp":
+            return self.begin_refresh(
+                base_url=base_url,
+                dashboard_path=dashboard_path,
+                username=resolved_username,
+                wait_seconds=wait_seconds,
+            )
         return self.login(
             base_url=base_url,
             dashboard_path=dashboard_path,

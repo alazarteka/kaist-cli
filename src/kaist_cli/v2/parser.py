@@ -94,6 +94,71 @@ def register_klms_parser(
         handler=handler,
     )
 
+    auth_setup_email = auth_sub.add_parser(
+        "setup-email-otp",
+        help="Configure email-OTP KLMS auth, save non-secret config, and store the KAIST password in macOS Keychain.",
+        description="Configure email-OTP KLMS auth, save non-secret config, and store the KAIST password in macOS Keychain.",
+        formatter_class=_HelpFormatter,
+    )
+    auth_setup_email.add_argument("--base-url", metavar="URL", help="Persist this KLMS base URL before configuring email OTP auth.")
+    auth_setup_email.add_argument("--dashboard-path", metavar="PATH", help="Optional dashboard path override, default /my/.")
+    auth_setup_email.add_argument("--username", metavar="ID", required=True, help="KAIST account ID used for username/password login.")
+    auth_setup_email.add_argument("--otp-source", metavar="SOURCE", default="manual", help="Human-readable OTP source label, for example `manual` or `gmail_connector`.")
+    auth_setup_email.add_argument("--password-env", metavar="ENV", help="Read the KAIST password from this environment variable instead of prompting interactively.")
+    _set_defaults(
+        auth_setup_email,
+        schema_name=f"{schema_prefix}.auth.setup_email_otp.v1",
+        command_path="klms auth setup-email-otp",
+        handler=handler,
+    )
+
+    auth_begin_refresh = auth_sub.add_parser(
+        "begin-refresh",
+        help="Start a staged email-OTP KLMS refresh and stop once the SSO challenge is waiting for an OTP code.",
+        description="Start a staged email-OTP KLMS refresh and stop once the SSO challenge is waiting for an OTP code.",
+        formatter_class=_HelpFormatter,
+    )
+    auth_begin_refresh.add_argument("--base-url", metavar="URL", help="Optional base URL override before starting the staged refresh.")
+    auth_begin_refresh.add_argument("--dashboard-path", metavar="PATH", help="Optional dashboard path override, default /my/.")
+    auth_begin_refresh.add_argument("--username", metavar="ID", help="Optional KAIST account ID override.")
+    auth_begin_refresh.add_argument("--wait-seconds", type=float, default=180.0, metavar="N", help="Maximum time to wait for the email OTP challenge page.")
+    _set_defaults(
+        auth_begin_refresh,
+        schema_name=f"{schema_prefix}.auth.begin_refresh.v1",
+        command_path="klms auth begin-refresh",
+        handler=handler,
+    )
+
+    auth_complete_refresh = auth_sub.add_parser(
+        "complete-refresh",
+        help="Submit an OTP code for a previously started staged email-OTP refresh.",
+        description="Submit an OTP code for a previously started staged email-OTP refresh.",
+        formatter_class=_HelpFormatter,
+    )
+    auth_complete_refresh.add_argument("session_id", metavar="SESSION_ID", help="Auth session ID returned by `begin-refresh`.")
+    auth_complete_refresh.add_argument("--otp", metavar="CODE", required=True, help="OTP code received from KAIST email.")
+    auth_complete_refresh.add_argument("--wait-seconds", type=float, default=180.0, metavar="N", help="Maximum time to wait for KLMS session completion after OTP submit.")
+    _set_defaults(
+        auth_complete_refresh,
+        schema_name=f"{schema_prefix}.auth.complete_refresh.v1",
+        command_path="klms auth complete-refresh",
+        handler=handler,
+    )
+
+    auth_cancel_refresh = auth_sub.add_parser(
+        "cancel-refresh",
+        help="Cancel and clear a previously started staged email-OTP refresh session.",
+        description="Cancel and clear a previously started staged email-OTP refresh session.",
+        formatter_class=_HelpFormatter,
+    )
+    auth_cancel_refresh.add_argument("session_id", metavar="SESSION_ID", help="Auth session ID returned by `begin-refresh`.")
+    _set_defaults(
+        auth_cancel_refresh,
+        schema_name=f"{schema_prefix}.auth.cancel_refresh.v1",
+        command_path="klms auth cancel-refresh",
+        handler=handler,
+    )
+
     auth_doctor = auth_sub.add_parser(
         "doctor",
         help="Run offline checks against saved KLMS auth state and config.",

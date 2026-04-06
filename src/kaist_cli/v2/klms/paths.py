@@ -16,6 +16,7 @@ class KlmsPaths:
     storage_state_path: Path
     snapshot_path: Path
     cache_path: Path
+    auth_session_path: Path
     notice_store_path: Path
     media_recency_store_path: Path
     endpoint_discovery_path: Path
@@ -37,6 +38,7 @@ def resolve_paths() -> KlmsPaths:
         storage_state_path=private_root / "storage_state.json",
         snapshot_path=private_root / "snapshot.json",
         cache_path=private_root / "cache.json",
+        auth_session_path=private_root / "auth_session.json",
         notice_store_path=private_root / "notice_store.json",
         media_recency_store_path=private_root / "media_recency_store.json",
         endpoint_discovery_path=private_root / "endpoint_discovery.json",
