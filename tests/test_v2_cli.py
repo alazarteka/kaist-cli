@@ -331,10 +331,103 @@ def test_auth_setup_email_otp_persists_config_and_secret(tmp_path: Path, monkeyp
 
     assert result.data["auth_strategy"] == "email_otp"
     assert result.data["otp_source"] == "manual"
+    assert result.data["secret_configured"] is True
     assert secret_store.saved == ("student123", "hunter2")
     assert config.auth_username == "student123"
     assert config.auth_strategy == "email_otp"
     assert config.otp_source == "manual"
+
+
+def test_auth_setup_email_otp_is_config_only_by_default(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+
+        class FakeSecretStore:
+            def __init__(self) -> None:
+                self.saved: tuple[str, str] | None = None
+
+            def store_email_otp_password(self, *, username: str, password: str) -> None:
+                self.saved = (username, password)
+
+        secret_store = FakeSecretStore()
+        auth = AuthService(paths, secret_store=secret_store)  # type: ignore[arg-type]
+        result = auth.setup_email_otp(
+            base_url="https://klms.kaist.ac.kr",
+            username="student123",
+            otp_source="manual",
+        )
+        config = load_config(paths)
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result.data["auth_strategy"] == "email_otp"
+    assert result.data["secret_configured"] is False
+    assert "store-email-otp-secret --username student123" in result.data["next_step"]
+    assert secret_store.saved is None
+    assert config.auth_username == "student123"
+    assert config.auth_strategy == "email_otp"
+
+
+def test_auth_store_email_otp_secret_uses_saved_username(tmp_path: Path) -> None:
+    _write_config(tmp_path, auth_username="student123", auth_strategy="email_otp", otp_source="manual")
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    os.environ["KAIST_PASSWORD_FOR_TEST"] = "hunter2"
+    try:
+        paths = resolve_paths()
+
+        class FakeSecretStore:
+            def __init__(self) -> None:
+                self.saved: tuple[str, str] | None = None
+
+            def store_email_otp_password(self, *, username: str, password: str) -> None:
+                self.saved = (username, password)
+
+        secret_store = FakeSecretStore()
+        auth = AuthService(paths, secret_store=secret_store)  # type: ignore[arg-type]
+        result = auth.store_email_otp_secret(password_env="KAIST_PASSWORD_FOR_TEST")
+    finally:
+        os.environ.pop("KAIST_PASSWORD_FOR_TEST", None)
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert secret_store.saved == ("student123", "hunter2")
+    assert result.data["username"] == "student123"
+    assert result.data["auth_strategy"] == "email_otp"
+
+
+def test_auth_clear_email_otp_secret_uses_saved_username(tmp_path: Path) -> None:
+    _write_config(tmp_path, auth_username="student123", auth_strategy="email_otp", otp_source="manual")
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+
+        class FakeSecretStore:
+            def __init__(self) -> None:
+                self.deleted: str | None = None
+
+            def delete_email_otp_password(self, *, username: str) -> None:
+                self.deleted = username
+
+        secret_store = FakeSecretStore()
+        auth = AuthService(paths, secret_store=secret_store)  # type: ignore[arg-type]
+        result = auth.clear_email_otp_secret()
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert secret_store.deleted == "student123"
+    assert result.data["username"] == "student123"
 
 
 def test_auth_begin_refresh_requires_email_otp_strategy(tmp_path: Path) -> None:
@@ -539,6 +632,78 @@ def test_auth_complete_refresh_routes_otp_to_worker(tmp_path: Path, monkeypatch)
 
     assert result.data["state"] == "completed"
     assert result.data["login_strategy"] == "email_otp"
+
+
+def test_auth_status_surfaces_worker_snapshot_without_secret_fields(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        save_auth_session(
+            paths,
+            {
+                "session_id": "abc123",
+                "strategy": "email_otp",
+                "stage": "waiting_for_email_otp",
+                "username": "student123",
+                "otp_source": "manual",
+                "started_at": "2026-04-06T00:00:00Z",
+                "expires_at": "2099-04-06T00:10:00Z",
+                "challenge_url": "https://sso.kaist.ac.kr/auth/kaist/user/login/second/view",
+                "worker_pid": os.getpid(),
+                "worker_port": 43210,
+                "worker_token": "secret",
+            },
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    cp = run_v2(tmp_path, "--json", "klms", "auth", "status")
+    assert cp.returncode == 0, cp.stderr
+    payload = json.loads(cp.stdout)
+    staged = payload["data"]["staged_auth_session"]
+    assert staged["worker"]["pid"] == os.getpid()
+    assert staged["worker"]["running"] is True
+    assert "worker_token" not in staged
+    assert "worker_port" not in staged
+
+
+def test_auth_complete_refresh_clears_stale_worker_session(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        save_auth_session(
+            paths,
+            {
+                "session_id": "abc123",
+                "strategy": "email_otp",
+                "stage": "waiting_for_email_otp",
+                "username": "student123",
+                "started_at": "2026-04-06T00:00:00Z",
+                "expires_at": "2099-04-06T00:10:00Z",
+                "worker_pid": 987654,
+                "worker_port": 43210,
+                "worker_token": "secret",
+            },
+        )
+        auth = AuthService(paths)
+        monkeypatch.setattr(auth_module.socket, "create_connection", lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionRefusedError("refused")))
+        monkeypatch.setattr(auth_module, "_pid_is_running", lambda pid: False)
+        with pytest.raises(CommandError) as exc_info:
+            auth.complete_refresh("abc123", otp="123456")
+        remaining = load_auth_session(paths)
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert exc_info.value.code == "AUTH_SESSION_EXPIRED"
+    assert remaining is None
 
 
 def test_validate_email_otp_request_maps_invalid_code(tmp_path: Path) -> None:

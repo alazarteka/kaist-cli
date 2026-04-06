@@ -80,6 +80,12 @@ kaist klms auth login --base-url https://klms.kaist.ac.kr
 # 2b. Non-interactive Easy Login (prints approval number for KAIST auth app)
 kaist klms auth login --base-url https://klms.kaist.ac.kr --username KAIST_ID
 
+# 2c. Safer email OTP setup: save non-secret config only
+kaist klms auth setup-email-otp --base-url https://klms.kaist.ac.kr --username KAIST_ID
+
+# 2d. Ask the user to open a separate terminal for password storage
+kaist klms auth store-email-otp-secret --username KAIST_ID
+
 # 3. Renew session (reuses saved username if available)
 kaist klms auth refresh
 
@@ -89,11 +95,20 @@ kaist klms auth doctor
 ```
 
 The manual browser login (no `--username`) requires an interactive terminal with a display and is not suitable for headless or non-interactive shells. The Easy Login flow (`--username`) runs headless and works in non-interactive shells — it just needs the user to approve the push notification in the KAIST auth app. Once logged in, `auth refresh` handles renewal automatically when a username was saved.
-The explicit non-interactive setup command is `kaist klms auth login --base-url https://klms.kaist.ac.kr --username KAIST_ID`.
+
+The email OTP flow is also available, but treat password enrollment as a human-only step:
+
+- run `kaist klms auth setup-email-otp --username KAIST_ID` yourself if you need to save non-secret config
+- then instruct the user to open a separate terminal and run `kaist klms auth store-email-otp-secret --username KAIST_ID`
+- do not ask the user to paste their password into chat
+- do not trigger an interactive password prompt in an agent-controlled terminal unless the user explicitly asks for that exact behavior
+- after the password is stored in macOS Keychain, later `auth refresh` / `begin-refresh` flows can be agent-driven again
+
+The explicit non-interactive Easy Login setup command is `kaist klms auth login --base-url https://klms.kaist.ac.kr --username KAIST_ID`.
 
 ### Agent auth recovery behavior
 
-When a KLMS task fails with `AUTH_MISSING` or `AUTH_EXPIRED`, prefer running `kaist klms auth refresh` yourself before telling the user to do it manually, as long as saved auth config exists and a saved Easy Login username is available.
+When a KLMS task fails with `AUTH_MISSING` or `AUTH_EXPIRED`, prefer running `kaist klms auth refresh` yourself before telling the user to do it manually, as long as saved auth config exists.
 
 During `auth refresh`:
 
@@ -101,13 +116,24 @@ During `auth refresh`:
 - poll output continuously while the refresh is waiting
 - as soon as an Easy Login approval number appears, immediately tell the user the number and ask them to approve it in the KAIST auth app
 - do not wait for the command to finish before relaying the number
+- if the configured strategy is `email_otp` and refresh returns a staged session, first try to fetch the OTP from the user's connected Gmail when that connector is available
+- when checking Gmail, prefer the newest KAIST auth email from the last few minutes with tight sender/subject filters; do not guess from unrelated mail
+- if a fresh Gmail OTP is found, submit it yourself with `kaist klms auth complete-refresh SESSION_ID --otp CODE`
+- if Gmail is not connected, unavailable, or the newest OTP mail is ambiguous, immediately ask the user for the newest email code
 - after the user approves and refresh succeeds, continue the original KLMS task automatically
+
+If email OTP setup exists but the password is not yet stored:
+
+- do not ask the user to paste the password into chat
+- tell them to open a separate terminal
+- tell them to run `kaist klms auth store-email-otp-secret --username KAIST_ID`
+- once that command succeeds, resume the KLMS task yourself
 
 Only hand the auth step back to the user when:
 
 - refresh fails or times out
 - the flow requires manual browser interaction
-- no saved Easy Login username exists
+- no saved auth config exists
 - the user explicitly wants to run the auth command themselves
 
 ## Common workflows
@@ -247,7 +273,7 @@ Check `error.retryable` to decide whether to retry automatically. The `error.hin
 
 ### Recovery patterns
 
-- **`AUTH_MISSING` or `AUTH_EXPIRED`** — run `kaist klms auth refresh`. If that fails, fall back to `kaist klms auth login`.
+- **`AUTH_MISSING` or `AUTH_EXPIRED`** — run `kaist klms auth refresh`. If the configured strategy is `email_otp` and the password is not stored yet, direct the user to `kaist klms auth store-email-otp-secret --username KAIST_ID` in a separate terminal. If refresh fails entirely, fall back to `kaist klms auth login`.
 - **Degraded `today`/`inbox` results** — run `kaist klms sync run` to warm the cache, then retry.
 - **Stale notice/file data** — `sync run` fetches fresh data from KLMS notice boards and file surfaces.
 

@@ -66,6 +66,18 @@ def epoch_to_iso_utc(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def has_profile_session(paths: KlmsPaths) -> bool:
     if not paths.profile_dir.exists() or not paths.profile_dir.is_dir():
         return False
@@ -904,10 +916,14 @@ class AuthService:
         self._paths = paths
         self._secret_store = secret_store or KeychainSecretStore()
 
+    def _email_otp_secret_command(self, username: str | None) -> str:
+        suffix = f" --username {username}" if username else ""
+        return f"`kaist klms auth store-email-otp-secret{suffix}`"
+
     def _config_payload(self, config: KlmsConfig | None) -> dict[str, Any] | None:
         if config is None:
             return None
-        return {
+        payload = {
             "base_url": config.base_url,
             "dashboard_path": config.dashboard_path,
             "auth_username": config.auth_username,
@@ -917,10 +933,31 @@ class AuthService:
             "notice_board_ids": list(config.notice_board_ids),
             "exclude_course_title_patterns": list(config.exclude_course_title_patterns),
         }
+        if config.auth_strategy == "email_otp":
+            payload["secret_storage"] = "macos_keychain"
+        return payload
 
-    def _recommended_action(self, *, config: KlmsConfig | None, mode: AuthMode) -> str:
+    def _recommended_action(
+        self,
+        *,
+        config: KlmsConfig | None,
+        mode: AuthMode,
+        staged_auth_session: dict[str, Any] | None,
+    ) -> str:
+        if staged_auth_session is not None:
+            stage = str(staged_auth_session.get("stage") or "").strip()
+            session_id = str(staged_auth_session.get("session_id") or "").strip()
+            if stage == "waiting_for_email_otp" and session_id:
+                return f"Run `kaist klms auth complete-refresh {session_id} --otp CODE`, or `kaist klms auth cancel-refresh {session_id}` to abort."
+            if stage == "failed":
+                return "Run `kaist klms auth begin-refresh` again to create a fresh email OTP session."
         if config is None:
             return "Run `kaist klms auth login --base-url https://klms.kaist.ac.kr`."
+        if config.auth_strategy == "email_otp":
+            return (
+                "Run `kaist klms auth refresh` to start an email OTP session. "
+                f"If the password has not been stored yet, run {self._email_otp_secret_command(config.auth_username)} in a separate terminal first."
+            )
         if mode == "none":
             return "Run `kaist klms auth login` to create a persistent browser profile."
         return "Run `kaist klms auth refresh` if the saved session stops working."
@@ -929,6 +966,7 @@ class AuthService:
         ensure_private_dirs(self._paths)
         config = maybe_load_config(self._paths)
         mode = active_auth_mode(self._paths)
+        staged_auth_session = self._session_snapshot()
         return {
             "configured": config is not None,
             "config_path": str(self._paths.config_path),
@@ -941,7 +979,7 @@ class AuthService:
                 "storage_state": has_storage_state_session(self._paths),
             },
             "storage_state_cookie_stats": storage_state_cookie_stats(self._paths),
-            "staged_auth_session": self._session_snapshot(),
+            "staged_auth_session": staged_auth_session,
             "config": self._config_payload(config),
             "validation_mode": "offline-only",
             "login_detection": {
@@ -949,14 +987,14 @@ class AuthService:
                 "url_needles": list(URL_LOGIN_NEEDLES),
                 "app_login_paths": list(APP_LOGIN_PATHS),
             },
-            "recommended_action": self._recommended_action(config=config, mode=mode),
+            "recommended_action": self._recommended_action(config=config, mode=mode, staged_auth_session=staged_auth_session),
         }
 
     def _session_snapshot(self) -> dict[str, Any] | None:
         payload = load_auth_session(self._paths)
         if payload is None:
             return None
-        return {
+        snapshot = {
             "session_id": str(payload.get("session_id") or "").strip() or None,
             "strategy": str(payload.get("strategy") or "").strip() or None,
             "stage": str(payload.get("stage") or "").strip() or None,
@@ -964,7 +1002,20 @@ class AuthService:
             "started_at": str(payload.get("started_at") or "").strip() or None,
             "expires_at": str(payload.get("expires_at") or "").strip() or None,
             "otp_source": str(payload.get("otp_source") or "").strip() or None,
+            "finished_at": str(payload.get("finished_at") or "").strip() or None,
+            "challenge_url": str(payload.get("challenge_url") or "").strip() or None,
         }
+        error = payload.get("error")
+        if isinstance(error, dict):
+            snapshot["error"] = error
+        worker_pid = int(payload.get("worker_pid") or 0)
+        if worker_pid > 0:
+            snapshot["worker"] = {
+                "pid": worker_pid,
+                "running": _pid_is_running(worker_pid),
+                "transport": "localhost",
+            }
+        return snapshot
 
     def status(self) -> CommandResult:
         return CommandResult(data=self.snapshot(), source="bootstrap", capability="partial")
@@ -989,7 +1040,7 @@ class AuthService:
             raise CommandError(
                 code="AUTH_SECRET_UNAVAILABLE",
                 message="Email OTP setup requires an interactive terminal or `--password-env`.",
-                hint="Run `kaist klms auth setup-email-otp --password-env VAR ...` in non-interactive shells.",
+                hint=f"Run {self._email_otp_secret_command(username)} in a human-run terminal, or use `--password-env VAR` in that command.",
                 exit_code=10,
                 retryable=False,
             )
@@ -998,11 +1049,37 @@ class AuthService:
             raise CommandError(
                 code="CONFIG_INVALID",
                 message="Password must not be empty.",
-                hint="Rerun `kaist klms auth setup-email-otp` and enter the KAIST password.",
+                hint=f"Rerun {self._email_otp_secret_command(username)} and enter the KAIST password.",
                 exit_code=40,
                 retryable=False,
             )
         return password
+
+    def _resolve_email_otp_secret_username(
+        self,
+        *,
+        username: str | None = None,
+        require_email_otp_strategy: bool = True,
+    ) -> tuple[KlmsConfig | None, str]:
+        config = maybe_load_config(self._paths)
+        resolved_username = str(username or "").strip() or (config.auth_username if config else None)
+        if require_email_otp_strategy and (config is None or config.auth_strategy != "email_otp"):
+            raise CommandError(
+                code="AUTH_FLOW_UNSUPPORTED",
+                message="KLMS auth is not configured for email OTP secret storage.",
+                hint="Run `kaist klms auth setup-email-otp --username <KAIST_ID>` first.",
+                exit_code=10,
+                retryable=False,
+            )
+        if not resolved_username:
+            raise CommandError(
+                code="CONFIG_INVALID",
+                message="KAIST username is required for email OTP secret storage.",
+                hint="Pass `--username <KAIST_ID>`, or configure email OTP auth first.",
+                exit_code=40,
+                retryable=False,
+            )
+        return config, resolved_username
 
     def setup_email_otp(
         self,
@@ -1012,11 +1089,11 @@ class AuthService:
         username: str,
         otp_source: str = "manual",
         password_env: str | None = None,
+        prompt_password: bool = False,
     ) -> CommandResult:
         normalized_username = str(username or "").strip()
         if not normalized_username:
             raise CommandError(code="CONFIG_INVALID", message="KAIST username is required.", exit_code=40)
-        password = self._resolve_password_input(username=normalized_username, password_env=password_env)
         config = save_config(
             self._paths,
             base_url=base_url,
@@ -1025,7 +1102,11 @@ class AuthService:
             auth_strategy="email_otp",
             otp_source=otp_source,
         )
-        self._secret_store.store_email_otp_password(username=normalized_username, password=password)
+        secret_configured = False
+        if prompt_password or str(password_env or "").strip():
+            password = self._resolve_password_input(username=normalized_username, password_env=password_env)
+            self._secret_store.store_email_otp_password(username=normalized_username, password=password)
+            secret_configured = True
         return CommandResult(
             data={
                 "ok": True,
@@ -1036,6 +1117,49 @@ class AuthService:
                 "otp_source": config.otp_source,
                 "username": normalized_username,
                 "secret_storage": "macos_keychain",
+                "secret_configured": secret_configured,
+                "next_step": (
+                    "Email OTP setup is complete."
+                    if secret_configured
+                    else (
+                        f"Run {self._email_otp_secret_command(normalized_username)} in a separate terminal to store the KAIST password in macOS Keychain."
+                    )
+                ),
+            },
+            source="bootstrap",
+            capability="partial",
+        )
+
+    def store_email_otp_secret(
+        self,
+        *,
+        username: str | None = None,
+        password_env: str | None = None,
+    ) -> CommandResult:
+        _, resolved_username = self._resolve_email_otp_secret_username(username=username, require_email_otp_strategy=True)
+        password = self._resolve_password_input(username=resolved_username, password_env=password_env)
+        self._secret_store.store_email_otp_password(username=resolved_username, password=password)
+        return CommandResult(
+            data={
+                "ok": True,
+                "username": resolved_username,
+                "secret_storage": "macos_keychain",
+                "auth_strategy": "email_otp",
+                "next_step": "Run `kaist klms auth refresh` to start the email OTP login flow.",
+            },
+            source="bootstrap",
+            capability="partial",
+        )
+
+    def clear_email_otp_secret(self, *, username: str | None = None) -> CommandResult:
+        _, resolved_username = self._resolve_email_otp_secret_username(username=username, require_email_otp_strategy=False)
+        self._secret_store.delete_email_otp_password(username=resolved_username)
+        return CommandResult(
+            data={
+                "ok": True,
+                "username": resolved_username,
+                "secret_storage": "macos_keychain",
+                "auth_strategy": "email_otp",
             },
             source="bootstrap",
             capability="partial",
@@ -1174,16 +1298,35 @@ class AuthService:
         request_payload: dict[str, Any] = {"token": token, "action": action}
         if otp_code is not None:
             request_payload["otp"] = otp_code
-        with socket.create_connection(("127.0.0.1", port), timeout=max(1.0, timeout_seconds)) as sock:
-            sock.settimeout(max(1.0, timeout_seconds))
-            sock.sendall(json.dumps(request_payload).encode("utf-8"))
-            sock.shutdown(socket.SHUT_WR)
-            chunks: list[bytes] = []
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                chunks.append(chunk)
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=max(1.0, timeout_seconds)) as sock:
+                sock.settimeout(max(1.0, timeout_seconds))
+                sock.sendall(json.dumps(request_payload).encode("utf-8"))
+                sock.shutdown(socket.SHUT_WR)
+                chunks: list[bytes] = []
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+        except OSError as exc:
+            worker_pid = int(payload.get("worker_pid") or 0)
+            if worker_pid > 0 and not _pid_is_running(worker_pid):
+                clear_auth_session(self._paths)
+                raise CommandError(
+                    code="AUTH_SESSION_EXPIRED",
+                    message="The staged KLMS email OTP worker is no longer running.",
+                    hint="Run `kaist klms auth begin-refresh` again to request a fresh OTP session.",
+                    exit_code=10,
+                    retryable=True,
+                ) from exc
+            raise CommandError(
+                code="AUTH_FAILED",
+                message=f"Could not reach the KLMS email OTP worker ({exc}).",
+                hint="Run `kaist klms auth begin-refresh` again to create a fresh staged session.",
+                exit_code=10,
+                retryable=True,
+            ) from exc
         try:
             response = json.loads(b"".join(chunks).decode("utf-8"))
         except Exception as exc:

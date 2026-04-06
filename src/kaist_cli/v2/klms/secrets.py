@@ -46,7 +46,7 @@ class KeychainSecretStore:
             raise CommandError(
                 code="AUTH_SECRET_UNAVAILABLE",
                 message=f"Could not store the KAIST password in macOS Keychain ({detail}).",
-                hint="Check Keychain access permissions, then rerun `kaist klms auth setup-email-otp`.",
+                hint="Check Keychain access permissions, then rerun `kaist klms auth store-email-otp-secret --username <KAIST_ID>`.",
                 exit_code=10,
                 retryable=True,
             )
@@ -72,7 +72,7 @@ class KeychainSecretStore:
             raise CommandError(
                 code="AUTH_SECRET_UNAVAILABLE",
                 message=f"KAIST password is not available from macOS Keychain ({detail}).",
-                hint="Run `kaist klms auth setup-email-otp --username <KAIST_ID>` again to store the password.",
+                hint="Run `kaist klms auth store-email-otp-secret --username <KAIST_ID>` in a separate terminal to store the password.",
                 exit_code=10,
                 retryable=True,
             )
@@ -81,7 +81,7 @@ class KeychainSecretStore:
             raise CommandError(
                 code="AUTH_SECRET_UNAVAILABLE",
                 message="KAIST password was blank when read from macOS Keychain.",
-                hint="Run `kaist klms auth setup-email-otp --username <KAIST_ID>` again to reset the password.",
+                hint="Run `kaist klms auth store-email-otp-secret --username <KAIST_ID>` again to reset the password.",
                 exit_code=10,
                 retryable=True,
             )

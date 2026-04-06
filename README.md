@@ -60,10 +60,24 @@ uv run kaist klms today
 uv run kaist klms sync run
 ```
 
+Email OTP setup uses a safer two-step flow by default:
+
+```bash
+# Save non-secret config
+uv run kaist klms auth setup-email-otp --base-url https://klms.kaist.ac.kr --username KAIST_ID
+
+# In a separate human-run terminal, store the password in macOS Keychain
+uv run kaist klms auth store-email-otp-secret --username KAIST_ID
+
+# Later refreshes can run headlessly and wait for the email OTP
+uv run kaist klms auth refresh
+```
+
 ## KLMS Commands
 
 Stable workflows:
 - `kaist klms auth login|install-browser|status|refresh|doctor`
+- `kaist klms auth setup-email-otp|store-email-otp-secret|clear-email-otp-secret|begin-refresh|complete-refresh|cancel-refresh`
 - `kaist klms today [--limit N] [--window-days N] [--notice-days N]`
 - `kaist klms inbox [--limit N] [--since <ISO>]`
 - `kaist klms sync run|status|reset`

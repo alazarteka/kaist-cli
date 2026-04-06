@@ -96,19 +96,49 @@ def register_klms_parser(
 
     auth_setup_email = auth_sub.add_parser(
         "setup-email-otp",
-        help="Configure email-OTP KLMS auth, save non-secret config, and store the KAIST password in macOS Keychain.",
-        description="Configure email-OTP KLMS auth, save non-secret config, and store the KAIST password in macOS Keychain.",
+        help="Configure email-OTP KLMS auth and save non-secret config. Password storage is a separate explicit step by default.",
+        description="Configure email-OTP KLMS auth and save non-secret config. Password storage is a separate explicit step by default.",
         formatter_class=_HelpFormatter,
     )
     auth_setup_email.add_argument("--base-url", metavar="URL", help="Persist this KLMS base URL before configuring email OTP auth.")
     auth_setup_email.add_argument("--dashboard-path", metavar="PATH", help="Optional dashboard path override, default /my/.")
     auth_setup_email.add_argument("--username", metavar="ID", required=True, help="KAIST account ID used for username/password login.")
     auth_setup_email.add_argument("--otp-source", metavar="SOURCE", default="manual", help="Human-readable OTP source label, for example `manual` or `gmail_connector`.")
-    auth_setup_email.add_argument("--password-env", metavar="ENV", help="Read the KAIST password from this environment variable instead of prompting interactively.")
+    auth_setup_email.add_argument("--password-env", metavar="ENV", help="Optionally read the KAIST password from this environment variable and store it in macOS Keychain during setup.")
+    auth_setup_email.add_argument("--prompt-password", action="store_true", help="Prompt for the KAIST password in the current terminal and store it in macOS Keychain during setup.")
     _set_defaults(
         auth_setup_email,
         schema_name=f"{schema_prefix}.auth.setup_email_otp.v1",
         command_path="klms auth setup-email-otp",
+        handler=handler,
+    )
+
+    auth_store_email_secret = auth_sub.add_parser(
+        "store-email-otp-secret",
+        help="Store the KAIST password for email-OTP auth in macOS Keychain. Intended for a human-run separate terminal.",
+        description="Store the KAIST password for email-OTP auth in macOS Keychain. Intended for a human-run separate terminal.",
+        formatter_class=_HelpFormatter,
+    )
+    auth_store_email_secret.add_argument("--username", metavar="ID", help="KAIST account ID override. Defaults to the saved email-OTP auth username.")
+    auth_store_email_secret.add_argument("--password-env", metavar="ENV", help="Read the KAIST password from this environment variable instead of prompting interactively.")
+    _set_defaults(
+        auth_store_email_secret,
+        schema_name=f"{schema_prefix}.auth.store_email_otp_secret.v1",
+        command_path="klms auth store-email-otp-secret",
+        handler=handler,
+    )
+
+    auth_clear_email_secret = auth_sub.add_parser(
+        "clear-email-otp-secret",
+        help="Delete the stored email-OTP KAIST password from macOS Keychain.",
+        description="Delete the stored email-OTP KAIST password from macOS Keychain.",
+        formatter_class=_HelpFormatter,
+    )
+    auth_clear_email_secret.add_argument("--username", metavar="ID", help="KAIST account ID override. Defaults to the saved email-OTP auth username.")
+    _set_defaults(
+        auth_clear_email_secret,
+        schema_name=f"{schema_prefix}.auth.clear_email_otp_secret.v1",
+        command_path="klms auth clear-email-otp-secret",
         handler=handler,
     )
 

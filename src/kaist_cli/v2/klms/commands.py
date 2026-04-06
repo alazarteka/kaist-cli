@@ -23,7 +23,15 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
             username=args.username,
             otp_source=args.otp_source,
             password_env=args.password_env,
+            prompt_password=args.prompt_password,
         )
+    if args.group == "auth" and args.action == "store-email-otp-secret":
+        return facade.auth_store_email_otp_secret(
+            username=args.username,
+            password_env=args.password_env,
+        )
+    if args.group == "auth" and args.action == "clear-email-otp-secret":
+        return facade.auth_clear_email_otp_secret(username=args.username)
     if args.group == "auth" and args.action == "status":
         return facade.auth_status()
     if args.group == "auth" and args.action == "refresh":

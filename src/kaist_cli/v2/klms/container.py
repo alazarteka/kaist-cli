@@ -66,6 +66,7 @@ class KlmsFacade:
         username: str,
         otp_source: str = "manual",
         password_env: str | None = None,
+        prompt_password: bool = False,
     ) -> CommandResult:
         return self._auth.setup_email_otp(
             base_url=base_url,
@@ -73,7 +74,19 @@ class KlmsFacade:
             username=username,
             otp_source=otp_source,
             password_env=password_env,
+            prompt_password=prompt_password,
         )
+
+    def auth_store_email_otp_secret(
+        self,
+        *,
+        username: str | None = None,
+        password_env: str | None = None,
+    ) -> CommandResult:
+        return self._auth.store_email_otp_secret(username=username, password_env=password_env)
+
+    def auth_clear_email_otp_secret(self, *, username: str | None = None) -> CommandResult:
+        return self._auth.clear_email_otp_secret(username=username)
 
     def auth_status(self) -> CommandResult:
         return self._auth.status()
