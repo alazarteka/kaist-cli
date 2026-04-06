@@ -1,7 +1,7 @@
 interface:
   display_name: "KAIST CLI"
   short_description: "Operate KLMS through the installed kaist CLI."
-  default_prompt: "Use $kaist-cli to inspect or operate KLMS through the installed kaist command."
+  default_prompt: "Use $kaist-cli to inspect or operate KLMS through the installed kaist command. For KLMS auth issues, run `kaist klms auth refresh` yourself before asking the user to do it, relay Easy Login codes immediately, and if the configured strategy is email OTP then prefer reading the newest KAIST OTP from connected Gmail before asking the user."
 
 policy:
   allow_implicit_invocation: true

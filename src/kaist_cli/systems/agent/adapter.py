@@ -17,7 +17,7 @@ class AgentAdapter(SystemAdapter):
         )
         agent_sub = agent.add_subparsers(dest="action", required=True, metavar="ACTION")
 
-        install = agent_sub.add_parser("install", help="Install the bundled kaist skill for a supported agent")
+        install = agent_sub.add_parser("install", help="Install the bundled `kaist-cli` skill for a supported agent")
         install.add_argument("target", choices=["codex", "claude", "gemini", "custom"])
         install.add_argument("--path", help="Target directory for custom installs.")
         install.add_argument("--copy", action="store_true", help="Copy the skill directory instead of creating a symlink.")
@@ -28,7 +28,7 @@ class AgentAdapter(SystemAdapter):
             command_path="agent install",
         )
 
-        status = agent_sub.add_parser("status", help="Show bundled skill status for Codex, Claude, Gemini, and optional custom path")
+        status = agent_sub.add_parser("status", help="Show bundled `kaist-cli` skill status for Codex, Claude, Gemini, and optional custom path")
         status.add_argument("--path", help="Also inspect a custom install root.")
         status.set_defaults(
             handler=self._handle_status,
@@ -36,7 +36,7 @@ class AgentAdapter(SystemAdapter):
             command_path="agent status",
         )
 
-        uninstall = agent_sub.add_parser("uninstall", help="Remove an installed kaist skill from a supported agent path")
+        uninstall = agent_sub.add_parser("uninstall", help="Remove an installed `kaist-cli` skill from a supported agent path")
         uninstall.add_argument("target", choices=["codex", "claude", "gemini", "custom"])
         uninstall.add_argument("--path", help="Target directory for custom uninstalls.")
         uninstall.set_defaults(

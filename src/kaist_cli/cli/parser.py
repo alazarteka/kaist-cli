@@ -22,8 +22,10 @@ def build_parser() -> argparse.ArgumentParser:
         epilog = _dedent(
             f"""
             Bundled agent skill:
+              Skill name: kaist-cli
               {distribution.bundled_skill_path}
-              Agents can install this skill directly from that path.
+              Codex install: kaist agent install codex
+              Agents can install this skill directly from that path or use the install helper above.
             """
         )
     parser = argparse.ArgumentParser(
@@ -36,6 +38,11 @@ def build_parser() -> argparse.ArgumentParser:
               1) kaist klms auth login --base-url https://klms.kaist.ac.kr
               2) kaist klms courses list
               3) kaist klms today
+
+            Agent quick start:
+              1) kaist agent install codex
+              2) Use the kaist-cli skill for KLMS tasks
+              3) Prefer `kaist --agent ...` commands in agent workflows
 
             Global machine mode:
               kaist --agent klms today
