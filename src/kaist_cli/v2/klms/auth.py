@@ -243,23 +243,48 @@ def _extract_email_otp_error_message(html: str) -> str | None:
 def _submit_password_login(page: Any, *, username: str, password: str) -> bool:
     script = """
     ([username, password]) => {
-      const findFirst = (selectors) => {
+      const visible = (node) => {
+        if (!node) return false;
+        const style = window.getComputedStyle(node);
+        return style.display !== 'none' && style.visibility !== 'hidden';
+      };
+      const clickIfPresent = (selector) => {
+        const node = document.querySelector(selector);
+        if (node) node.click();
+      };
+      clickIfPresent('li#auth a');
+      clickIfPresent('#auth a');
+
+      const activePane = document.querySelector('#loginTab02');
+      if (activePane && !visible(activePane)) {
+        activePane.style.display = 'block';
+      }
+      const inactivePane = document.querySelector('#loginTab01');
+      if (inactivePane && visible(activePane)) {
+        inactivePane.style.display = 'none';
+      }
+
+      const findFirst = (selectors, root = document) => {
         for (const selector of selectors) {
-          const node = document.querySelector(selector);
-          if (node) return node;
+          const nodes = Array.from(root.querySelectorAll(selector));
+          const preferred = nodes.find((node) => visible(node)) || nodes[0];
+          if (preferred) return preferred;
         }
         return null;
       };
+
+      const passwordRoot = activePane || document;
       const userInput = findFirst([
         '#login_id', '#loginId', '#username', '#userId', 'input[name="login_id"]',
         'input[name="loginId"]', 'input[name="username"]', 'input[name="userId"]',
+        '#login_id_mfa', 'input[name="login_id_mfa"]',
         'input[type="text"][name*="id"]', 'input[type="email"]'
-      ]);
+      ], passwordRoot);
       const passInput = findFirst([
-        '#login_pw', '#loginPw', '#password', '#userPw', 'input[name="login_pw"]',
-        'input[name="loginPw"]', 'input[name="password"]', 'input[name="userPw"]',
+        '#login_pwd', '#login_pw', '#loginPw', '#password', '#userPw', 'input[name="login_pwd"]',
+        'input[name="login_pw"]', 'input[name="loginPw"]', 'input[name="password"]', 'input[name="userPw"]',
         'input[type="password"]'
-      ]);
+      ], passwordRoot);
       if (!userInput || !passInput) return false;
       userInput.focus();
       userInput.value = username;
@@ -271,7 +296,7 @@ def _submit_password_login(page: Any, *, username: str, password: str) -> bool:
       passInput.dispatchEvent(new Event('change', { bubbles: true }));
       const submit = findFirst([
         'button[type="submit"]', 'input[type="submit"]', 'a.btn_login', '.btn_login'
-      ]);
+      ], passwordRoot);
       if (submit) {
         submit.click();
         return true;
@@ -297,9 +322,18 @@ def _submit_email_otp_code(page: Any, *, otp: str) -> bool:
         const style = window.getComputedStyle(node);
         return style.display !== 'none' && style.visibility !== 'hidden';
       };
+      if (typeof window.send_flag !== 'undefined') {
+        window.send_flag = true;
+      }
+      const otpInput = document.querySelector('#crtfc_no');
+      const submitButton = document.querySelector('#proc');
+      if (otpInput) otpInput.disabled = false;
+      if (submitButton) submitButton.disabled = false;
+      const authWrap = document.querySelector('.factor_auth_wrap');
+      if (authWrap) authWrap.classList.remove('disable');
       const inputs = Array.from(document.querySelectorAll('input'))
         .filter((node) => visible(node))
-        .filter((node) => !['hidden', 'password'].includes((node.type || '').toLowerCase()));
+        .filter((node) => !['hidden', 'password', 'submit', 'button'].includes((node.type || '').toLowerCase()));
       const splitInputs = inputs.filter((node) => ['1', 1].includes(node.maxLength));
       if (splitInputs.length === otp.length && splitInputs.length > 1) {
         splitInputs.forEach((node, index) => {
@@ -309,7 +343,7 @@ def _submit_email_otp_code(page: Any, *, otp: str) -> bool:
           node.dispatchEvent(new Event('change', { bubbles: true }));
         });
       } else {
-        const candidate = inputs.find((node) => {
+        const candidate = document.querySelector('#crtfc_no') || inputs.find((node) => {
           const hint = [node.id, node.name, node.className].join(' ').toLowerCase();
           return ['otp', 'code', 'auth', 'verify', 'cert'].some((token) => hint.includes(token));
         }) || inputs[0];
@@ -338,6 +372,30 @@ def _submit_email_otp_code(page: Any, *, otp: str) -> bool:
     """
     try:
         return bool(page.evaluate(script, otp))
+    except Exception:
+        return False
+
+
+def _request_email_otp_delivery(page: Any) -> bool:
+    script = """
+    () => {
+      const visible = (node) => {
+        if (!node) return false;
+        const style = window.getComputedStyle(node);
+        return style.display !== 'none' && style.visibility !== 'hidden';
+      };
+      const button = document.querySelector('#email')
+        || Array.from(document.querySelectorAll('input[type="submit"], button, a')).find((node) => {
+          const text = ((node.textContent || '') + ' ' + (node.value || '') + ' ' + (node.id || '')).toLowerCase();
+          return ['mail', 'email', '외부 메일'].some((token) => text.includes(token));
+        });
+      if (!button || !visible(button)) return false;
+      button.click();
+      return true;
+    }
+    """
+    try:
+        return bool(page.evaluate(script))
     except Exception:
         return False
 
@@ -1107,6 +1165,55 @@ class AuthService:
             retryable=True,
         )
 
+    def _wait_for_email_otp_delivery(
+        self,
+        *,
+        page: Any,
+        timeout_seconds: float,
+    ) -> None:
+        deadline = time.monotonic() + max(1.0, timeout_seconds)
+        while time.monotonic() < deadline:
+            html = _safe_page_content(page) or ""
+            lowered = html.lower()
+            if "인증 번호가 발송되었습니다" in html or "verification code has been sent" in lowered:
+                return
+            try:
+                status = page.evaluate(
+                    """
+                    () => {
+                      const input = document.querySelector('#crtfc_no');
+                      const submit = document.querySelector('#proc');
+                      const result = document.querySelector('#resultMsg');
+                      return {
+                        inputReady: !!input && !input.disabled,
+                        submitReady: !!submit && !submit.disabled,
+                        resultText: (result?.textContent || '').trim(),
+                      };
+                    }
+                    """
+                ) or {}
+            except Exception:
+                status = {}
+            if bool(status.get("inputReady")) and bool(status.get("submitReady")):
+                return
+            error_message = _extract_email_otp_error_message(html)
+            if error_message and "발송" in error_message:
+                raise CommandError(
+                    code="AUTH_OTP_REQUIRED",
+                    message=f"KAIST did not send the email OTP ({error_message}).",
+                    hint="Retry `kaist klms auth begin-refresh`, or inspect the KAIST second-step page manually.",
+                    exit_code=10,
+                    retryable=True,
+                )
+            page.wait_for_timeout(250)
+        raise CommandError(
+            code="AUTH_OTP_REQUIRED",
+            message="Timed out waiting for KAIST to send the email OTP.",
+            hint="Retry `kaist klms auth begin-refresh`, or inspect the KAIST second-step page manually.",
+            exit_code=10,
+            retryable=True,
+        )
+
     def begin_refresh(
         self,
         *,
@@ -1123,22 +1230,16 @@ class AuthService:
         password = self._secret_store.load_email_otp_password(username=resolved_username)
         wait_seconds = max(15.0, min(float(wait_seconds), 600.0))
         configure_playwright_env(self._paths)
-        self._paths.profile_dir.mkdir(parents=True, exist_ok=True)
-        chmod_best_effort(self._paths.profile_dir, 0o700)
 
         from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
 
         clear_auth_session(self._paths)
         with _hold_profile_lock(self._paths):
             with sync_playwright() as playwright:
-                context = _launch_chromium_persistent_context_sync(
-                    playwright,
-                    paths=self._paths,
-                    user_data_dir=str(self._paths.profile_dir),
-                    headless=True,
-                    accept_downloads=False,
-                )
+                browser = _launch_chromium_browser_sync(playwright, paths=self._paths, headless=True)
+                context: Any | None = None
                 try:
+                    context = browser.new_context(accept_downloads=False)
                     page = context.new_page()
                     page.goto(config.base_url, wait_until="domcontentloaded", timeout=30_000)
                     current_url = _safe_page_url(page) or ""
@@ -1170,6 +1271,17 @@ class AuthService:
                             source="browser",
                             capability="full",
                         )
+                    if not _request_email_otp_delivery(page):
+                        raise CommandError(
+                            code="AUTH_FLOW_UNSUPPORTED",
+                            message="Could not find the KAIST email OTP delivery control on the second-step page.",
+                            hint="Inspect the KAIST second-step page manually, then update the staged email OTP selectors.",
+                            exit_code=10,
+                            retryable=False,
+                        )
+                    self._wait_for_email_otp_delivery(page=page, timeout_seconds=min(wait_seconds, 30.0))
+                    context.storage_state(path=str(self._paths.auth_session_state_path))
+                    chmod_best_effort(self._paths.auth_session_state_path, 0o600)
                     payload = save_auth_session(
                         self._paths,
                         self._auth_session_payload(
@@ -1193,7 +1305,11 @@ class AuthService:
                         capability="partial",
                     )
                 finally:
-                    context.close()
+                    try:
+                        if context is not None:
+                            context.close()
+                    finally:
+                        browser.close()
 
     def complete_refresh(self, session_id: str, *, otp: str, wait_seconds: float = EMAIL_OTP_DEFAULT_WAIT_SECONDS) -> CommandResult:
         payload = self._require_active_auth_session(session_id)
@@ -1218,14 +1334,22 @@ class AuthService:
 
         with _hold_profile_lock(self._paths):
             with sync_playwright() as playwright:
-                context = _launch_chromium_persistent_context_sync(
-                    playwright,
-                    paths=self._paths,
-                    user_data_dir=str(self._paths.profile_dir),
-                    headless=True,
-                    accept_downloads=False,
-                )
+                if not self._paths.auth_session_state_path.exists():
+                    clear_auth_session(self._paths)
+                    raise CommandError(
+                        code="AUTH_SESSION_MISSING",
+                        message="Staged KLMS auth session state was not found.",
+                        hint="Run `kaist klms auth begin-refresh` again to request a fresh OTP challenge.",
+                        exit_code=10,
+                        retryable=True,
+                    )
+                browser = _launch_chromium_browser_sync(playwright, paths=self._paths, headless=True)
+                context: Any | None = None
                 try:
+                    context = browser.new_context(
+                        storage_state=str(self._paths.auth_session_state_path),
+                        accept_downloads=False,
+                    )
                     page = context.new_page()
                     resume_url = str(payload.get("challenge_url") or "").strip() or config.base_url
                     page.goto(resume_url, wait_until="domcontentloaded", timeout=30_000)
@@ -1253,7 +1377,11 @@ class AuthService:
                         capability="full",
                     )
                 finally:
-                    context.close()
+                    try:
+                        if context is not None:
+                            context.close()
+                    finally:
+                        browser.close()
 
     def cancel_refresh(self, session_id: str) -> CommandResult:
         payload = self._require_active_auth_session(session_id)

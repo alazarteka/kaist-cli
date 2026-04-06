@@ -25,9 +25,9 @@ from kaist_cli.cli.output import emit_text
 from kaist_cli.v2.contracts import CommandError, CommandResult
 from kaist_cli.v2.klms.cache import load_cache_entry, load_cache_value, save_cache_value
 from kaist_cli.v2.klms import dashboard as dashboard_module
-from kaist_cli.v2.klms.auth_session import load_auth_session, save_auth_session
+from kaist_cli.v2.klms.auth_session import clear_auth_session, load_auth_session, save_auth_session
 from kaist_cli.v2.klms.auth import AuthService
-from kaist_cli.v2.klms.auth import _EasyLoginSignals, _extract_easy_login_error_message, _extract_easy_login_number, _extract_sso_login_view_url, _should_update_easy_login_number, looks_login_url
+from kaist_cli.v2.klms.auth import _EasyLoginSignals, _extract_easy_login_error_message, _extract_easy_login_number, _extract_sso_login_view_url, _request_email_otp_delivery, _should_update_easy_login_number, _submit_password_login, looks_login_url
 from kaist_cli.v2.klms.assignments import AssignmentService, _extract_assignment_detail_from_html, _extract_assignment_rows_from_calendar_data, _filter_assignments
 from kaist_cli.v2.klms.courses import _course_is_current_term, _course_matches_query, _discover_courses_from_dashboard, _parse_recent_courses_payload
 from kaist_cli.v2.klms.capture import _courseboard_runtime_capture_summary, _extract_courseboard_js_hints
@@ -382,6 +382,23 @@ def test_auth_cancel_refresh_clears_staged_session(tmp_path: Path) -> None:
     assert load_auth_session(paths) is None
 
 
+def test_clear_auth_session_removes_staged_storage_state(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        paths.auth_session_state_path.parent.mkdir(parents=True, exist_ok=True)
+        paths.auth_session_state_path.write_text("{}", encoding="utf-8")
+        clear_auth_session(paths)
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert not paths.auth_session_state_path.exists()
+
+
 def test_auth_complete_refresh_rejects_missing_session(tmp_path: Path) -> None:
     old_home = os.environ.get("KAIST_CLI_HOME")
     os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
@@ -507,6 +524,24 @@ def test_run_authenticated_raises_concurrent_access_when_profile_lock_is_held(tm
     assert exc_info.value.retryable is True
 
 
+def test_command_error_survives_profile_lock_context(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        with pytest.raises(CommandError) as exc_info:
+            with auth_module._hold_profile_lock(paths):
+                raise CommandError(code="AUTH_FLOW_UNSUPPORTED", message="broken")
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert exc_info.value.code == "AUTH_FLOW_UNSUPPORTED"
+    assert exc_info.value.message == "broken"
+
+
 def test_v2_json_envelope_reports_concurrent_access_when_profile_lock_is_held(tmp_path: Path) -> None:
     old_home = os.environ.get("KAIST_CLI_HOME")
     os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
@@ -592,6 +627,43 @@ def test_extract_easy_login_number_and_error_message() -> None:
     """
     assert _extract_easy_login_number(html) == "482913"
     assert _extract_easy_login_error_message(html) == "Easy Login app is not registered."
+
+
+def test_submit_password_login_targets_id_pw_tab_selectors() -> None:
+    class FakePage:
+        def evaluate(self, script: str, payload: list[str]) -> bool:  # type: ignore[no-untyped-def]
+            assert payload == ["student123", "hunter2"]
+            assert "li#auth a" in script
+            assert "#loginTab02" in script
+            assert "#login_id" in script
+            assert "#login_pwd" in script
+            return True
+
+    assert _submit_password_login(FakePage(), username="student123", password="hunter2") is True
+
+
+def test_request_email_otp_delivery_targets_email_button() -> None:
+    class FakePage:
+        def evaluate(self, script: str) -> bool:  # type: ignore[no-untyped-def]
+            assert "#email" in script
+            assert "외부 메일" in script
+            return True
+
+    assert _request_email_otp_delivery(FakePage()) is True
+
+
+def test_submit_email_otp_code_reenables_second_step_controls() -> None:
+    class FakePage:
+        def evaluate(self, script: str, payload: str) -> bool:  # type: ignore[no-untyped-def]
+            assert payload == "123456"
+            assert "window.send_flag = true" in script
+            assert "document.querySelector('#crtfc_no')" in script
+            assert "document.querySelector('#proc')" in script
+            assert "classList.remove('disable')" in script
+            assert "'submit', 'button'" in script
+            return True
+
+    assert auth_module._submit_email_otp_code(FakePage(), otp="123456") is True
 
 
 def test_extract_easy_login_number_from_verification_widget() -> None:

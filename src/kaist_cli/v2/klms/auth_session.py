@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
@@ -50,6 +51,8 @@ def save_auth_session(paths: KlmsPaths, payload: dict[str, Any]) -> dict[str, An
 
 def clear_auth_session(paths: KlmsPaths) -> None:
     write_json_file_atomic(paths.auth_session_path, _default_session_payload(), chmod_mode=0o600)
+    with contextlib.suppress(FileNotFoundError):
+        paths.auth_session_state_path.unlink()
 
 
 def update_auth_session(paths: KlmsPaths, *, updater: Any) -> dict[str, Any]:

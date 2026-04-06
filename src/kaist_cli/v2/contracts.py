@@ -15,7 +15,7 @@ class CommandResult:
     capability: Capability
 
 
-@dataclass(frozen=True)
+@dataclass
 class CommandError(Exception):
     code: str
     message: str
@@ -25,4 +25,3 @@ class CommandError(Exception):
 
     def __str__(self) -> str:
         return self.message
-
