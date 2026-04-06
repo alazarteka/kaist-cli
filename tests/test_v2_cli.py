@@ -354,6 +354,49 @@ def test_auth_begin_refresh_requires_email_otp_strategy(tmp_path: Path) -> None:
     assert exc_info.value.code == "AUTH_FLOW_UNSUPPORTED"
 
 
+def test_auth_begin_refresh_spawns_worker_and_returns_waiting_session(tmp_path: Path, monkeypatch) -> None:
+    _write_config(tmp_path, auth_username="student123", auth_strategy="email_otp", otp_source="manual")
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        auth = AuthService(resolve_paths())
+        spawned: list[str] = []
+
+        class FakeWorker:
+            def poll(self) -> None:
+                return None
+
+        def fake_spawn(session_id: str) -> FakeWorker:
+            spawned.append(session_id)
+            return FakeWorker()
+
+        def fake_wait(*, session_id: str, wait_seconds: float, worker: FakeWorker) -> dict[str, object]:
+            assert spawned == [session_id]
+            assert wait_seconds == 45.0
+            return {
+                "session_id": session_id,
+                "strategy": "email_otp",
+                "otp_source": "manual",
+                "started_at": "2026-04-06T00:00:00Z",
+                "expires_at": "2026-04-06T00:10:00Z",
+                "stage": "waiting_for_email_otp",
+            }
+
+        monkeypatch.setattr(auth, "_spawn_email_otp_worker", fake_spawn)
+        monkeypatch.setattr(auth, "_wait_for_email_otp_worker_ready", fake_wait)
+        result = auth.begin_refresh(wait_seconds=180.0)
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result.data["state"] == "waiting_for_email_otp"
+    assert result.data["strategy"] == "email_otp"
+    assert result.data["otp_source"] == "manual"
+    assert spawned
+
+
 def test_auth_cancel_refresh_clears_staged_session(tmp_path: Path) -> None:
     old_home = os.environ.get("KAIST_CLI_HOME")
     os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
@@ -380,6 +423,43 @@ def test_auth_cancel_refresh_clears_staged_session(tmp_path: Path) -> None:
 
     assert result.data["state"] == "canceled"
     assert load_auth_session(paths) is None
+
+
+def test_auth_cancel_refresh_routes_to_worker_when_present(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        save_auth_session(
+            paths,
+            {
+                "session_id": "abc123",
+                "strategy": "email_otp",
+                "stage": "waiting_for_email_otp",
+                "username": "student123",
+                "started_at": "2026-04-06T00:00:00Z",
+                "expires_at": "2099-04-06T00:10:00Z",
+                "worker_port": 43210,
+                "worker_token": "secret",
+            },
+        )
+        auth = AuthService(paths)
+
+        def fake_send(*, payload: dict[str, object], action: str, timeout_seconds: float, otp_code: str | None = None) -> dict[str, object]:
+            assert payload["session_id"] == "abc123"
+            assert action == "cancel"
+            assert otp_code is None
+            return {"ok": True, "data": {"ok": True, "state": "canceled", "session_id": "abc123", "strategy": "email_otp"}}
+
+        monkeypatch.setattr(auth, "_send_email_otp_worker_command", fake_send)
+        result = auth.cancel_refresh("abc123")
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result.data["state"] == "canceled"
 
 
 def test_clear_auth_session_removes_staged_storage_state(tmp_path: Path) -> None:
@@ -413,6 +493,134 @@ def test_auth_complete_refresh_rejects_missing_session(tmp_path: Path) -> None:
             os.environ["KAIST_CLI_HOME"] = old_home
 
     assert exc_info.value.code == "AUTH_SESSION_MISSING"
+
+
+def test_auth_complete_refresh_routes_otp_to_worker(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        save_auth_session(
+            paths,
+            {
+                "session_id": "abc123",
+                "strategy": "email_otp",
+                "stage": "waiting_for_email_otp",
+                "username": "student123",
+                "started_at": "2026-04-06T00:00:00Z",
+                "expires_at": "2099-04-06T00:10:00Z",
+                "worker_port": 43210,
+                "worker_token": "secret",
+            },
+        )
+        auth = AuthService(paths)
+
+        def fake_send(*, payload: dict[str, object], action: str, timeout_seconds: float, otp_code: str | None = None) -> dict[str, object]:
+            assert payload["session_id"] == "abc123"
+            assert action == "submit_otp"
+            assert otp_code == "123456"
+            return {
+                "ok": True,
+                "data": {
+                    "ok": True,
+                    "state": "completed",
+                    "login_strategy": "email_otp",
+                    "username": "student123",
+                },
+            }
+
+        monkeypatch.setattr(auth, "_send_email_otp_worker_command", fake_send)
+        result = auth.complete_refresh("abc123", otp="123456")
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result.data["state"] == "completed"
+    assert result.data["login_strategy"] == "email_otp"
+
+
+def test_validate_email_otp_request_maps_invalid_code(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        auth = AuthService(resolve_paths())
+
+        class FakeResponse:
+            def json(self) -> dict[str, str]:
+                return {"code": "E001"}
+
+        class FakeRequest:
+            def post(self, url: str, *, form: dict[str, str]) -> FakeResponse:  # type: ignore[no-untyped-def]
+                assert url.endswith("/ajaxValidCrtfcNo")
+                assert form == {"crtfc_no": "123456"}
+                return FakeResponse()
+
+        fake_context = SimpleNamespace(request=FakeRequest())
+        with pytest.raises(CommandError) as exc_info:
+            auth._validate_email_otp_request(context=fake_context, otp_code="123456")
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert exc_info.value.code == "AUTH_OTP_INVALID"
+
+
+def test_validate_email_otp_request_accepts_success_code(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        auth = AuthService(resolve_paths())
+
+        class FakeResponse:
+            def json(self) -> dict[str, str]:
+                return {"code": "SS0001"}
+
+        class FakeRequest:
+            def post(self, url: str, *, form: dict[str, str]) -> FakeResponse:  # type: ignore[no-untyped-def]
+                assert url.endswith("/ajaxValidCrtfcNo")
+                assert form == {"crtfc_no": "654321"}
+                return FakeResponse()
+
+        fake_context = SimpleNamespace(request=FakeRequest())
+        code = auth._validate_email_otp_request(context=fake_context, otp_code="654321")
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert code == "SS0001"
+
+
+def test_validate_email_otp_request_accepts_device_registration_code(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        auth = AuthService(resolve_paths())
+
+        class FakeResponse:
+            def json(self) -> dict[str, str]:
+                return {"code": "SS0099"}
+
+        class FakeRequest:
+            def post(self, url: str, *, form: dict[str, str]) -> FakeResponse:  # type: ignore[no-untyped-def]
+                assert url.endswith("/ajaxValidCrtfcNo")
+                assert form == {"crtfc_no": "777777"}
+                return FakeResponse()
+
+        fake_context = SimpleNamespace(request=FakeRequest())
+        code = auth._validate_email_otp_request(context=fake_context, otp_code="777777")
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert code == "SS0099"
 
 
 def test_keychain_secret_store_shells_out_to_security_cli(monkeypatch) -> None:

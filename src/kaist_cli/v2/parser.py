@@ -159,6 +159,20 @@ def register_klms_parser(
         handler=handler,
     )
 
+    auth_worker_run = auth_sub.add_parser(
+        "_worker-run",
+        help=argparse.SUPPRESS,
+        description=argparse.SUPPRESS,
+        formatter_class=_HelpFormatter,
+    )
+    auth_worker_run.add_argument("session_id", metavar="SESSION_ID", help=argparse.SUPPRESS)
+    _set_defaults(
+        auth_worker_run,
+        schema_name=f"{schema_prefix}.auth.worker_run.v1",
+        command_path="klms auth _worker-run",
+        handler=handler,
+    )
+
     auth_doctor = auth_sub.add_parser(
         "doctor",
         help="Run offline checks against saved KLMS auth state and config.",

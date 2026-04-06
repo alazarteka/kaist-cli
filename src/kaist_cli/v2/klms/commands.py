@@ -44,6 +44,8 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
         return facade.auth_complete_refresh(args.session_id, otp=args.otp, wait_seconds=args.wait_seconds)
     if args.group == "auth" and args.action == "cancel-refresh":
         return facade.auth_cancel_refresh(args.session_id)
+    if args.group == "auth" and args.action == "_worker-run":
+        return facade.auth_worker_run(args.session_id)
     if args.group == "auth" and args.action == "doctor":
         return facade.auth_doctor()
     if args.group == "today":

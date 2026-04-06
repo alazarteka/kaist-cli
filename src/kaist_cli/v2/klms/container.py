@@ -120,6 +120,9 @@ class KlmsFacade:
     def auth_cancel_refresh(self, session_id: str) -> CommandResult:
         return self._auth.cancel_refresh(session_id)
 
+    def auth_worker_run(self, session_id: str) -> CommandResult:
+        return self._auth.worker_run(session_id)
+
     def auth_doctor(self) -> CommandResult:
         return self._auth.doctor()
 
