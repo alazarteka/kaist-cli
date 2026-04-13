@@ -15,6 +15,15 @@ from .paths import KlmsPaths
 from .provider_state import ProviderLoad
 from .session import build_session_bootstrap
 
+WEEK_COMMAND_SOFT_SECONDS = 24.0
+WEEK_COMMAND_HARD_SECONDS = 30.0
+WEEK_ASSIGNMENTS_SOFT_SECONDS = 8.0
+WEEK_ASSIGNMENTS_HARD_SECONDS = 12.0
+WEEK_NOTICES_SOFT_SECONDS = 18.0
+WEEK_NOTICES_HARD_SECONDS = 24.0
+WEEK_FILES_SOFT_SECONDS = 14.0
+WEEK_FILES_HARD_SECONDS = 20.0
+
 
 def _local_now() -> datetime:
     return datetime.now().astimezone()
@@ -580,7 +589,10 @@ class DashboardService:
         week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
         week_end = week_start + timedelta(days=7)
         config = load_config(self._paths)
-        deadline = RefreshDeadline.start()
+        deadline = RefreshDeadline.start(
+            soft_seconds=WEEK_COMMAND_SOFT_SECONDS,
+            hard_seconds=WEEK_COMMAND_HARD_SECONDS,
+        )
 
         def callback(context: Any, auth_mode: str, dashboard_state: dict[str, Any]) -> CommandResult:
             bootstrap = build_session_bootstrap(
@@ -594,20 +606,26 @@ class DashboardService:
             )
             warnings: list[dict[str, Any]] = []
             provider_status: dict[str, Any] = {}
+            assignments_load = self._run_component(
+                "assignments",
+                lambda: self._assignments.load_for_dashboard(
+                    context=context,
+                    config=config,
+                    auth_mode=auth_mode,
+                    limit=max(limit * 3, 16),
+                    since_iso=week_start.isoformat(timespec="seconds"),
+                    bootstrap=bootstrap,
+                    deadline=RefreshDeadline.start(
+                        soft_seconds=WEEK_ASSIGNMENTS_SOFT_SECONDS,
+                        hard_seconds=WEEK_ASSIGNMENTS_HARD_SECONDS,
+                    ),
+                ),
+            )
+            warnings.extend(assignments_load.provider_warnings("assignments"))
+            provider_status["assignments"] = assignments_load.provider_status()
+
             loads = self._run_components_parallel(
                 [
-                    (
-                        "assignments",
-                        lambda: self._assignments.load_for_dashboard(
-                            context=context,
-                            config=config,
-                            auth_mode=auth_mode,
-                            limit=max(limit * 3, 16),
-                            since_iso=week_start.isoformat(timespec="seconds"),
-                            bootstrap=bootstrap,
-                            deadline=deadline,
-                        ),
-                    ),
                     (
                         "notices",
                         lambda: self._notices.load_for_dashboard(
@@ -618,7 +636,10 @@ class DashboardService:
                             limit=max(limit * 2, 16),
                             since_iso=week_start.isoformat(timespec="seconds"),
                             bootstrap=bootstrap,
-                            deadline=deadline,
+                            deadline=RefreshDeadline.start(
+                                soft_seconds=WEEK_NOTICES_SOFT_SECONDS,
+                                hard_seconds=WEEK_NOTICES_HARD_SECONDS,
+                            ),
                         ),
                     ),
                     (
@@ -629,7 +650,10 @@ class DashboardService:
                             auth_mode=auth_mode,
                             limit=max(limit * 2, 12),
                             bootstrap=bootstrap,
-                            deadline=deadline,
+                            deadline=RefreshDeadline.start(
+                                soft_seconds=WEEK_FILES_SOFT_SECONDS,
+                                hard_seconds=WEEK_FILES_HARD_SECONDS,
+                            ),
                         ),
                     ),
                 ],
@@ -637,7 +661,6 @@ class DashboardService:
                 provider_status=provider_status,
             )
             successes: list[ProviderLoad] = []
-            assignments_load = loads["assignments"]
             if assignments_load.ok:
                 successes.append(assignments_load)
             notices_load = loads["notices"]
