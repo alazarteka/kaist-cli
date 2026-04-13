@@ -62,6 +62,7 @@ EMAIL_OTP_SESSION_TTL_SECONDS = 10 * 60
 EMAIL_OTP_WORKER_READY_TIMEOUT_SECONDS = 45.0
 EMAIL_OTP_WORKER_POLL_SECONDS = 0.25
 AUTH_SESSION_STARTING_GRACE_SECONDS = 30.0
+AUTH_STATUS_REFRESH_WINDOW_HOURS = 3.0
 
 
 def epoch_to_iso_utc(epoch: float) -> str:
@@ -676,6 +677,29 @@ def storage_state_cookie_stats(paths: KlmsPaths) -> dict[str, Any] | None:
     }
 
 
+def _latest_auth_artifact_mtime(paths: KlmsPaths) -> float | None:
+    mtimes: list[float] = []
+    for candidate in (paths.storage_state_path,):
+        try:
+            if candidate.exists():
+                mtimes.append(candidate.stat().st_mtime)
+        except OSError:
+            continue
+    try:
+        if paths.profile_dir.exists():
+            mtimes.append(paths.profile_dir.stat().st_mtime)
+            for child in paths.profile_dir.rglob("*"):
+                try:
+                    mtimes.append(child.stat().st_mtime)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    if not mtimes:
+        return None
+    return max(mtimes)
+
+
 def _tail_text(text: str, *, max_lines: int = 20) -> str:
     lines = [line for line in text.splitlines() if line.strip()]
     if not lines:
@@ -1010,6 +1034,22 @@ class AuthService:
             return ""
         return _tail_text(text, max_lines=max_lines)
 
+    def _refresh_heuristic(self) -> dict[str, Any] | None:
+        last_refresh_epoch = _latest_auth_artifact_mtime(self._paths)
+        if last_refresh_epoch is None:
+            return None
+        refresh_due_epoch = last_refresh_epoch + (AUTH_STATUS_REFRESH_WINDOW_HOURS * 3600)
+        now_epoch = time.time()
+        remaining_hours = round((refresh_due_epoch - now_epoch) / 3600, 2)
+        return {
+            "kind": "fixed_window_since_last_refresh",
+            "window_hours": AUTH_STATUS_REFRESH_WINDOW_HOURS,
+            "last_refresh_at": epoch_to_iso_utc(last_refresh_epoch),
+            "refresh_due_at": epoch_to_iso_utc(refresh_due_epoch),
+            "refresh_overdue": refresh_due_epoch <= now_epoch,
+            "hours_until_refresh": remaining_hours,
+        }
+
     def snapshot(self) -> dict[str, Any]:
         ensure_private_dirs(self._paths)
         config = maybe_load_config(self._paths)
@@ -1026,6 +1066,7 @@ class AuthService:
                 "profile": has_profile_session(self._paths),
                 "storage_state": has_storage_state_session(self._paths),
             },
+            "refresh_heuristic": self._refresh_heuristic(),
             "storage_state_cookie_stats": storage_state_cookie_stats(self._paths),
             "staged_auth_session": staged_auth_session,
             "config": self._config_payload(config),

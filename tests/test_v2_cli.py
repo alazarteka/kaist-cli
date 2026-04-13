@@ -139,8 +139,29 @@ def test_auth_status_detects_storage_state_and_cookie_stats(tmp_path: Path) -> N
     payload = json.loads(cp.stdout)
     assert payload["data"]["configured"] is True
     assert payload["data"]["auth_mode"] == "storage_state"
+    assert payload["data"]["refresh_heuristic"]["kind"] == "fixed_window_since_last_refresh"
+    assert payload["data"]["refresh_heuristic"]["window_hours"] == 3.0
     assert payload["data"]["storage_state_cookie_stats"]["cookie_count"] == 1
     assert payload["data"]["storage_state_cookie_stats"]["next_expiry_iso"] is not None
+
+
+def test_auth_status_uses_latest_auth_artifact_for_refresh_heuristic(tmp_path: Path) -> None:
+    _write_config(tmp_path)
+    storage_state = _write_storage_state(tmp_path)
+    profile_file = tmp_path / "kaist-home" / "private" / "klms" / "profile" / "Cookies"
+    profile_file.parent.mkdir(parents=True, exist_ok=True)
+    profile_file.write_text("cookie-db", encoding="utf-8")
+    old_storage = datetime(2026, 4, 14, 0, 0, 0, tzinfo=timezone.utc).timestamp()
+    newer_profile = datetime(2026, 4, 14, 1, 0, 0, tzinfo=timezone.utc).timestamp()
+    os.utime(storage_state, (old_storage, old_storage))
+    os.utime(profile_file, (newer_profile, newer_profile))
+
+    cp = run_v2(tmp_path, "--json", "klms", "auth", "status")
+    assert cp.returncode == 0, cp.stderr
+    payload = json.loads(cp.stdout)
+    heuristic = payload["data"]["refresh_heuristic"]
+    assert heuristic["last_refresh_at"] == "2026-04-14T01:00:00Z"
+    assert heuristic["refresh_due_at"] == "2026-04-14T04:00:00Z"
 
 
 def test_auth_status_includes_saved_auth_username(tmp_path: Path) -> None:
