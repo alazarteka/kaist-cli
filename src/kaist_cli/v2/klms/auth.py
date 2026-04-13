@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import time
+import traceback
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -60,6 +61,7 @@ EMAIL_OTP_DEFAULT_WAIT_SECONDS = 180.0
 EMAIL_OTP_SESSION_TTL_SECONDS = 10 * 60
 EMAIL_OTP_WORKER_READY_TIMEOUT_SECONDS = 45.0
 EMAIL_OTP_WORKER_POLL_SECONDS = 0.25
+AUTH_SESSION_STARTING_GRACE_SECONDS = 30.0
 
 
 def epoch_to_iso_utc(epoch: float) -> str:
@@ -76,6 +78,16 @@ def _pid_is_running(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def _parse_iso_utc(value: str | None) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def has_profile_session(paths: KlmsPaths) -> bool:
@@ -962,6 +974,42 @@ class AuthService:
             return "Run `kaist klms auth login` to create a persistent browser profile."
         return "Run `kaist klms auth refresh` if the saved session stops working."
 
+    def _stale_auth_session_reason(self, payload: dict[str, Any]) -> str | None:
+        stage = str(payload.get("stage") or "").strip()
+        expires_at = _parse_iso_utc(payload.get("expires_at"))
+        now = datetime.now(timezone.utc)
+        if expires_at is not None and expires_at <= now:
+            return "expired"
+        if stage in {"completed", "canceled"}:
+            return stage
+        worker_pid = int(payload.get("worker_pid") or 0)
+        if stage == "starting" and worker_pid > 0 and not _pid_is_running(worker_pid):
+            return "worker_exited"
+        started_at = _parse_iso_utc(payload.get("started_at"))
+        if stage == "starting" and worker_pid <= 0 and started_at is not None:
+            age = (now - started_at).total_seconds()
+            if age >= AUTH_SESSION_STARTING_GRACE_SECONDS:
+                return "startup_stalled"
+        return None
+
+    def _cleanup_stale_auth_session(self, payload: dict[str, Any] | None) -> dict[str, Any] | None:
+        if payload is None:
+            return None
+        if self._stale_auth_session_reason(payload) is None:
+            return payload
+        clear_auth_session(self._paths)
+        return None
+
+    def _load_current_auth_session(self) -> dict[str, Any] | None:
+        return self._cleanup_stale_auth_session(load_auth_session(self._paths))
+
+    def _read_auth_worker_log_tail(self, *, max_lines: int = 20) -> str:
+        try:
+            text = self._paths.auth_worker_log_path.read_text(encoding="utf-8")
+        except (FileNotFoundError, OSError):
+            return ""
+        return _tail_text(text, max_lines=max_lines)
+
     def snapshot(self) -> dict[str, Any]:
         ensure_private_dirs(self._paths)
         config = maybe_load_config(self._paths)
@@ -991,7 +1039,7 @@ class AuthService:
         }
 
     def _session_snapshot(self) -> dict[str, Any] | None:
-        payload = load_auth_session(self._paths)
+        payload = self._load_current_auth_session()
         if payload is None:
             return None
         snapshot = {
@@ -1220,19 +1268,21 @@ class AuthService:
 
     def _spawn_email_otp_worker(self, session_id: str) -> subprocess.Popen[str]:
         command = [sys.executable, "-m", "kaist_cli.main", "klms", "auth", "_worker-run", session_id]
-        devnull = open(os.devnull, "w", encoding="utf-8")
+        self._paths.auth_worker_log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._paths.auth_worker_log_path.write_text("", encoding="utf-8")
+        log_handle = open(self._paths.auth_worker_log_path, "a", encoding="utf-8")
         try:
             return subprocess.Popen(  # noqa: S603
                 command,
-                stdin=devnull,
-                stdout=devnull,
-                stderr=devnull,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=log_handle,
                 text=True,
                 start_new_session=True,
                 close_fds=True,
             )
         finally:
-            devnull.close()
+            log_handle.close()
 
     def _wait_for_email_otp_worker_ready(
         self,
@@ -1261,9 +1311,12 @@ class AuthService:
                     retryable=True,
                 )
             if worker.poll() is not None:
+                detail = self._read_auth_worker_log_tail(max_lines=12)
+                detail_suffix = f" Last log lines:\n{detail}" if detail else ""
+                clear_auth_session(self._paths)
                 raise CommandError(
                     code="AUTH_FAILED",
-                    message="KLMS email OTP worker exited before reaching the OTP stage.",
+                    message=f"KLMS email OTP worker exited before reaching the OTP stage.{detail_suffix}",
                     hint="Retry `kaist klms auth begin-refresh`, or inspect the KAIST SSO flow manually.",
                     exit_code=10,
                     retryable=True,
@@ -1365,7 +1418,7 @@ class AuthService:
             pass
 
     def _require_active_auth_session(self, session_id: str) -> dict[str, Any]:
-        payload = load_auth_session(self._paths)
+        payload = self._load_current_auth_session()
         if payload is None:
             raise CommandError(
                 code="AUTH_SESSION_MISSING",
@@ -1382,22 +1435,28 @@ class AuthService:
                 exit_code=10,
                 retryable=True,
             )
-        expires_at = str(payload.get("expires_at") or "").strip()
-        if expires_at:
-            normalized = expires_at.replace("Z", "+00:00")
-            try:
-                expires_dt = datetime.fromisoformat(normalized)
-            except ValueError:
-                expires_dt = None
-            if expires_dt is not None and expires_dt <= datetime.now(timezone.utc):
-                clear_auth_session(self._paths)
-                raise CommandError(
-                    code="AUTH_SESSION_EXPIRED",
-                    message=f"Staged KLMS auth session expired: {session_id}",
-                    hint="Run `kaist klms auth begin-refresh` again to request a fresh OTP challenge.",
-                    exit_code=10,
-                    retryable=True,
-                )
+        stage = str(payload.get("stage") or "").strip()
+        if stage in {"completed", "canceled"}:
+            clear_auth_session(self._paths)
+            raise CommandError(
+                code="AUTH_SESSION_EXPIRED",
+                message=f"Staged KLMS auth session is no longer active: {session_id}",
+                hint="Run `kaist klms auth begin-refresh` again to request a fresh OTP challenge.",
+                exit_code=10,
+                retryable=True,
+            )
+        if stage == "failed":
+            error = payload.get("error")
+            if isinstance(error, dict):
+                _raise_command_error_payload(error)
+            clear_auth_session(self._paths)
+            raise CommandError(
+                code="AUTH_SESSION_EXPIRED",
+                message=f"Staged KLMS auth session already failed: {session_id}",
+                hint="Run `kaist klms auth begin-refresh` again to request a fresh OTP challenge.",
+                exit_code=10,
+                retryable=True,
+            )
         return payload
 
     def _wait_for_email_otp_challenge(
@@ -1617,6 +1676,98 @@ class AuthService:
             retryable=True,
         )
 
+    def _assert_saved_auth_session_reusable_with_playwright(
+        self,
+        *,
+        playwright: Any,
+        config: KlmsConfig,
+        timeout_seconds: float,
+    ) -> None:
+        timeout_ms = max(1_000, int(max(1.0, timeout_seconds) * 1000))
+        attempts: list[dict[str, Any]] = []
+
+        if has_profile_session(self._paths):
+            profile_context = _launch_chromium_persistent_context_sync(
+                playwright,
+                paths=self._paths,
+                user_data_dir=str(self._paths.profile_dir),
+                headless=True,
+                accept_downloads=False,
+            )
+            try:
+                state = self._context_dashboard_state(profile_context, config=config, timeout_ms=timeout_ms)
+                attempts.append({"auth_mode": "profile", **state})
+                if state["authenticated"]:
+                    return
+            finally:
+                profile_context.close()
+
+        if has_storage_state_session(self._paths):
+            browser = _launch_chromium_browser_sync(playwright, paths=self._paths, headless=True)
+            try:
+                storage_context = browser.new_context(
+                    storage_state=str(self._paths.storage_state_path),
+                    accept_downloads=False,
+                )
+                try:
+                    state = self._context_dashboard_state(storage_context, config=config, timeout_ms=timeout_ms)
+                    attempts.append({"auth_mode": "storage_state", **state})
+                    if state["authenticated"]:
+                        return
+                finally:
+                    storage_context.close()
+            finally:
+                browser.close()
+
+        detail = "; ".join(
+            f"{attempt['auth_mode']}: final_url={attempt.get('final_url')}"
+            for attempt in attempts
+        ) or "no reusable auth artifacts"
+        raise CommandError(
+            code="AUTH_FAILED",
+            message=f"KLMS login completed, but the saved session could not be reopened ({detail}).",
+            hint="Run `kaist klms auth refresh` again; if it still fails, switch auth strategy or inspect `kaist klms auth doctor`.",
+            exit_code=10,
+            retryable=True,
+        )
+
+    def _assert_storage_state_reusable(
+        self,
+        *,
+        browser: Any,
+        config: KlmsConfig,
+        timeout_seconds: float,
+    ) -> None:
+        if not has_storage_state_session(self._paths):
+            raise CommandError(
+                code="AUTH_FAILED",
+                message="KLMS email OTP login completed, but no storage_state was written.",
+                hint="Run `kaist klms auth begin-refresh` again to create a fresh staged session.",
+                exit_code=10,
+                retryable=True,
+            )
+        storage_context = browser.new_context(
+            storage_state=str(self._paths.storage_state_path),
+            accept_downloads=False,
+        )
+        try:
+            state = self._context_dashboard_state(
+                storage_context,
+                config=config,
+                timeout_ms=max(1_000, int(max(1.0, timeout_seconds) * 1000)),
+            )
+        finally:
+            storage_context.close()
+        if state["authenticated"]:
+            return
+        raise CommandError(
+            code="AUTH_FAILED",
+            message=f"KLMS email OTP login completed, but the saved session could not be reopened (storage_state: final_url={state.get('final_url')}).",
+            hint="Run `kaist klms auth begin-refresh` again to request a fresh OTP session.",
+            exit_code=10,
+            retryable=True,
+        )
+
     def begin_refresh(
         self,
         *,
@@ -1640,6 +1791,17 @@ class AuthService:
             ),
         )
         worker = self._spawn_email_otp_worker(payload["session_id"])
+        from .auth_session import update_auth_session
+
+        update_auth_session(
+            self._paths,
+            updater=lambda current: {
+                **current,
+                "worker_pid": getattr(worker, "pid", 0) or None,
+            }
+            if str(current.get("session_id") or "").strip() == payload["session_id"]
+            else current,
+        )
         ready = self._wait_for_email_otp_worker_ready(
             session_id=payload["session_id"],
             wait_seconds=min(max(float(wait_seconds), 15.0), EMAIL_OTP_WORKER_READY_TIMEOUT_SECONDS),
@@ -1772,6 +1934,7 @@ class AuthService:
                     server.settimeout(0.5)
                     context: Any | None = None
                     try:
+                        mark_stage(worker_pid=os.getpid())
                         context = browser.new_context(accept_downloads=False)
                         page = context.new_page()
                         page.goto(config.base_url, wait_until="domcontentloaded", timeout=30_000)
@@ -1880,6 +2043,11 @@ class AuthService:
                                     else:
                                         page.goto("https://sso.kaist.ac.kr/auth/user/login/link", wait_until="domcontentloaded", timeout=30_000)
                                     self._wait_for_email_otp_completion(page=page, context=context, config=config, wait_seconds=EMAIL_OTP_DEFAULT_WAIT_SECONDS)
+                                    self._assert_storage_state_reusable(
+                                        browser=browser,
+                                        config=config,
+                                        timeout_seconds=15.0,
+                                    )
                                     clear_auth_session(self._paths)
                                     send_response(
                                         conn,
@@ -1912,6 +2080,17 @@ class AuthService:
                             browser.close()
         except CommandError as exc:
             self._persist_worker_failure(session_id, exc)
+            return CommandResult(data={"ok": False}, source="browser", capability="partial")
+        except Exception as exc:  # noqa: BLE001
+            print(traceback.format_exc(), file=sys.stderr)
+            wrapped = CommandError(
+                code="AUTH_FAILED",
+                message=f"Unexpected KLMS email OTP worker failure ({exc}).",
+                hint="Retry `kaist klms auth begin-refresh`; if it still fails, inspect `kaist klms auth status` and the auth worker log.",
+                exit_code=10,
+                retryable=True,
+            )
+            self._persist_worker_failure(session_id, wrapped)
             return CommandResult(data={"ok": False}, source="browser", capability="partial")
 
     def doctor(self) -> CommandResult:
@@ -2011,6 +2190,11 @@ class AuthService:
                 input()
                 self._persist_context_state(context)
                 context.close()
+                self._assert_saved_auth_session_reusable_with_playwright(
+                    playwright=playwright,
+                    config=config,
+                    timeout_seconds=15.0,
+                )
 
         return CommandResult(
             data={
@@ -2242,7 +2426,7 @@ class AuthService:
                         print("Approve this login in the KAIST auth app. Waiting for KLMS session...", file=sys.stderr)
                     else:
                         print("KAIST SSO Easy Login initialized. Waiting for approval in the KAIST auth app...", file=sys.stderr)
-                    return self._wait_for_easy_login_approval(
+                    result = self._wait_for_easy_login_approval(
                         page=page,
                         context=context,
                         config=config,
@@ -2257,6 +2441,12 @@ class AuthService:
                     except Exception:
                         pass
                     context.close()
+                self._assert_saved_auth_session_reusable_with_playwright(
+                    playwright=playwright,
+                    config=config,
+                    timeout_seconds=15.0,
+                )
+                return result
 
     def login(
         self,

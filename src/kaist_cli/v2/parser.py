@@ -223,6 +223,16 @@ def register_klms_parser(
     today.add_argument("--max-notice-pages", type=int, default=1, metavar="N", help="Maximum notice pages per board.")
     _set_defaults(today, schema_name=f"{schema_prefix}.today.v1", command_path="klms today", handler=handler)
 
+    week = klms_sub.add_parser(
+        "week",
+        help="Show this week’s assignments, notices, and new materials in one weekly summary view.",
+        description="Show this week’s assignments, notices, and new materials in one weekly summary view.",
+        formatter_class=_HelpFormatter,
+    )
+    week.add_argument("--limit", type=int, default=8, metavar="N", help="Maximum items per section.")
+    week.add_argument("--max-notice-pages", type=int, default=2, metavar="N", help="Maximum notice pages per board.")
+    _set_defaults(week, schema_name=f"{schema_prefix}.week.v1", command_path="klms week", handler=handler)
+
     inbox = klms_sub.add_parser(
         "inbox",
         help="Show a broader chronological KLMS feed merged across assignments, notices, and materials.",
@@ -271,6 +281,12 @@ def register_klms_parser(
     courses_list.add_argument("--course", metavar="QUERY", help="Filter by course code or title substring.")
     courses_list.add_argument("--limit", type=int, metavar="N", help="Maximum number of courses to return.")
     _set_defaults(courses_list, schema_name=f"{schema_prefix}.courses.list.v1", command_path="klms courses list", handler=handler)
+    courses_resolve = courses_sub.add_parser("resolve", help="Resolve a course query to concrete course IDs and matching aliases.", formatter_class=_HelpFormatter)
+    courses_resolve.add_argument("query", metavar="QUERY", help="Course ID, code, Korean title, or English title.")
+    courses_resolve.add_argument("--include-all", action="store_true", help="Include noisy dashboard cards and non-course items that are hidden by default.")
+    courses_resolve.add_argument("--include-past", action="store_true", help="Include past-term courses instead of defaulting to the current term.")
+    courses_resolve.add_argument("--limit", type=int, default=10, metavar="N", help="Maximum number of matching courses to return.")
+    _set_defaults(courses_resolve, schema_name=f"{schema_prefix}.courses.resolve.v1", command_path="klms courses resolve", handler=handler)
     courses_show = courses_sub.add_parser("show", help="Show course metadata and details for one course ID.", formatter_class=_HelpFormatter)
     courses_show.add_argument("course_id", metavar="ID", help="Course ID.")
     _set_defaults(courses_show, schema_name=f"{schema_prefix}.courses.show.v1", command_path="klms courses show", handler=handler)
@@ -391,6 +407,14 @@ def register_klms_parser(
     videos_show.add_argument("video_id", metavar="ID", help="Video ID or URL.")
     videos_show.add_argument("--course-id", metavar="ID", help="Optional course scope hint.")
     _set_defaults(videos_show, schema_name=f"{schema_prefix}.videos.show.v1", command_path="klms videos show", handler=handler)
+
+    request = klms_sub.add_parser("request", help="Authenticated low-level read-only request helpers for KLMS repair/debugging.", formatter_class=_HelpFormatter)
+    request_sub = request.add_subparsers(dest="action", required=True, metavar="ACTION")
+    request_get = request_sub.add_parser("get", help="Run an authenticated GET against a KLMS path or URL and return stable JSON.", formatter_class=_HelpFormatter)
+    request_get.add_argument("target", metavar="TARGET", help="KLMS path like `/course/view.php?id=12345` or a full URL under the configured base URL.")
+    request_get.add_argument("--preview-chars", type=int, default=4000, metavar="N", help="Maximum body characters to include before truncating.")
+    request_get.add_argument("--full-body", action="store_true", help="Include the full response body instead of truncating to a preview.")
+    _set_defaults(request_get, schema_name=f"{schema_prefix}.request.get.v1", command_path="klms request get", handler=handler)
 
     dev = klms_sub.add_parser("dev", help="Engineering, probe, and discovery commands for KLMS internals.", formatter_class=_HelpFormatter)
     dev_sub = dev.add_subparsers(dest="action", required=True, metavar="ACTION")

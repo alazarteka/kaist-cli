@@ -142,6 +142,7 @@ Only hand the auth step back to the user when:
 
 ```bash
 kaist --agent klms today           # urgency-focused: near-term assignments, recent notices, materials
+kaist --agent klms week            # current-week summary across assignments, notices, and materials
 kaist --agent klms inbox           # chronological feed across all resource types
 kaist --agent klms inbox --since 2026-03-15T00:00:00
 ```
@@ -157,10 +158,12 @@ kaist --agent klms sync status     # check cache freshness
 ### Browse courses
 
 Use `courses show` for course-level drill-down.
+Use `courses resolve` before guessing when a course filter may be ambiguous across Korean, English, or code aliases.
 
 ```bash
 kaist --agent klms courses list
 kaist --agent klms courses list --course "CS101"    # filter by code or title
+kaist --agent klms courses resolve "Operating Systems"
 kaist --agent klms courses list --include-past      # include previous terms
 kaist --agent klms courses show COURSE_ID
 ```
@@ -220,6 +223,15 @@ kaist --agent klms videos list --course "CS101" --recent
 kaist --agent klms videos show VIDEO_ID
 ```
 
+### Low-level repair/debug read
+
+Use `request get` as the authenticated read-only escape hatch when a high-level surface is missing or you need to inspect one exact KLMS URL.
+
+```bash
+kaist --agent klms request get /course/view.php?id=178434
+kaist --agent klms request get /lib/ajax/service.php --full-body
+```
+
 ### Maintenance
 
 ```bash
@@ -275,6 +287,8 @@ Check `error.retryable` to decide whether to retry automatically. The `error.hin
 
 - **`AUTH_MISSING` or `AUTH_EXPIRED`** — run `kaist klms auth refresh`. If the configured strategy is `email_otp` and the password is not stored yet, direct the user to `kaist klms auth store-email-otp-secret --username KAIST_ID` in a separate terminal. If refresh fails entirely, fall back to `kaist klms auth login`.
 - **Degraded `today`/`inbox` results** — run `kaist klms sync run` to warm the cache, then retry.
+- **Ambiguous course filtering** — run `kaist --agent klms courses resolve QUERY` and use the returned concrete course ID instead of guessing.
+- **A needed surface is missing from the high-level CLI** — use `kaist --agent klms request get TARGET` before falling back to scraping.
 - **Stale notice/file data** — `sync run` fetches fresh data from KLMS notice boards and file surfaces.
 
 ## Resource payload fields

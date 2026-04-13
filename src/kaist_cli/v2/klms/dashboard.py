@@ -238,6 +238,84 @@ def _select_materials(files: list[dict[str, Any]], *, limit: int) -> list[dict[s
     return materials[: max(0, limit)]
 
 
+def _select_week_assignments(
+    assignments: list[dict[str, Any]],
+    *,
+    now: datetime,
+    week_start: datetime,
+    week_end: datetime,
+    limit: int,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in assignments:
+        due_dt = _parse_iso_datetime(str(row.get("due_iso") or ""), local_tz=now.tzinfo)
+        if due_dt is None or due_dt < week_start or due_dt >= week_end:
+            continue
+        decorated = dict(row)
+        decorated["hours_until_due"] = round((due_dt - now).total_seconds() / 3600, 2)
+        decorated["days_until_due"] = round((due_dt - now).total_seconds() / 86400, 2)
+        decorated["status"] = "overdue" if due_dt < now else "due_this_week"
+        out.append(decorated)
+    out.sort(
+        key=lambda row: (
+            _parse_iso_datetime(str(row.get("due_iso") or ""), local_tz=now.tzinfo) or week_end,
+            str(row.get("title") or "").lower(),
+        )
+    )
+    return out[: max(0, limit)]
+
+
+def _select_week_notices(
+    notices: list[dict[str, Any]],
+    *,
+    now: datetime,
+    week_start: datetime,
+    limit: int,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in notices:
+        posted_dt = _parse_iso_datetime(str(row.get("posted_iso") or ""), local_tz=now.tzinfo)
+        if posted_dt is None or posted_dt < week_start:
+            continue
+        decorated = dict(row)
+        decorated["hours_since_posted"] = round((now - posted_dt).total_seconds() / 3600, 2)
+        out.append(decorated)
+    out.sort(
+        key=lambda row: (
+            -(_parse_iso_datetime(str(row.get("posted_iso") or ""), local_tz=now.tzinfo) or week_start).timestamp(),
+            str(row.get("title") or "").lower(),
+        )
+    )
+    return out[: max(0, limit)]
+
+
+def _select_week_materials(
+    files: list[dict[str, Any]],
+    *,
+    now: datetime,
+    week_start: datetime,
+    limit: int,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in files:
+        if not bool(row.get("downloadable")):
+            continue
+        seen_dt = _parse_iso_datetime(str(row.get("first_seen_at") or row.get("last_seen_at") or ""), local_tz=now.tzinfo)
+        if seen_dt is None or seen_dt < week_start:
+            continue
+        decorated = dict(row)
+        decorated["hours_since_seen"] = round((now - seen_dt).total_seconds() / 3600, 2)
+        out.append(decorated)
+    out.sort(
+        key=lambda row: (
+            -(_parse_iso_datetime(str(row.get("first_seen_at") or row.get("last_seen_at") or ""), local_tz=now.tzinfo) or week_start).timestamp(),
+            str(row.get("course_title") or ""),
+            str(row.get("title") or "").lower(),
+        )
+    )
+    return out[: max(0, limit)]
+
+
 def _merge_capability(results: list[ProviderLoad], *, had_warnings: bool) -> str:
     values = [result.capability for result in results if result.ok]
     if had_warnings:
@@ -476,6 +554,132 @@ class DashboardService:
                 "urgent_assignments": urgent_assignments,
                 "recent_notices": recent_notices,
                 "materials": materials,
+            }
+            return CommandResult(
+                data=payload,
+                source="mixed",
+                capability=_merge_capability(successes, had_warnings=bool(warnings)),
+            )
+
+        return self._auth.run_authenticated_with_state(
+            config=config,
+            headless=True,
+            accept_downloads=False,
+            timeout_seconds=deadline.request_timeout(10.0, use_soft=False),
+            callback=callback,
+        )
+
+    def week(
+        self,
+        *,
+        limit: int = 8,
+        max_notice_pages: int = 2,
+    ) -> CommandResult:
+        limit = max(1, min(int(limit), 50))
+        now = _local_now()
+        week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        week_end = week_start + timedelta(days=7)
+        config = load_config(self._paths)
+        deadline = RefreshDeadline.start()
+
+        def callback(context: Any, auth_mode: str, dashboard_state: dict[str, Any]) -> CommandResult:
+            bootstrap = build_session_bootstrap(
+                self._paths,
+                context=context,
+                config=config,
+                auth_mode=auth_mode,
+                timeout_seconds=10.0,
+                dashboard_url=str(dashboard_state.get("final_url") or ""),
+                dashboard_html=str(dashboard_state.get("html") or ""),
+            )
+            warnings: list[dict[str, Any]] = []
+            provider_status: dict[str, Any] = {}
+            loads = self._run_components_parallel(
+                [
+                    (
+                        "assignments",
+                        lambda: self._assignments.load_for_dashboard(
+                            context=context,
+                            config=config,
+                            auth_mode=auth_mode,
+                            limit=max(limit * 3, 16),
+                            since_iso=week_start.isoformat(timespec="seconds"),
+                            bootstrap=bootstrap,
+                            deadline=deadline,
+                        ),
+                    ),
+                    (
+                        "notices",
+                        lambda: self._notices.load_for_dashboard(
+                            context=context,
+                            config=config,
+                            auth_mode=auth_mode,
+                            max_pages=max_notice_pages,
+                            limit=max(limit * 2, 16),
+                            since_iso=week_start.isoformat(timespec="seconds"),
+                            bootstrap=bootstrap,
+                            deadline=deadline,
+                        ),
+                    ),
+                    (
+                        "files",
+                        lambda: self._files.load_for_dashboard(
+                            context=context,
+                            config=config,
+                            auth_mode=auth_mode,
+                            limit=max(limit * 2, 12),
+                            bootstrap=bootstrap,
+                            deadline=deadline,
+                        ),
+                    ),
+                ],
+                warnings=warnings,
+                provider_status=provider_status,
+            )
+            successes: list[ProviderLoad] = []
+            assignments_load = loads["assignments"]
+            if assignments_load.ok:
+                successes.append(assignments_load)
+            notices_load = loads["notices"]
+            if notices_load.ok:
+                successes.append(notices_load)
+            files_load = loads["files"]
+            if files_load.ok:
+                successes.append(files_load)
+
+            week_assignments = _select_week_assignments(
+                assignments_load.items,
+                now=now,
+                week_start=week_start,
+                week_end=week_end,
+                limit=limit,
+            )
+            week_notices = _select_week_notices(
+                notices_load.items,
+                now=now,
+                week_start=week_start,
+                limit=limit,
+            )
+            week_materials = _select_week_materials(
+                files_load.items,
+                now=now,
+                week_start=week_start,
+                limit=limit,
+            )
+            payload = {
+                "summary": {
+                    "now_iso": now.isoformat(timespec="seconds"),
+                    "week_start_iso": week_start.isoformat(timespec="seconds"),
+                    "week_end_iso": week_end.isoformat(timespec="seconds"),
+                    "assignment_count": len(week_assignments),
+                    "notice_count": len(week_notices),
+                    "material_count": len(week_materials),
+                },
+                "assignments": week_assignments,
+                "notices": week_notices,
+                "materials": week_materials,
+                "providers": provider_status,
+                "warnings": warnings,
             }
             return CommandResult(
                 data=payload,

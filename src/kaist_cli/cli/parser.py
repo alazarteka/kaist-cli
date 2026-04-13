@@ -36,8 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
 
             KLMS quick start:
               1) kaist klms auth login --base-url https://klms.kaist.ac.kr
-              2) kaist klms courses list
-              3) kaist klms today
+              2) kaist klms courses resolve "Operating Systems"
+              3) kaist klms week
 
             Agent quick start:
               1) kaist agent install codex
@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
               3) Prefer `kaist --agent ...` commands in agent workflows
 
             Global machine mode:
-              kaist --agent klms today
+              kaist --agent klms week
               kaist --agent version
             """
         ),

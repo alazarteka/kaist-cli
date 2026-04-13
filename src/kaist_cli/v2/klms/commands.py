@@ -63,6 +63,8 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
             notice_days=args.notice_days,
             max_notice_pages=args.max_notice_pages,
         )
+    if args.group == "week":
+        return facade.week(limit=args.limit, max_notice_pages=args.max_notice_pages)
     if args.group == "inbox":
         return facade.inbox(limit=args.limit, max_notice_pages=args.max_notice_pages, since_iso=args.since_iso)
     if args.group == "sync" and args.action == "run":
@@ -77,6 +79,13 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
             include_past=args.include_past,
             limit=args.limit,
             course_query=args.course,
+        )
+    if args.group == "courses" and args.action == "resolve":
+        return facade.resolve_course(
+            query=args.query,
+            include_all=args.include_all,
+            include_past=args.include_past,
+            limit=args.limit,
         )
     if args.group == "courses" and args.action == "show":
         return facade.show_course(args.course_id)
@@ -143,6 +152,8 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
         return facade.list_videos(course_id=args.course_id, course_query=args.course, limit=args.limit, recent=args.recent)
     if args.group == "videos" and args.action == "show":
         return facade.show_video(args.video_id, course_id_hint=args.course_id)
+    if args.group == "request" and args.action == "get":
+        return facade.request_get(args.target, preview_chars=args.preview_chars, full_body=args.full_body)
     if args.group == "dev" and args.action == "plan":
         return facade.dev_plan()
     if args.group == "dev" and args.action == "probe":

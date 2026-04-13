@@ -4,8 +4,9 @@ CLI for KAIST systems, currently centered on KLMS.
 
 Current KLMS surface:
 - auth/session management
-- `today` and `inbox`
+- `today`, `week`, and `inbox`
 - courses, assignments, notices, files, and videos
+- `courses resolve` and authenticated raw `request get`
 - local cache prewarm via `sync`
 - file download and bulk `files pull`
 
@@ -79,13 +80,15 @@ Stable workflows:
 - `kaist klms auth login|install-browser|status|refresh|doctor`
 - `kaist klms auth setup-email-otp|store-email-otp-secret|clear-email-otp-secret|begin-refresh|complete-refresh|cancel-refresh`
 - `kaist klms today [--limit N] [--window-days N] [--notice-days N]`
+- `kaist klms week [--limit N]`
 - `kaist klms inbox [--limit N] [--since <ISO>]`
 - `kaist klms sync run|status|reset`
-- `kaist klms courses list|show`
+- `kaist klms courses list|resolve|show`
 - `kaist klms assignments list|show`
 - `kaist klms notices list|show`
 - `kaist klms files list|get|download|pull`
 - `kaist klms videos list|show`
+- `kaist klms request get TARGET`
 - `kaist klms dev plan|probe|discover`
 
 Other systems:

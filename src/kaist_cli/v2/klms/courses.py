@@ -235,6 +235,23 @@ def _course_matches_query(course: Course, query: str | None) -> bool:
     return False
 
 
+def _matching_course_aliases(course: Course, query: str | None) -> tuple[str, ...]:
+    needle = _normalize_course_match_value(query)
+    if not needle:
+        return ()
+    aliases = _course_aliases(course)
+    matches: list[str] = []
+    if any(needle == alias or needle in alias for alias in aliases):
+        matches.extend(alias for alias in aliases if needle == alias or needle in alias)
+    needle_compact = re.sub(r"[^a-z0-9가-힣]+", "", needle)
+    if needle_compact:
+        for alias in aliases:
+            alias_compact = re.sub(r"[^a-z0-9가-힣]+", "", alias)
+            if alias_compact and needle_compact == alias_compact and alias not in matches:
+                matches.append(alias)
+    return tuple(matches)
+
+
 def _course_is_current_term(course: Course, current_term_label: str | None, *, include_past: bool) -> bool:
     if include_past or not current_term_label:
         return True
@@ -802,6 +819,98 @@ class CourseService:
                 auth_mode=auth_mode,
             )
             return CommandResult(data=course.to_dict(), source="html", capability="partial")
+
+        return self._auth.run_authenticated(
+            config=config,
+            headless=True,
+            accept_downloads=False,
+            timeout_seconds=10.0,
+            callback=callback,
+        )
+
+    def resolve(
+        self,
+        *,
+        query: str,
+        include_all: bool = False,
+        include_past: bool = True,
+        limit: int | None = 10,
+    ) -> CommandResult:
+        needle = str(query or "").strip()
+        if not needle:
+            raise CommandError(
+                code="CONFIG_INVALID",
+                message="Course resolve requires a non-empty query.",
+                hint="Pass a course ID, code, Korean title, or English title.",
+                exit_code=40,
+                retryable=False,
+            )
+        config = load_config(self._paths)
+        limit = None if limit is None else max(1, min(int(limit), 50))
+
+        def callback(context: Any, auth_mode: str) -> CommandResult:
+            courses = self._list_courses_ajax(
+                context=context,
+                config=config,
+                auth_mode=auth_mode,
+                include_all=include_all,
+                include_past=include_past,
+                limit=None,
+                course_query=None,
+            )
+            source = "moodle_ajax"
+            capability = "full"
+            if not courses:
+                courses = self._list_courses_html(
+                    context=context,
+                    config=config,
+                    auth_mode=auth_mode,
+                    include_all=include_all,
+                    include_past=include_past,
+                    limit=None,
+                    course_query=None,
+                )
+                source = "html"
+                capability = "partial"
+            courses = self._enrich_course_professors(
+                context=context,
+                config=config,
+                auth_mode=auth_mode,
+                courses=courses,
+            )
+            matches: list[dict[str, Any]] = []
+            for course in courses:
+                matched_aliases = _matching_course_aliases(course, needle)
+                if not matched_aliases:
+                    continue
+                row = course.to_dict()
+                row["matched_aliases"] = list(matched_aliases)
+                row["title_variants"] = list(course.title_variants)
+                matches.append(row)
+            matches.sort(
+                key=lambda row: (
+                    0 if needle.lower() in {alias.lower() for alias in row["matched_aliases"]} else 1,
+                    len(row["matched_aliases"]),
+                    str(row.get("title") or "").lower(),
+                )
+            )
+            if limit is not None:
+                matches = matches[:limit]
+            resolution = "none"
+            if len(matches) == 1:
+                resolution = "unique"
+            elif matches:
+                resolution = "ambiguous"
+            return CommandResult(
+                data={
+                    "query": needle,
+                    "resolution": resolution,
+                    "count": len(matches),
+                    "items": matches,
+                },
+                source=source,
+                capability=capability,
+            )
 
         return self._auth.run_authenticated(
             config=config,

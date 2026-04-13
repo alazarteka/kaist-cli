@@ -29,7 +29,7 @@ from kaist_cli.v2.klms.auth_session import clear_auth_session, load_auth_session
 from kaist_cli.v2.klms.auth import AuthService
 from kaist_cli.v2.klms.auth import _EasyLoginSignals, _extract_easy_login_error_message, _extract_easy_login_number, _extract_sso_login_view_url, _request_email_otp_delivery, _should_update_easy_login_number, _submit_password_login, looks_login_url
 from kaist_cli.v2.klms.assignments import AssignmentService, _extract_assignment_detail_from_html, _extract_assignment_rows_from_calendar_data, _filter_assignments
-from kaist_cli.v2.klms.courses import _course_is_current_term, _course_matches_query, _discover_courses_from_dashboard, _parse_recent_courses_payload
+from kaist_cli.v2.klms.courses import CourseService, _course_is_current_term, _course_matches_query, _discover_courses_from_dashboard, _parse_recent_courses_payload
 from kaist_cli.v2.klms.capture import _courseboard_runtime_capture_summary, _extract_courseboard_js_hints
 from kaist_cli.v2.klms.config import load_config
 from kaist_cli.v2.klms.dashboard import DashboardService, _build_inbox_items, _decorate_today_assignments, _filter_inbox_assignments, _filter_inbox_files, _select_materials, _select_recent_notices
@@ -40,6 +40,7 @@ from kaist_cli.v2.klms.models import Assignment, Course, FileItem, Notice, Video
 from kaist_cli.v2.klms.notices import NoticeService, _discover_notice_board_ids_from_course_page, _extract_course_ids_from_dashboard, _parse_notice_detail_from_html, _parse_notice_items_from_soup
 from kaist_cli.v2.klms.paths import resolve_paths
 from kaist_cli.v2.klms.provider_state import ProviderLoad
+from kaist_cli.v2.klms.request import RequestService
 from kaist_cli.v2.klms.session import KlmsDownloadFallback
 from kaist_cli.v2.klms.videos import VideoService, _extract_video_items_from_html, _parse_video_detail_from_html, _parse_video_viewer_from_html
 
@@ -456,6 +457,8 @@ def test_auth_begin_refresh_spawns_worker_and_returns_waiting_session(tmp_path: 
         spawned: list[str] = []
 
         class FakeWorker:
+            pid = 43210
+
             def poll(self) -> None:
                 return None
 
@@ -478,6 +481,7 @@ def test_auth_begin_refresh_spawns_worker_and_returns_waiting_session(tmp_path: 
         monkeypatch.setattr(auth, "_spawn_email_otp_worker", fake_spawn)
         monkeypatch.setattr(auth, "_wait_for_email_otp_worker_ready", fake_wait)
         result = auth.begin_refresh(wait_seconds=180.0)
+        session = load_auth_session(resolve_paths())
     finally:
         if old_home is None:
             os.environ.pop("KAIST_CLI_HOME", None)
@@ -488,6 +492,8 @@ def test_auth_begin_refresh_spawns_worker_and_returns_waiting_session(tmp_path: 
     assert result.data["strategy"] == "email_otp"
     assert result.data["otp_source"] == "manual"
     assert spawned
+    assert session is not None
+    assert session["worker_pid"] == 43210
 
 
 def test_auth_cancel_refresh_clears_staged_session(tmp_path: Path) -> None:
@@ -669,6 +675,73 @@ def test_auth_status_surfaces_worker_snapshot_without_secret_fields(tmp_path: Pa
     assert staged["worker"]["running"] is True
     assert "worker_token" not in staged
     assert "worker_port" not in staged
+
+
+def test_auth_status_clears_expired_stuck_starting_session(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        save_auth_session(
+            paths,
+            {
+                "session_id": "stale123",
+                "strategy": "email_otp",
+                "stage": "starting",
+                "username": "student123",
+                "started_at": "2026-04-06T00:00:00Z",
+                "expires_at": "2026-04-06T00:10:00Z",
+            },
+        )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    cp = run_v2(tmp_path, "--json", "klms", "auth", "status")
+    assert cp.returncode == 0, cp.stderr
+    payload = json.loads(cp.stdout)
+    assert payload["data"]["staged_auth_session"] is None
+
+
+def test_wait_for_email_otp_worker_ready_includes_worker_log_tail(tmp_path: Path, monkeypatch) -> None:
+    _write_config(tmp_path, auth_username="student123", auth_strategy="email_otp", otp_source="manual")
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        save_auth_session(
+            paths,
+            {
+                "session_id": "abc123",
+                "strategy": "email_otp",
+                "stage": "starting",
+                "username": "student123",
+                "started_at": "2099-04-06T00:00:00Z",
+                "expires_at": "2099-04-06T00:10:00Z",
+                "worker_pid": 43210,
+            },
+        )
+        paths.auth_worker_log_path.parent.mkdir(parents=True, exist_ok=True)
+        paths.auth_worker_log_path.write_text("Traceback...\nRuntimeError: boom\n", encoding="utf-8")
+        auth = AuthService(paths)
+        monkeypatch.setattr(auth_module, "_pid_is_running", lambda pid: True)
+
+        class FakeWorker:
+            def poll(self) -> int:
+                return 1
+
+        with pytest.raises(CommandError) as exc_info:
+            auth._wait_for_email_otp_worker_ready(session_id="abc123", wait_seconds=15.0, worker=FakeWorker())
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert exc_info.value.code == "AUTH_FAILED"
+    assert "RuntimeError: boom" in exc_info.value.message
 
 
 def test_auth_complete_refresh_clears_stale_worker_session(tmp_path: Path, monkeypatch) -> None:
@@ -1619,6 +1692,7 @@ def test_easy_login_registers_response_listener_on_context(tmp_path: Path, monke
                 capability="full",
             ),
         )
+        monkeypatch.setattr(auth, "_assert_saved_auth_session_reusable_with_playwright", lambda **kwargs: None)
 
         result = auth._easy_login(config=config, username="student123", wait_seconds=30.0)
     finally:
@@ -4181,6 +4255,172 @@ def test_dashboard_today_reuses_one_auth_session_for_all_components(tmp_path: Pa
     assert result.data["providers"]["assignments"]["source"] == "moodle_ajax"
     assert result.data["providers"]["notices"]["freshness_mode"] == "cache"
     assert result.data["providers"]["files"]["refresh_attempted"] is True
+
+
+def test_dashboard_week_summarizes_current_week_items(tmp_path: Path) -> None:
+    now = datetime.now().astimezone()
+    week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    due_iso = (week_start + timedelta(days=2, hours=9)).isoformat(timespec="seconds")
+    posted_iso = (week_start + timedelta(days=1, hours=10)).isoformat(timespec="seconds")
+    first_seen = (week_start + timedelta(days=3, hours=8)).isoformat(timespec="seconds")
+
+    class FakeAuth:
+        def run_authenticated_with_state(self, *, config, headless, accept_downloads, timeout_seconds, callback):  # type: ignore[no-untyped-def]
+            return callback(object(), "profile", {"final_url": "https://klms.kaist.ac.kr/my/", "html": "<html></html>"})
+
+    class FakeAssignments:
+        def load_for_dashboard(self, **kwargs):  # type: ignore[no-untyped-def]
+            return ProviderLoad(
+                items=[{"id": "a1", "title": "HW1", "due_iso": due_iso}],
+                source="moodle_ajax",
+                capability="full",
+                freshness_mode="live",
+                cache_hit=False,
+                stale=False,
+                fetched_at="2026-03-15T00:00:00Z",
+                expires_at=None,
+                refresh_attempted=True,
+            )
+
+    class FakeNotices:
+        def load_for_dashboard(self, **kwargs):  # type: ignore[no-untyped-def]
+            return ProviderLoad(
+                items=[{"id": "n1", "title": "Week notice", "posted_iso": posted_iso}],
+                source="html",
+                capability="partial",
+                freshness_mode="live",
+                cache_hit=False,
+                stale=False,
+                fetched_at="2026-03-15T00:00:00Z",
+                expires_at=None,
+                refresh_attempted=True,
+            )
+
+    class FakeFiles:
+        def load_for_dashboard(self, **kwargs):  # type: ignore[no-untyped-def]
+            return ProviderLoad(
+                items=[{"id": "f1", "title": "Week notes", "downloadable": True, "first_seen_at": first_seen}],
+                source="html",
+                capability="partial",
+                freshness_mode="live",
+                cache_hit=False,
+                stale=False,
+                fetched_at="2026-03-15T00:00:01Z",
+                expires_at=None,
+                refresh_attempted=True,
+            )
+
+    _write_config(tmp_path)
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        dashboard = DashboardService(paths, FakeAuth(), FakeAssignments(), FakeNotices(), FakeFiles())
+        original_build_bootstrap = dashboard_module.build_session_bootstrap
+        dashboard_module.build_session_bootstrap = lambda *args, **kwargs: object()  # type: ignore[assignment]
+        try:
+            result = dashboard.week(limit=5)
+        finally:
+            dashboard_module.build_session_bootstrap = original_build_bootstrap  # type: ignore[assignment]
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result.data["summary"]["assignment_count"] == 1
+    assert result.data["summary"]["notice_count"] == 1
+    assert result.data["summary"]["material_count"] == 1
+    assert result.data["assignments"][0]["id"] == "a1"
+    assert result.data["notices"][0]["id"] == "n1"
+    assert result.data["materials"][0]["id"] == "f1"
+
+
+def test_course_resolve_returns_matching_aliases(tmp_path: Path, monkeypatch) -> None:
+    class FakeAuth:
+        def run_authenticated(self, *, config, headless, accept_downloads, timeout_seconds, callback):  # type: ignore[no-untyped-def]
+            return callback(object(), "profile")
+
+    _write_config(tmp_path)
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        service = CourseService(paths, FakeAuth())  # type: ignore[arg-type]
+        monkeypatch.setattr(
+            service,
+            "_list_courses_ajax",
+            lambda **kwargs: [
+                Course(
+                    id="178434",
+                    title="Operating Systems",
+                    url="https://klms.kaist.ac.kr/course/view.php?id=178434",
+                    course_code="CS.35000_2026_1",
+                    course_code_base="CS.35000",
+                    term_label="2026 Spring",
+                    title_variants=("Operating Systems", "운영체제"),
+                    professors=("Prof. Kim",),
+                    source="moodle_ajax",
+                    confidence=0.9,
+                    auth_mode="profile",
+                )
+            ],
+        )
+        monkeypatch.setattr(service, "_enrich_course_professors", lambda **kwargs: kwargs["courses"])
+        result = service.resolve(query="운영체제", limit=5)
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result.data["resolution"] == "unique"
+    assert result.data["count"] == 1
+    assert "운영체제" in result.data["items"][0]["matched_aliases"]
+
+
+def test_request_get_returns_json_body(tmp_path: Path) -> None:
+    class FakePage:
+        url = "https://klms.kaist.ac.kr/lib/ajax/service.php"
+
+        def evaluate(self, script: str, payload: dict[str, str]) -> dict[str, object]:
+            assert payload["url"].endswith("/lib/ajax/service.php")
+            return {
+                "ok": True,
+                "status": 200,
+                "url": payload["url"],
+                "contentType": "application/json; charset=utf-8",
+                "text": '{"ok":true,"items":[1,2,3]}',
+            }
+
+        def close(self) -> None:
+            return None
+
+    class FakeContext:
+        def new_page(self) -> FakePage:
+            return FakePage()
+
+    class FakeAuth:
+        def run_authenticated(self, *, config, headless, accept_downloads, timeout_seconds, callback):  # type: ignore[no-untyped-def]
+            return callback(FakeContext(), "storage_state")
+
+    _write_config(tmp_path)
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        service = RequestService(paths, FakeAuth())  # type: ignore[arg-type]
+        result = service.get("/lib/ajax/service.php")
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result.data["http_status"] == 200
+    assert result.data["auth_mode"] == "storage_state"
+    assert result.data["body_json"]["ok"] is True
+    assert result.data["truncated"] is False
 
 
 def test_dashboard_inbox_surfaces_stale_cache_warning_from_provider(tmp_path: Path) -> None:

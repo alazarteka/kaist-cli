@@ -10,6 +10,7 @@ from .files import FileService
 from .notices import NoticeService
 from .paths import resolve_paths
 from .probe import CapabilityProbeService
+from .request import RequestService
 from .sync import SyncService
 from .videos import VideoService
 
@@ -28,6 +29,7 @@ class KlmsFacade:
         capture: EndpointCaptureService,
         courses: CourseService,
         videos: VideoService,
+        request: RequestService,
     ) -> None:
         self._auth = auth
         self._assignments = assignments
@@ -39,6 +41,7 @@ class KlmsFacade:
         self._capture = capture
         self._courses = courses
         self._videos = videos
+        self._request = request
 
     def auth_login(
         self,
@@ -154,6 +157,14 @@ class KlmsFacade:
             max_notice_pages=max_notice_pages,
         )
 
+    def week(
+        self,
+        *,
+        limit: int = 8,
+        max_notice_pages: int = 2,
+    ) -> CommandResult:
+        return self._dashboard.week(limit=limit, max_notice_pages=max_notice_pages)
+
     def inbox(
         self,
         *,
@@ -205,6 +216,21 @@ class KlmsFacade:
 
     def show_course(self, course_id: str) -> CommandResult:
         return self._courses.show(course_id)
+
+    def resolve_course(
+        self,
+        *,
+        query: str,
+        include_all: bool = False,
+        include_past: bool = True,
+        limit: int | None = 10,
+    ) -> CommandResult:
+        return self._courses.resolve(
+            query=query,
+            include_all=include_all,
+            include_past=include_past,
+            limit=limit,
+        )
 
     def list_assignments(
         self,
@@ -327,6 +353,15 @@ class KlmsFacade:
     def show_video(self, video_id_or_url: str, *, course_id_hint: str | None = None) -> CommandResult:
         return self._videos.show(video_id_or_url, course_id_hint=course_id_hint)
 
+    def request_get(
+        self,
+        target: str,
+        *,
+        preview_chars: int = 4000,
+        full_body: bool = False,
+    ) -> CommandResult:
+        return self._request.get(target, preview_chars=preview_chars, full_body=full_body)
+
     def not_implemented(self, command: str) -> CommandResult:
         raise CommandError(
             code="NOT_IMPLEMENTED",
@@ -349,6 +384,7 @@ def build_container() -> KlmsFacade:
     capture = EndpointCaptureService(paths, auth)
     courses = CourseService(paths, auth)
     videos = VideoService(paths, auth)
+    request = RequestService(paths, auth)
     return KlmsFacade(
         auth=auth,
         assignments=assignments,
@@ -360,4 +396,5 @@ def build_container() -> KlmsFacade:
         capture=capture,
         courses=courses,
         videos=videos,
+        request=request,
     )
