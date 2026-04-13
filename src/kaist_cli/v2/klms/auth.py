@@ -1307,8 +1307,13 @@ class AuthService:
             "expires_at": session_expiry_iso(ttl_seconds=EMAIL_OTP_SESSION_TTL_SECONDS),
         }
 
+    def _email_otp_worker_command(self, session_id: str) -> list[str]:
+        if bool(getattr(sys, "frozen", False)):
+            return [sys.executable, "klms", "auth", "_worker-run", session_id]
+        return [sys.executable, "-m", "kaist_cli.main", "klms", "auth", "_worker-run", session_id]
+
     def _spawn_email_otp_worker(self, session_id: str) -> subprocess.Popen[str]:
-        command = [sys.executable, "-m", "kaist_cli.main", "klms", "auth", "_worker-run", session_id]
+        command = self._email_otp_worker_command(session_id)
         self._paths.auth_worker_log_path.parent.mkdir(parents=True, exist_ok=True)
         self._paths.auth_worker_log_path.write_text("", encoding="utf-8")
         log_handle = open(self._paths.auth_worker_log_path, "a", encoding="utf-8")

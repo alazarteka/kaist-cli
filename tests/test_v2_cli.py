@@ -517,6 +517,39 @@ def test_auth_begin_refresh_spawns_worker_and_returns_waiting_session(tmp_path: 
     assert session["worker_pid"] == 43210
 
 
+def test_email_otp_worker_command_uses_module_in_source_mode(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        auth = AuthService(resolve_paths())
+        command = auth._email_otp_worker_command("abc123")
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert command[:3] == [sys.executable, "-m", "kaist_cli.main"]
+    assert command[-4:] == ["klms", "auth", "_worker-run", "abc123"]
+
+
+def test_email_otp_worker_command_uses_frozen_binary_entrypoint(tmp_path: Path, monkeypatch) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        monkeypatch.setattr(auth_module.sys, "executable", "/tmp/kaist", raising=False)
+        monkeypatch.setattr(auth_module.sys, "frozen", True, raising=False)
+        auth = AuthService(resolve_paths())
+        command = auth._email_otp_worker_command("abc123")
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert command == ["/tmp/kaist", "klms", "auth", "_worker-run", "abc123"]
+
+
 def test_auth_cancel_refresh_clears_staged_session(tmp_path: Path) -> None:
     old_home = os.environ.get("KAIST_CLI_HOME")
     os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
