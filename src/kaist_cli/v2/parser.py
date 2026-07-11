@@ -75,6 +75,11 @@ def register_klms_parser(
         description="Show saved auth artifacts, config, and the active auth mode.",
         formatter_class=_HelpFormatter,
     )
+    auth_status.add_argument(
+        "--verify",
+        action="store_true",
+        help="Confirm the saved session against a live KLMS dashboard fetch (opens a headless browser).",
+    )
     _set_defaults(auth_status, schema_name=f"{schema_prefix}.auth.status.v1", command_path="klms auth status", handler=handler)
 
     auth_refresh = auth_sub.add_parser(

@@ -130,6 +130,70 @@ def test_auth_status_json_envelope(tmp_path: Path) -> None:
     assert payload["data"]["configured"] is False
 
 
+def test_auth_status_verify_returns_refreshed_verification_timestamp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    paths = resolve_paths()
+    auth = AuthService(paths)
+
+    def successful_live_check(**kwargs):  # type: ignore[no-untyped-def]
+        auth_module.record_auth_verified(paths)
+        return {
+            "authenticated": True,
+            "auth_mode": "storage_state",
+            "final_url": "https://klms.kaist.ac.kr/my/",
+        }
+
+    monkeypatch.setattr(auth, "run_authenticated_with_state", successful_live_check)
+
+    result = auth.status(verify=True).data
+
+    assert result["live_check"]["authenticated"] is True
+    assert result["last_verified_at"] == auth_module.load_auth_verified(paths)
+    assert result["last_verified_at"] is not None
+
+
+def test_auth_status_verify_reports_transport_failure_as_unknown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    auth = AuthService(resolve_paths())
+
+    def unavailable_live_check(**kwargs):  # type: ignore[no-untyped-def]
+        raise CommandError(
+            code="AUTH_CHECK_UNAVAILABLE",
+            message="DNS lookup failed",
+            retryable=True,
+        )
+
+    monkeypatch.setattr(auth, "run_authenticated_with_state", unavailable_live_check)
+
+    result = auth.status(verify=True).data
+    live_check = result["live_check"]
+
+    assert live_check["authenticated"] is None
+    assert live_check["code"] == "AUTH_CHECK_UNAVAILABLE"
+    assert live_check["detail"] == "DNS lookup failed"
+    assert live_check["retryable"] is True
+    assert isinstance(live_check["checked_at"], str)
+
+
+def test_auth_status_verify_reports_conclusive_expiry_as_unauthenticated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    auth = AuthService(resolve_paths())
+
+    def expired_live_check(**kwargs):  # type: ignore[no-untyped-def]
+        raise CommandError(code="AUTH_EXPIRED", message="Dashboard redirected to login.")
+
+    monkeypatch.setattr(auth, "run_authenticated_with_state", expired_live_check)
+
+    live_check = auth.status(verify=True).data["live_check"]
+
+    assert live_check["authenticated"] is False
+    assert live_check["code"] == "AUTH_EXPIRED"
+    assert live_check["detail"] == "Dashboard redirected to login."
+
+
 def test_auth_status_detects_storage_state_and_cookie_stats(tmp_path: Path) -> None:
     _write_config(tmp_path)
     _write_storage_state(tmp_path)
@@ -139,29 +203,84 @@ def test_auth_status_detects_storage_state_and_cookie_stats(tmp_path: Path) -> N
     payload = json.loads(cp.stdout)
     assert payload["data"]["configured"] is True
     assert payload["data"]["auth_mode"] == "storage_state"
-    assert payload["data"]["refresh_heuristic"]["kind"] == "fixed_window_since_last_refresh"
-    assert payload["data"]["refresh_heuristic"]["window_hours"] == 3.0
+    assert payload["data"]["session_expiry"]["source"] == "cookie_expiry"
+    assert payload["data"]["session_expiry"]["overdue"] is False
+    assert payload["data"]["session_expiry"]["next_expiry_iso"] is not None
+    assert payload["data"]["last_verified_at"] is None
     assert payload["data"]["storage_state_cookie_stats"]["cookie_count"] == 1
     assert payload["data"]["storage_state_cookie_stats"]["next_expiry_iso"] is not None
+    assert payload["data"]["storage_state_cookie_stats"]["auth_cookie_count"] == 1
+    assert payload["data"]["storage_state_cookie_stats"]["auth_next_expiry_iso"] is not None
 
 
-def test_auth_status_uses_latest_auth_artifact_for_refresh_heuristic(tmp_path: Path) -> None:
+def test_auth_status_session_expiry_unknown_without_cookie_expiry(tmp_path: Path) -> None:
+    # A bare MoodleSession session cookie carries no absolute expiry; status must say
+    # so honestly rather than inventing a fixed refresh window.
     _write_config(tmp_path)
-    storage_state = _write_storage_state(tmp_path)
-    profile_file = tmp_path / "kaist-home" / "private" / "klms" / "profile" / "Cookies"
-    profile_file.parent.mkdir(parents=True, exist_ok=True)
-    profile_file.write_text("cookie-db", encoding="utf-8")
-    old_storage = datetime(2026, 4, 14, 0, 0, 0, tzinfo=timezone.utc).timestamp()
-    newer_profile = datetime(2026, 4, 14, 1, 0, 0, tzinfo=timezone.utc).timestamp()
-    os.utime(storage_state, (old_storage, old_storage))
-    os.utime(profile_file, (newer_profile, newer_profile))
+    storage_state_path = tmp_path / "kaist-home" / "private" / "klms" / "storage_state.json"
+    storage_state_path.parent.mkdir(parents=True, exist_ok=True)
+    storage_state_path.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": "MoodleSession",
+                        "value": "session",
+                        "domain": "klms.kaist.ac.kr",
+                        "path": "/",
+                        "expires": -1,
+                    }
+                ],
+                "origins": [],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     cp = run_v2(tmp_path, "--json", "klms", "auth", "status")
     assert cp.returncode == 0, cp.stderr
     payload = json.loads(cp.stdout)
-    heuristic = payload["data"]["refresh_heuristic"]
-    assert heuristic["last_refresh_at"] == "2026-04-14T01:00:00Z"
-    assert heuristic["refresh_due_at"] == "2026-04-14T04:00:00Z"
+    assert payload["data"]["session_expiry"]["source"] == "unknown"
+    assert "refresh_heuristic" not in payload["data"]
+    assert payload["data"]["last_verified_at"] is None
+
+
+def test_auth_status_ignores_non_auth_cookie_expiry(tmp_path: Path) -> None:
+    _write_config(tmp_path)
+    storage_state_path = tmp_path / "kaist-home" / "private" / "klms" / "storage_state.json"
+    storage_state_path.parent.mkdir(parents=True, exist_ok=True)
+    storage_state_path.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {
+                        "name": "MoodleSession",
+                        "value": "session",
+                        "domain": "klms.kaist.ac.kr",
+                        "path": "/",
+                        "expires": -1,
+                    },
+                    {
+                        "name": "_ga",
+                        "value": "analytics",
+                        "domain": "klms.kaist.ac.kr",
+                        "path": "/",
+                        "expires": 1,
+                    },
+                ],
+                "origins": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cp = run_v2(tmp_path, "--json", "klms", "auth", "status")
+    assert cp.returncode == 0, cp.stderr
+    payload = json.loads(cp.stdout)
+
+    assert payload["data"]["storage_state_cookie_stats"]["next_expiry_iso"] is not None
+    assert payload["data"]["storage_state_cookie_stats"]["auth_next_expiry_iso"] is None
+    assert payload["data"]["session_expiry"]["source"] == "unknown"
 
 
 def test_auth_status_includes_saved_auth_username(tmp_path: Path) -> None:
@@ -985,8 +1104,147 @@ def test_run_authenticated_configures_playwright_env_before_launch(tmp_path: Pat
         else:
             os.environ["KAIST_CLI_HOME"] = old_home
 
-    assert exc_info.value.code == "AUTH_EXPIRED"
+    assert exc_info.value.code == "AUTH_CHECK_UNAVAILABLE"
     assert calls[:2] == ["configure", "sync_playwright"]
+
+
+def test_run_authenticated_reports_dashboard_check_failure_as_unavailable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    _write_storage_state(tmp_path)
+    paths = resolve_paths()
+    auth = AuthService(paths)
+
+    class FakePlaywrightContext:
+        def __enter__(self) -> object:
+            return object()
+
+        def __exit__(self, exc_type, exc, tb) -> bool:  # type: ignore[no-untyped-def]
+            return False
+
+    class FakeContext:
+        def close(self) -> None:
+            return None
+
+    class FakeBrowser:
+        def new_context(self, **kwargs):  # type: ignore[no-untyped-def]
+            return FakeContext()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(auth_module, "configure_playwright_env", lambda paths: paths.playwright_browsers_dir)
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: FakePlaywrightContext())
+    monkeypatch.setattr(auth_module, "_launch_chromium_browser_sync", lambda *args, **kwargs: FakeBrowser())
+    monkeypatch.setattr(
+        auth,
+        "_context_dashboard_state",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("dashboard timeout")),
+    )
+
+    with pytest.raises(CommandError) as exc_info:
+        auth.run_authenticated(
+            config=load_config(paths),
+            headless=True,
+            accept_downloads=False,
+            timeout_seconds=1.0,
+            callback=lambda context, auth_mode: None,
+        )
+
+    assert exc_info.value.code == "AUTH_CHECK_UNAVAILABLE"
+    assert "check_error=dashboard timeout" in exc_info.value.message
+
+
+def test_reusable_profile_validation_records_auth_verification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    paths = resolve_paths()
+    (paths.profile_dir / "Cookies").parent.mkdir(parents=True, exist_ok=True)
+    (paths.profile_dir / "Cookies").write_text("session", encoding="utf-8")
+    auth = AuthService(paths)
+
+    class FakeContext:
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(auth_module, "_launch_chromium_persistent_context_sync", lambda *args, **kwargs: FakeContext())
+    monkeypatch.setattr(
+        auth,
+        "_context_dashboard_state",
+        lambda *args, **kwargs: {"authenticated": True, "final_url": "https://klms.kaist.ac.kr/my/"},
+    )
+
+    auth._assert_saved_auth_session_reusable_with_playwright(
+        playwright=object(),
+        config=load_config(paths),
+        timeout_seconds=1.0,
+    )
+
+    assert auth_module.load_auth_verified(paths) is not None
+
+
+def test_reusable_storage_state_validation_records_auth_verification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    _write_storage_state(tmp_path)
+    paths = resolve_paths()
+    auth = AuthService(paths)
+
+    class FakeContext:
+        def close(self) -> None:
+            return None
+
+    class FakeBrowser:
+        def new_context(self, **kwargs):  # type: ignore[no-untyped-def]
+            return FakeContext()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(auth_module, "_launch_chromium_browser_sync", lambda *args, **kwargs: FakeBrowser())
+    monkeypatch.setattr(
+        auth,
+        "_context_dashboard_state",
+        lambda *args, **kwargs: {"authenticated": True, "final_url": "https://klms.kaist.ac.kr/my/"},
+    )
+
+    auth._assert_saved_auth_session_reusable_with_playwright(
+        playwright=object(),
+        config=load_config(paths),
+        timeout_seconds=1.0,
+    )
+
+    assert auth_module.load_auth_verified(paths) is not None
+
+
+def test_email_otp_storage_state_validation_records_auth_verification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    _write_storage_state(tmp_path)
+    paths = resolve_paths()
+    auth = AuthService(paths)
+
+    class FakeContext:
+        def close(self) -> None:
+            return None
+
+    class FakeBrowser:
+        def new_context(self, **kwargs):  # type: ignore[no-untyped-def]
+            return FakeContext()
+
+    monkeypatch.setattr(
+        auth,
+        "_context_dashboard_state",
+        lambda *args, **kwargs: {"authenticated": True, "final_url": "https://klms.kaist.ac.kr/my/"},
+    )
+
+    auth._assert_storage_state_reusable(
+        browser=FakeBrowser(),
+        config=load_config(paths),
+        timeout_seconds=1.0,
+    )
+
+    assert auth_module.load_auth_verified(paths) is not None
 
 
 def test_run_authenticated_raises_concurrent_access_when_profile_lock_is_held(tmp_path: Path) -> None:

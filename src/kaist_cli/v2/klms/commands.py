@@ -33,7 +33,7 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
     if args.group == "auth" and args.action == "clear-email-otp-secret":
         return facade.auth_clear_email_otp_secret(username=args.username)
     if args.group == "auth" and args.action == "status":
-        return facade.auth_status()
+        return facade.auth_status(verify=getattr(args, "verify", False))
     if args.group == "auth" and args.action == "refresh":
         return facade.auth_refresh(
             base_url=args.base_url,

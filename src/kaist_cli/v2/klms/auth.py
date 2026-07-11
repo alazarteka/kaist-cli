@@ -62,7 +62,7 @@ EMAIL_OTP_SESSION_TTL_SECONDS = 10 * 60
 EMAIL_OTP_WORKER_READY_TIMEOUT_SECONDS = 45.0
 EMAIL_OTP_WORKER_POLL_SECONDS = 0.25
 AUTH_SESSION_STARTING_GRACE_SECONDS = 30.0
-AUTH_STATUS_REFRESH_WINDOW_HOURS = 3.0
+AUTH_SESSION_COOKIE_NAME = "moodlesession"
 
 
 def epoch_to_iso_utc(epoch: float) -> str:
@@ -650,54 +650,74 @@ def storage_state_cookie_stats(paths: KlmsPaths) -> dict[str, Any] | None:
 
     cookies = raw.get("cookies") or []
     now_epoch = time.time()
-    exp_epochs = [
-        float(cookie.get("expires"))
-        for cookie in cookies
-        if isinstance(cookie, dict)
-        and isinstance(cookie.get("expires"), (int, float))
-        and float(cookie.get("expires")) > 0
+    valid_cookies = [cookie for cookie in cookies if isinstance(cookie, dict)]
+    auth_cookies = [
+        cookie
+        for cookie in valid_cookies
+        if str(cookie.get("name") or "").strip().lower() == AUTH_SESSION_COOKIE_NAME
     ]
-    if not exp_epochs:
+
+    def expiry_epochs(items: list[dict[str, Any]]) -> list[float]:
+        return [
+            float(cookie["expires"])
+            for cookie in items
+            if isinstance(cookie.get("expires"), (int, float)) and float(cookie["expires"]) > 0
+        ]
+
+    exp_epochs = expiry_epochs(valid_cookies)
+    auth_exp_epochs = expiry_epochs(auth_cookies)
+
+    def expiry_payload(values: list[float]) -> dict[str, Any]:
+        if not values:
+            return {
+                "expiring_cookie_count": 0,
+                "next_expiry_iso": None,
+                "next_expiry_in_hours": None,
+                "latest_expiry_iso": None,
+            }
+        next_expiry = min(values)
+        latest_expiry = max(values)
         return {
-            "cookie_count": len(cookies),
-            "expiring_cookie_count": 0,
-            "next_expiry_iso": None,
-            "next_expiry_in_hours": None,
-            "latest_expiry_iso": None,
+            "expiring_cookie_count": len(values),
+            "next_expiry_iso": epoch_to_iso_utc(next_expiry),
+            "next_expiry_in_hours": round((next_expiry - now_epoch) / 3600, 2),
+            "latest_expiry_iso": epoch_to_iso_utc(latest_expiry),
         }
 
-    next_expiry = min(exp_epochs)
-    latest_expiry = max(exp_epochs)
     return {
         "cookie_count": len(cookies),
-        "expiring_cookie_count": len(exp_epochs),
-        "next_expiry_iso": epoch_to_iso_utc(next_expiry),
-        "next_expiry_in_hours": round((next_expiry - now_epoch) / 3600, 2),
-        "latest_expiry_iso": epoch_to_iso_utc(latest_expiry),
+        **expiry_payload(exp_epochs),
+        "auth_cookie_count": len(auth_cookies),
+        **{
+            f"auth_{key}": value
+            for key, value in expiry_payload(auth_exp_epochs).items()
+        },
     }
 
 
-def _latest_auth_artifact_mtime(paths: KlmsPaths) -> float | None:
-    mtimes: list[float] = []
-    for candidate in (paths.storage_state_path,):
-        try:
-            if candidate.exists():
-                mtimes.append(candidate.stat().st_mtime)
-        except OSError:
-            continue
+def record_auth_verified(paths: KlmsPaths) -> None:
+    """Persist the moment a live dashboard check last confirmed an authenticated session.
+
+    This is the honest "we know you were logged in at X" signal — written only when
+    ``_context_dashboard_state`` actually reached an authenticated dashboard, never on
+    mere file activity.
+    """
+    ensure_private_dirs(paths)
     try:
-        if paths.profile_dir.exists():
-            mtimes.append(paths.profile_dir.stat().st_mtime)
-            for child in paths.profile_dir.rglob("*"):
-                try:
-                    mtimes.append(child.stat().st_mtime)
-                except OSError:
-                    continue
+        paths.auth_verified_path.write_text(
+            json.dumps({"verified_at": utc_now_iso()}), encoding="utf-8"
+        )
     except OSError:
         pass
-    if not mtimes:
+
+
+def load_auth_verified(paths: KlmsPaths) -> str | None:
+    try:
+        raw = json.loads(paths.auth_verified_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return None
-    return max(mtimes)
+    value = str(raw.get("verified_at") or "").strip() if isinstance(raw, dict) else ""
+    return value or None
 
 
 def _tail_text(text: str, *, max_lines: int = 20) -> str:
@@ -1034,20 +1054,32 @@ class AuthService:
             return ""
         return _tail_text(text, max_lines=max_lines)
 
-    def _refresh_heuristic(self) -> dict[str, Any] | None:
-        last_refresh_epoch = _latest_auth_artifact_mtime(self._paths)
-        if last_refresh_epoch is None:
-            return None
-        refresh_due_epoch = last_refresh_epoch + (AUTH_STATUS_REFRESH_WINDOW_HOURS * 3600)
-        now_epoch = time.time()
-        remaining_hours = round((refresh_due_epoch - now_epoch) / 3600, 2)
+    @staticmethod
+    def _session_expiry(cookie_stats: dict[str, Any] | None) -> dict[str, Any]:
+        """Report when the saved session expires, grounded in real cookie data.
+
+        Uses only the persisted ``MoodleSession`` cookie. When that auth cookie has
+        no absolute expiry, we say so honestly rather than using an unrelated
+        persistent cookie as a proxy; the live dashboard check remains the real gate.
+        """
+        if not isinstance(cookie_stats, dict) or "read_error" in cookie_stats:
+            return {
+                "source": "unknown",
+                "note": "No readable session cookies; session validity is confirmed at use.",
+            }
+        next_iso = cookie_stats.get("auth_next_expiry_iso")
+        hours = cookie_stats.get("auth_next_expiry_in_hours")
+        if next_iso is None or hours is None:
+            return {
+                "source": "unknown",
+                "note": "The KLMS session cookie carries no expiry; session validity is confirmed at use.",
+            }
         return {
-            "kind": "fixed_window_since_last_refresh",
-            "window_hours": AUTH_STATUS_REFRESH_WINDOW_HOURS,
-            "last_refresh_at": epoch_to_iso_utc(last_refresh_epoch),
-            "refresh_due_at": epoch_to_iso_utc(refresh_due_epoch),
-            "refresh_overdue": refresh_due_epoch <= now_epoch,
-            "hours_until_refresh": remaining_hours,
+            "source": "cookie_expiry",
+            "next_expiry_iso": next_iso,
+            "hours_until_expiry": hours,
+            "latest_expiry_iso": cookie_stats.get("auth_latest_expiry_iso"),
+            "overdue": hours <= 0,
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -1055,6 +1087,7 @@ class AuthService:
         config = maybe_load_config(self._paths)
         mode = active_auth_mode(self._paths)
         staged_auth_session = self._session_snapshot()
+        cookie_stats = storage_state_cookie_stats(self._paths)
         return {
             "configured": config is not None,
             "config_path": str(self._paths.config_path),
@@ -1066,8 +1099,9 @@ class AuthService:
                 "profile": has_profile_session(self._paths),
                 "storage_state": has_storage_state_session(self._paths),
             },
-            "refresh_heuristic": self._refresh_heuristic(),
-            "storage_state_cookie_stats": storage_state_cookie_stats(self._paths),
+            "session_expiry": self._session_expiry(cookie_stats),
+            "last_verified_at": load_auth_verified(self._paths),
+            "storage_state_cookie_stats": cookie_stats,
             "staged_auth_session": staged_auth_session,
             "config": self._config_payload(config),
             "validation_mode": "offline-only",
@@ -1106,8 +1140,66 @@ class AuthService:
             }
         return snapshot
 
-    def status(self) -> CommandResult:
-        return CommandResult(data=self.snapshot(), source="bootstrap", capability="partial")
+    def status(self, *, verify: bool = False) -> CommandResult:
+        snapshot = self.snapshot()
+        if verify:
+            live_check = self._live_check()
+            snapshot["live_check"] = live_check
+            if live_check.get("authenticated") is True:
+                snapshot["last_verified_at"] = load_auth_verified(self._paths)
+        return CommandResult(data=snapshot, source="bootstrap", capability="partial")
+
+    def _live_check(self, *, timeout_seconds: float = 20.0) -> dict[str, Any]:
+        """Confirm the saved session against a live KLMS dashboard fetch.
+
+        Returns an authenticated, unauthenticated, or unknown result rather than
+        raising, so ``auth status --verify`` always renders. A successful check also
+        refreshes ``last_verified_at`` via ``run_authenticated_with_state``.
+        """
+        config = maybe_load_config(self._paths)
+        if config is None:
+            return {
+                "authenticated": None,
+                "note": "KLMS is not configured; run `kaist klms auth login` first.",
+                "checked_at": utc_now_iso(),
+            }
+        try:
+            result = self.run_authenticated_with_state(
+                config=config,
+                headless=True,
+                accept_downloads=False,
+                timeout_seconds=timeout_seconds,
+                callback=lambda context, auth_mode, state: {
+                    "authenticated": True,
+                    "auth_mode": auth_mode,
+                    "final_url": state.get("final_url"),
+                },
+            )
+        except CommandError as exc:
+            if exc.code in {"AUTH_EXPIRED", "AUTH_MISSING"}:
+                return {
+                    "authenticated": False,
+                    "code": exc.code,
+                    "detail": exc.message,
+                    "checked_at": utc_now_iso(),
+                }
+            return {
+                "authenticated": None,
+                "code": exc.code,
+                "detail": exc.message,
+                "retryable": exc.retryable,
+                "checked_at": utc_now_iso(),
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "authenticated": None,
+                "code": "AUTH_CHECK_UNAVAILABLE",
+                "detail": f"{type(exc).__name__}: {exc}",
+                "retryable": True,
+                "checked_at": utc_now_iso(),
+            }
+        result["checked_at"] = utc_now_iso()
+        return result
 
     def install_browser(self, *, force: bool = False) -> CommandResult:
         return CommandResult(data=install_browser(self._paths, force=force), source="bootstrap", capability="partial")
@@ -1744,6 +1836,7 @@ class AuthService:
                 state = self._context_dashboard_state(profile_context, config=config, timeout_ms=timeout_ms)
                 attempts.append({"auth_mode": "profile", **state})
                 if state["authenticated"]:
+                    record_auth_verified(self._paths)
                     return
             finally:
                 profile_context.close()
@@ -1759,6 +1852,7 @@ class AuthService:
                     state = self._context_dashboard_state(storage_context, config=config, timeout_ms=timeout_ms)
                     attempts.append({"auth_mode": "storage_state", **state})
                     if state["authenticated"]:
+                        record_auth_verified(self._paths)
                         return
                 finally:
                     storage_context.close()
@@ -1805,6 +1899,7 @@ class AuthService:
         finally:
             storage_context.close()
         if state["authenticated"]:
+            record_auth_verified(self._paths)
             return
         raise CommandError(
             code="AUTH_FAILED",
@@ -2635,8 +2730,12 @@ class AuthService:
                     else:
                         try:
                             state = self._context_dashboard_state(profile_context, config=config, timeout_ms=timeout_ms)
+                        except Exception as exc:  # noqa: BLE001
+                            attempts.append({"auth_mode": "profile", "check_error": str(exc)})
+                        else:
                             attempts.append({"auth_mode": "profile", **state})
                             if state["authenticated"]:
+                                record_auth_verified(self._paths)
                                 if include_dashboard_state:
                                     return callback(profile_context, "profile", state)
                                 return callback(profile_context, "profile")
@@ -2655,8 +2754,12 @@ class AuthService:
                     else:
                         try:
                             state = self._context_dashboard_state(storage_context, config=config, timeout_ms=timeout_ms)
+                        except Exception as exc:  # noqa: BLE001
+                            attempts.append({"auth_mode": "storage_state", "check_error": str(exc)})
+                        else:
                             attempts.append({"auth_mode": "storage_state", **state})
                             if state["authenticated"]:
+                                record_auth_verified(self._paths)
                                 if include_dashboard_state:
                                     return callback(storage_context, "storage_state", state)
                                 return callback(storage_context, "storage_state")
@@ -2668,11 +2771,21 @@ class AuthService:
             (
                 f"{attempt['auth_mode']}: launch_error={attempt.get('launch_error')}"
                 if attempt.get("launch_error")
+                else f"{attempt['auth_mode']}: check_error={attempt.get('check_error')}"
+                if attempt.get("check_error")
                 else f"{attempt['auth_mode']}: final_url={attempt.get('final_url')}"
             )
             for attempt in attempts
         ]
         detail = "; ".join(attempt_summaries) if attempt_summaries else "no attempts"
+        if attempts and all("launch_error" in attempt or "check_error" in attempt for attempt in attempts):
+            raise CommandError(
+                code="AUTH_CHECK_UNAVAILABLE",
+                message=f"Could not complete a live KLMS auth check ({detail}).",
+                hint="Retry the command after checking network access and browser availability.",
+                exit_code=10,
+                retryable=True,
+            )
         raise CommandError(
             code="AUTH_EXPIRED",
             message=f"Saved KLMS auth did not reach an authenticated dashboard session ({detail}).",

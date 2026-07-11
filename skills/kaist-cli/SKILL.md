@@ -90,9 +90,12 @@ kaist klms auth store-email-otp-secret --username KAIST_ID
 kaist klms auth refresh
 
 # 4. Diagnostics
-kaist klms auth status
+kaist klms auth status           # offline: session_expiry (from real cookie data), last_verified_at
+kaist klms auth status --verify  # also does a live dashboard fetch -> live_check.authenticated
 kaist klms auth doctor
 ```
+
+`auth status` reports `session_expiry` from the saved cookies' real expiry (`source: "cookie_expiry"`) or, when the cookies carry no expiry, `source: "unknown"` — it does not guess a fixed window, so an "unknown" result is not a problem. `last_verified_at` is the last time a live dashboard fetch actually confirmed the session. To know for sure whether the saved session still works, use `--verify` and read `live_check.authenticated` (`true`/`false`; `null` when KLMS is not configured).
 
 The manual browser login (no `--username`) requires an interactive terminal with a display and is not suitable for headless or non-interactive shells. The Easy Login flow (`--username`) runs headless and works in non-interactive shells — it just needs the user to approve the push notification in the KAIST auth app. Once logged in, `auth refresh` handles renewal automatically when a username was saved.
 

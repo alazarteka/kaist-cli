@@ -91,8 +91,8 @@ class KlmsFacade:
     def auth_clear_email_otp_secret(self, *, username: str | None = None) -> CommandResult:
         return self._auth.clear_email_otp_secret(username=username)
 
-    def auth_status(self) -> CommandResult:
-        return self._auth.status()
+    def auth_status(self, *, verify: bool = False) -> CommandResult:
+        return self._auth.status(verify=verify)
 
     def auth_refresh(
         self,

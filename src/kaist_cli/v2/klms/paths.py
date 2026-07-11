@@ -14,6 +14,7 @@ class KlmsPaths:
     profile_dir: Path
     config_path: Path
     storage_state_path: Path
+    auth_verified_path: Path
     snapshot_path: Path
     cache_path: Path
     auth_session_path: Path
@@ -38,6 +39,7 @@ def resolve_paths() -> KlmsPaths:
         profile_dir=private_root / "profile",
         config_path=private_root / "config.toml",
         storage_state_path=private_root / "storage_state.json",
+        auth_verified_path=private_root / "auth_verified.json",
         snapshot_path=private_root / "snapshot.json",
         cache_path=private_root / "cache.json",
         auth_session_path=private_root / "auth_session.json",
