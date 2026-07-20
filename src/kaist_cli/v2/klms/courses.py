@@ -5,7 +5,7 @@ import re
 from collections.abc import Iterable
 from typing import Any, TypeAlias
 
-from bs4 import BeautifulSoup  # type: ignore[import-untyped]
+from bs4 import BeautifulSoup, Tag  # type: ignore[import-untyped]
 
 from ..contracts import CommandError, CommandResult
 from .auth import AuthService, extract_sesskey, looks_logged_out_html, looks_login_url
@@ -15,6 +15,7 @@ from .models import Course
 from .paths import KlmsPaths
 from .session import KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
 from .validate import looks_klms_error_html
+from .browser_types import BrowserContextLike
 
 
 SEMESTER_LABELS = {
@@ -420,7 +421,7 @@ def _extract_current_term_from_dashboard(html: str) -> str | None:
     if not year_select or not sem_select:
         return None
 
-    def selected_text(select: Any) -> str | None:
+    def selected_text(select: Tag) -> str | None:
         option = select.find("option", selected=True) or select.find("option")
         if option is None:
             return None
@@ -645,7 +646,7 @@ class CourseService:
     def _list_courses_ajax(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         include_all: bool,
@@ -713,7 +714,7 @@ class CourseService:
     def _enrich_course_professors(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         courses: list[Course],
@@ -762,7 +763,7 @@ class CourseService:
     def _list_courses_html(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         include_all: bool,
@@ -814,7 +815,7 @@ class CourseService:
     ) -> CommandResult:
         config = load_config(self._paths)
 
-        def callback(context: Any, auth_mode: str) -> CommandResult:
+        def callback(context: BrowserContextLike, auth_mode: str) -> CommandResult:
             ajax_courses = self._list_courses_ajax(
                 context=context,
                 config=config,
@@ -872,7 +873,7 @@ class CourseService:
         if not target_id:
             raise CommandError(code="CONFIG_INVALID", message="Course ID is required.", exit_code=40)
 
-        def callback(context: Any, auth_mode: str) -> CommandResult:
+        def callback(context: BrowserContextLike, auth_mode: str) -> CommandResult:
             page = context.new_page()
             try:
                 page.goto(abs_url(config.base_url, f"/course/view.php?id={target_id}&section=0"), wait_until="domcontentloaded", timeout=30_000)
@@ -942,7 +943,7 @@ class CourseService:
         config = load_config(self._paths)
         limit = None if limit is None else max(1, min(int(limit), 50))
 
-        def callback(context: Any, auth_mode: str) -> CommandResult:
+        def callback(context: BrowserContextLike, auth_mode: str) -> CommandResult:
             courses = self._list_courses_ajax(
                 context=context,
                 config=config,

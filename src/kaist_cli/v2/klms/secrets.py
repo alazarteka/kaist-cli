@@ -3,10 +3,19 @@ from __future__ import annotations
 import subprocess
 import sys
 from dataclasses import dataclass
+from typing import Protocol
 
 from ..contracts import CommandError
 
 EMAIL_OTP_KEYCHAIN_SERVICE = "kaist-cli.klms.email-otp"
+
+
+class SecretStore(Protocol):
+    def store_email_otp_password(self, *, username: str, password: str) -> None: ...
+
+    def load_email_otp_password(self, *, username: str) -> str: ...
+
+    def delete_email_otp_password(self, *, username: str) -> None: ...
 
 
 @dataclass(frozen=True)

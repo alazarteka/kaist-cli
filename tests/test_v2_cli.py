@@ -48,6 +48,25 @@ from kaist_cli.v2.klms.session import KlmsDownloadFallback, KlmsHttpResponse, Kl
 from kaist_cli.v2.klms.videos import VideoService, _extract_video_items_from_html, _parse_video_detail_from_html, _parse_video_viewer_from_html
 
 
+class _FakeSecretStore:
+    """Minimal SecretStore stand-in for AuthService email-OTP tests."""
+
+    def __init__(self) -> None:
+        self.saved: tuple[str, str] | None = None
+        self.deleted: str | None = None
+
+    def store_email_otp_password(self, *, username: str, password: str) -> None:
+        self.saved = (username, password)
+
+    def load_email_otp_password(self, *, username: str) -> str:
+        if self.saved and self.saved[0] == username:
+            return self.saved[1]
+        raise KeyError(username)
+
+    def delete_email_otp_password(self, *, username: str) -> None:
+        self.deleted = username
+
+
 FIXTURES = ROOT / "tests" / "fixtures"
 
 
@@ -449,15 +468,8 @@ def test_auth_setup_email_otp_persists_config_and_secret(tmp_path: Path, monkeyp
     try:
         paths = resolve_paths()
 
-        class FakeSecretStore:
-            def __init__(self) -> None:
-                self.saved: tuple[str, str] | None = None
-
-            def store_email_otp_password(self, *, username: str, password: str) -> None:
-                self.saved = (username, password)
-
-        secret_store = FakeSecretStore()
-        auth = AuthService(paths, secret_store=secret_store)  # type: ignore[arg-type]
+        secret_store = _FakeSecretStore()
+        auth = AuthService(paths, secret_store=secret_store)
         result = auth.setup_email_otp(
             base_url="https://klms.kaist.ac.kr",
             username="student123",
@@ -487,15 +499,8 @@ def test_auth_setup_email_otp_is_config_only_by_default(tmp_path: Path) -> None:
     try:
         paths = resolve_paths()
 
-        class FakeSecretStore:
-            def __init__(self) -> None:
-                self.saved: tuple[str, str] | None = None
-
-            def store_email_otp_password(self, *, username: str, password: str) -> None:
-                self.saved = (username, password)
-
-        secret_store = FakeSecretStore()
-        auth = AuthService(paths, secret_store=secret_store)  # type: ignore[arg-type]
+        secret_store = _FakeSecretStore()
+        auth = AuthService(paths, secret_store=secret_store)
         result = auth.setup_email_otp(
             base_url="https://klms.kaist.ac.kr",
             username="student123",
@@ -524,15 +529,8 @@ def test_auth_store_email_otp_secret_uses_saved_username(tmp_path: Path) -> None
     try:
         paths = resolve_paths()
 
-        class FakeSecretStore:
-            def __init__(self) -> None:
-                self.saved: tuple[str, str] | None = None
-
-            def store_email_otp_password(self, *, username: str, password: str) -> None:
-                self.saved = (username, password)
-
-        secret_store = FakeSecretStore()
-        auth = AuthService(paths, secret_store=secret_store)  # type: ignore[arg-type]
+        secret_store = _FakeSecretStore()
+        auth = AuthService(paths, secret_store=secret_store)
         result = auth.store_email_otp_secret(password_env="KAIST_PASSWORD_FOR_TEST")
     finally:
         os.environ.pop("KAIST_PASSWORD_FOR_TEST", None)
@@ -553,15 +551,8 @@ def test_auth_clear_email_otp_secret_uses_saved_username(tmp_path: Path) -> None
     try:
         paths = resolve_paths()
 
-        class FakeSecretStore:
-            def __init__(self) -> None:
-                self.deleted: str | None = None
-
-            def delete_email_otp_password(self, *, username: str) -> None:
-                self.deleted = username
-
-        secret_store = FakeSecretStore()
-        auth = AuthService(paths, secret_store=secret_store)  # type: ignore[arg-type]
+        secret_store = _FakeSecretStore()
+        auth = AuthService(paths, secret_store=secret_store)
         result = auth.clear_email_otp_secret()
     finally:
         if old_home is None:

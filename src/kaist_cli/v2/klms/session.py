@@ -15,6 +15,7 @@ from .auth import extract_sesskey, looks_logged_out_html, looks_login_url
 from .config import KlmsConfig, abs_url
 from .deadline import RefreshDeadline
 from .paths import KlmsPaths
+from .browser_types import BrowserContextLike
 
 DEFAULT_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -89,7 +90,7 @@ def _cookie_from_state_row(row: dict[str, Any]) -> http.cookiejar.Cookie | None:
 
 
 class KlmsHttpSession:
-    def __init__(self, context: Any, *, base_url: str) -> None:
+    def __init__(self, context: BrowserContextLike, *, base_url: str) -> None:
         self._base_url = base_url.rstrip("/")
         state = context.storage_state()
         cookies = state.get("cookies") if isinstance(state, dict) else []
@@ -114,7 +115,7 @@ class KlmsHttpSession:
         self,
         url_or_path: str,
         *,
-        context: Any | None = None,
+        context: BrowserContextLike | None = None,
         timeout_seconds: float = 20.0,
     ) -> KlmsHttpResponse:
         target_url = abs_url(self._base_url, url_or_path)
@@ -225,7 +226,7 @@ class KlmsHttpSession:
             )
 
     @staticmethod
-    def _browser_fallback(context: Any, target_url: str, *, timeout_seconds: float) -> KlmsHttpResponse:
+    def _browser_fallback(context: BrowserContextLike, target_url: str, *, timeout_seconds: float) -> KlmsHttpResponse:
         page = context.new_page()
         try:
             page.goto(target_url, wait_until="domcontentloaded", timeout=max(1_000, int(timeout_seconds * 1000)))
@@ -272,7 +273,7 @@ def fetch_html_batch(
 def build_session_bootstrap(
     paths: KlmsPaths,
     *,
-    context: Any,
+    context: BrowserContextLike,
     config: KlmsConfig,
     auth_mode: str,
     timeout_seconds: float = 20.0,

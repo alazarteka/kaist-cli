@@ -37,6 +37,7 @@ from .auth_sso import (
 )
 from .config import KlmsConfig, maybe_load_config, save_config
 from .paths import configure_playwright_env
+from .browser_types import BrowserContextLike, PageLike
 
 EMAIL_OTP_DEFAULT_WAIT_SECONDS = 180.0
 
@@ -500,8 +501,8 @@ class AuthOtpMixin:
     def _wait_for_email_otp_challenge(
         self,
         *,
-        page: Any,
-        context: Any,
+        page: PageLike,
+        context: BrowserContextLike,
         config: KlmsConfig,
         timeout_seconds: float,
     ) -> dict[str, Any]:
@@ -536,8 +537,8 @@ class AuthOtpMixin:
     def _wait_for_email_otp_completion(
         self,
         *,
-        page: Any,
-        context: Any,
+        page: PageLike,
+        context: BrowserContextLike,
         config: KlmsConfig,
         wait_seconds: float,
     ) -> None:
@@ -569,7 +570,7 @@ class AuthOtpMixin:
         )
 
 
-    def _validate_email_otp_request(self, *, context: Any, otp_code: str) -> str:
+    def _validate_email_otp_request(self, *, context: BrowserContextLike, otp_code: str) -> str:
         response = context.request.post(
             "https://sso.kaist.ac.kr/auth/kaist/user/login/second/ajaxValidCrtfcNo",
             form={"crtfc_no": otp_code},
@@ -631,8 +632,8 @@ class AuthOtpMixin:
     def _complete_email_otp_device_registration(
         self,
         *,
-        page: Any,
-        context: Any,
+        page: PageLike,
+        context: BrowserContextLike,
         config: KlmsConfig,
         wait_seconds: float,
     ) -> None:
@@ -672,7 +673,7 @@ class AuthOtpMixin:
     def _wait_for_email_otp_delivery(
         self,
         *,
-        page: Any,
+        page: PageLike,
         timeout_seconds: float,
     ) -> None:
         deadline = time.monotonic() + max(1.0, timeout_seconds)
@@ -754,7 +755,7 @@ class AuthOtpMixin:
                     server.bind(("127.0.0.1", 0))
                     server.listen(1)
                     server.settimeout(0.5)
-                    context: Any | None = None
+                    context: BrowserContextLike | None = None
                     try:
                         mark_stage(worker_pid=os.getpid())
                         context = browser.new_context(accept_downloads=False)

@@ -7,6 +7,7 @@ from ..contracts import CommandError, CommandResult
 from .auth import AuthService, looks_logged_out_html, looks_login_url
 from .config import abs_url, load_config
 from .paths import KlmsPaths
+from .browser_types import BrowserContextLike
 
 
 class RequestService:
@@ -46,7 +47,7 @@ class RequestService:
             target_url = abs_url(base_url, requested if requested.startswith("/") else f"/{requested}")
         preview_chars = max(200, min(int(preview_chars), 50_000))
 
-        def callback(context: Any, auth_mode: str) -> CommandResult:
+        def callback(context: BrowserContextLike, auth_mode: str) -> CommandResult:
             page = context.new_page()
             try:
                 result = page.evaluate(

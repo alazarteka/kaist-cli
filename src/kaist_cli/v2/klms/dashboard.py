@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, tzinfo
 from typing import Any, Callable
 
 from ..contracts import CommandError, CommandResult
 from .auth import AuthService
 from .assignments import AssignmentService
-from .config import load_config
+from .browser_types import BrowserContextLike
+from .config import KlmsConfig, load_config
 from .deadline import RefreshDeadline
 from .files import FileService
 from .notices import NoticeService
 from .paths import KlmsPaths
 from .provider_state import ProviderLoad
-from .session import build_session_bootstrap
+from .session import KlmsSessionBootstrap, build_session_bootstrap
 
 WEEK_COMMAND_SOFT_SECONDS = 24.0
 WEEK_COMMAND_HARD_SECONDS = 30.0
@@ -29,7 +30,7 @@ def _local_now() -> datetime:
     return datetime.now().astimezone()
 
 
-def _parse_iso_datetime(value: str | None, *, local_tz: Any) -> datetime | None:
+def _parse_iso_datetime(value: str | None, *, local_tz: tzinfo) -> datetime | None:
     text = str(value or "").strip()
     if not text:
         return None
@@ -47,7 +48,7 @@ def _kind_priority(kind: str) -> int:
     return {"assignment": 0, "notice": 1, "file": 2}.get(kind, 9)
 
 
-def _ranked_timestamp(item: dict[str, Any], *, local_tz: Any) -> float:
+def _ranked_timestamp(item: dict[str, Any], *, local_tz: tzinfo) -> float:
     dt = _parse_iso_datetime(str(item.get("time_iso") or ""), local_tz=local_tz)
     return dt.timestamp() if dt is not None else float("-inf")
 
@@ -368,7 +369,7 @@ class DashboardService:
         deadline = RefreshDeadline.start()
         notice_floor_iso = since_iso or (now - timedelta(days=21)).isoformat(timespec="seconds")
 
-        def build_result(context: Any, auth_mode: str, bootstrap: Any) -> CommandResult:
+        def build_result(context: BrowserContextLike, auth_mode: str, bootstrap: KlmsSessionBootstrap) -> CommandResult:
             warnings: list[dict[str, Any]] = []
             provider_status: dict[str, Any] = {}
             loads = self._run_components_parallel(
@@ -463,7 +464,7 @@ class DashboardService:
         deadline = RefreshDeadline.start()
         notice_floor_iso = (now - timedelta(days=notice_days)).isoformat(timespec="seconds")
 
-        def build_result(context: Any, auth_mode: str, bootstrap: Any) -> CommandResult:
+        def build_result(context: BrowserContextLike, auth_mode: str, bootstrap: KlmsSessionBootstrap) -> CommandResult:
             warnings: list[dict[str, Any]] = []
             provider_status: dict[str, Any] = {}
             loads = self._run_components_parallel(
@@ -564,7 +565,7 @@ class DashboardService:
             hard_seconds=WEEK_COMMAND_HARD_SECONDS,
         )
 
-        def build_result(context: Any, auth_mode: str, bootstrap: Any) -> CommandResult:
+        def build_result(context: BrowserContextLike, auth_mode: str, bootstrap: KlmsSessionBootstrap) -> CommandResult:
             warnings: list[dict[str, Any]] = []
             provider_status: dict[str, Any] = {}
             assignments_load = self._run_component(
@@ -676,11 +677,11 @@ class DashboardService:
     def _with_dashboard_session(
         self,
         *,
-        config: Any,
+        config: KlmsConfig,
         deadline: RefreshDeadline,
-        build_result: Callable[[Any, str, Any], CommandResult],
+        build_result: Callable[[BrowserContextLike, str, KlmsSessionBootstrap], CommandResult],
     ) -> CommandResult:
-        def callback(context: Any, auth_mode: str, dashboard_state: dict[str, Any]) -> CommandResult:
+        def callback(context: BrowserContextLike, auth_mode: str, dashboard_state: dict[str, Any]) -> CommandResult:
             bootstrap = build_session_bootstrap(
                 self._paths,
                 context=context,

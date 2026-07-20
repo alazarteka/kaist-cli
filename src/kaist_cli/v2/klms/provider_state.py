@@ -7,6 +7,7 @@ from typing import Any
 from ...core.timeutil import cache_is_fresh_enough, iso_from_epoch_seconds, utc_now_iso
 from ..contracts import Capability, CommandError, CommandResult, Source
 from .deadline import RefreshDeadline
+from .browser_types import BrowserContextLike
 
 
 @dataclass(frozen=True)
@@ -254,7 +255,7 @@ def run_list_authenticated(
 
     config = load_config(paths)
 
-    def callback(context: Any, auth_mode: str) -> CommandResult:
+    def callback(context: BrowserContextLike, auth_mode: str) -> CommandResult:
         return list_with_context(
             context=context,
             config=config,
