@@ -219,6 +219,8 @@ def _load_recent_courses_from_bootstrap(
     sesskey = str(getattr(bootstrap, "dashboard_sesskey", None) or "").strip()
     if not sesskey:
         return []
+    # Soft enrichment only: callers merge with dashboard metadata and must keep
+    # working when the recent-courses AJAX path is unavailable or shape-changed.
     try:
         args = load_recent_courses_args(paths, limit=200)
         args["limit"] = max(200, int(args.get("limit") or 0))
@@ -238,8 +240,6 @@ def _load_recent_courses_from_bootstrap(
             limit=None,
             course_query=None,
         )
-    except CommandError:
-        raise
     except Exception:
         return []
 

@@ -144,7 +144,13 @@ def save_config(
     otp_source: str | None = None,
 ) -> KlmsConfig:
     ensure_private_dirs(paths)
-    existing = maybe_load_config(paths)
+    try:
+        existing = maybe_load_config(paths)
+    except CommandError as exc:
+        # Allow login/setup flows to rewrite a corrupt or invalid config in place.
+        if exc.code != "CONFIG_INVALID":
+            raise
+        existing = None
     resolved_base_url = _normalize_base_url(base_url or (existing.base_url if existing else ""))
     resolved_dashboard_path = _normalize_dashboard_path(dashboard_path or (existing.dashboard_path if existing else "/my/"))
     resolved_auth_username = (

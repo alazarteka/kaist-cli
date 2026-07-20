@@ -578,10 +578,15 @@ def _sync_claude_plugin_metadata(install_root: Path, *, version: str) -> Path:
     if source_plugin_manifest_path.exists():
         try:
             raw_plugin_payload = json.loads(source_plugin_manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            raw_plugin_payload = None
-        if isinstance(raw_plugin_payload, dict):
-            plugin_payload = raw_plugin_payload
+        except Exception as exc:
+            raise SelfUpdateError(
+                f"Invalid plugin manifest at {source_plugin_manifest_path}: {exc}"
+            ) from exc
+        if not isinstance(raw_plugin_payload, dict):
+            raise SelfUpdateError(
+                f"Plugin manifest at {source_plugin_manifest_path} must be a JSON object"
+            )
+        plugin_payload = raw_plugin_payload
     _write_json(plugin_manifest_path, plugin_payload)
 
     marketplace_payload = {

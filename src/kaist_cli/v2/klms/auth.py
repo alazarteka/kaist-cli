@@ -1141,7 +1141,18 @@ class AuthService:
 
     def _live_check(self, *, timeout_seconds: float = 20.0) -> dict[str, Any]:
         """Live dashboard check for ``auth status --verify``; never raises to the caller."""
-        config = maybe_load_config(self._paths)
+        try:
+            config = maybe_load_config(self._paths)
+        except CommandError as exc:
+            if exc.code == "CONFIG_INVALID":
+                return {
+                    "authenticated": None,
+                    "code": exc.code,
+                    "detail": exc.message,
+                    "note": "KLMS config is invalid; run `kaist klms auth login` to rewrite it.",
+                    "checked_at": utc_now_iso(),
+                }
+            raise
         if config is None:
             return {
                 "authenticated": None,
@@ -1533,9 +1544,14 @@ class AuthService:
             updated["finished_at"] = utc_now_iso()
             return updated
 
-        from .auth_session import update_auth_session
+        # Best-effort side effect: persistence failure must not mask the primary
+        # auth error or prevent the worker from replying to the client.
+        try:
+            from .auth_session import update_auth_session
 
-        update_auth_session(self._paths, updater=updater)
+            update_auth_session(self._paths, updater=updater)
+        except Exception:
+            pass
 
     def _require_active_auth_session(self, session_id: str) -> dict[str, Any]:
         payload = self._load_current_auth_session()
