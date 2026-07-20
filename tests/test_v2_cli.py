@@ -20,6 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from kaist_cli.v2.klms import auth as auth_module
+from kaist_cli.v2.klms import auth_browser as auth_browser_module
+from kaist_cli.v2.klms import auth_otp as auth_otp_module
+from kaist_cli.v2.klms import auth_sso as auth_sso_module
 from kaist_cli.v2.klms import secrets as secrets_module
 from kaist_cli.cli.output import emit_text
 from kaist_cli.v2.contracts import CommandError, CommandResult
@@ -898,6 +901,7 @@ def test_wait_for_email_otp_worker_ready_includes_worker_log_tail(tmp_path: Path
         paths.auth_worker_log_path.parent.mkdir(parents=True, exist_ok=True)
         paths.auth_worker_log_path.write_text("Traceback...\nRuntimeError: boom\n", encoding="utf-8")
         auth = AuthService(paths)
+        monkeypatch.setattr(auth_otp_module, "_pid_is_running", lambda pid: True)
         monkeypatch.setattr(auth_module, "_pid_is_running", lambda pid: True)
 
         class FakeWorker:
@@ -937,7 +941,7 @@ def test_auth_complete_refresh_clears_stale_worker_session(tmp_path: Path, monke
         )
         auth = AuthService(paths)
         monkeypatch.setattr(auth_module.socket, "create_connection", lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionRefusedError("refused")))
-        monkeypatch.setattr(auth_module, "_pid_is_running", lambda pid: False)
+        monkeypatch.setattr(auth_otp_module, "_pid_is_running", lambda pid: False)
         with pytest.raises(CommandError) as exc_info:
             auth.complete_refresh("abc123", otp="123456")
         remaining = load_auth_session(paths)
@@ -1529,7 +1533,7 @@ def test_wait_for_easy_login_approval_succeeds_from_mfa_and_policy_responses(tmp
             tick["value"] += 0.6
             return tick["value"]
 
-        monkeypatch.setattr(auth_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
+        monkeypatch.setattr(auth_sso_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
         monkeypatch.setattr(auth_module.time, "monotonic", fake_monotonic)
         monkeypatch.setattr(auth, "_persist_context_state", lambda context: persisted.append(True))
         monkeypatch.setattr(
@@ -1582,7 +1586,7 @@ def test_wait_for_easy_login_approval_fails_fast_on_canceled_request(tmp_path: P
         config = load_config(paths)
         auth = AuthService(paths)
         signals = _EasyLoginSignals(latest_mfa_payload={"result": False, "error_code": "ESY023"})
-        monkeypatch.setattr(auth_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
+        monkeypatch.setattr(auth_sso_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
         with pytest.raises(CommandError) as excinfo:
             auth._wait_for_easy_login_approval(
                 page=FakePage(),
@@ -1630,7 +1634,7 @@ def test_wait_for_easy_login_approval_times_out_on_repeated_waiting_state(tmp_pa
             tick["value"] += 5.0
             return tick["value"]
 
-        monkeypatch.setattr(auth_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
+        monkeypatch.setattr(auth_sso_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
         monkeypatch.setattr(auth_module.time, "monotonic", fake_monotonic)
         monkeypatch.setattr(
             auth,
@@ -1687,9 +1691,9 @@ def test_wait_for_easy_login_approval_keeps_original_number_when_extractor_mutat
             tick["value"] += 5.0
             return tick["value"]
 
-        monkeypatch.setattr(auth_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
+        monkeypatch.setattr(auth_sso_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
         monkeypatch.setattr(auth_module.time, "monotonic", fake_monotonic)
-        monkeypatch.setattr(auth_module, "_extract_easy_login_number", lambda html: "1488")
+        monkeypatch.setattr(auth_sso_module, "_extract_easy_login_number", lambda html: "1488")
         monkeypatch.setattr(
             auth,
             "_context_dashboard_state",
@@ -1741,7 +1745,7 @@ def test_wait_for_easy_login_approval_completes_device_registration_and_succeeds
         auth = AuthService(paths)
         page = FakePage()
         signals = _EasyLoginSignals(latest_mfa_payload={"result": True, "error_code": ""})
-        monkeypatch.setattr(auth_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
+        monkeypatch.setattr(auth_sso_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
         monkeypatch.setattr(auth, "_persist_context_state", lambda context: None)
         monkeypatch.setattr(
             auth,
@@ -1793,7 +1797,7 @@ def test_wait_for_easy_login_approval_errors_if_device_registration_fails(tmp_pa
         config = load_config(paths)
         auth = AuthService(paths)
         signals = _EasyLoginSignals(latest_mfa_payload={"result": True, "error_code": ""})
-        monkeypatch.setattr(auth_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
+        monkeypatch.setattr(auth_sso_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
         with pytest.raises(CommandError) as excinfo:
             auth._wait_for_easy_login_approval(
                 page=FakePage(),
@@ -1854,7 +1858,7 @@ def test_wait_for_easy_login_approval_tolerates_page_content_error_during_naviga
             tick["value"] += 0.7
             return tick["value"]
 
-        monkeypatch.setattr(auth_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
+        monkeypatch.setattr(auth_sso_module, "EASY_LOGIN_POLL_SECONDS", 0.0)
         monkeypatch.setattr(auth_module.time, "monotonic", fake_monotonic)
         monkeypatch.setattr(auth, "_persist_context_state", lambda context: None)
         monkeypatch.setattr(
@@ -1984,12 +1988,12 @@ def test_easy_login_registers_response_listener_on_context(tmp_path: Path, monke
 
         monkeypatch.setattr(playwright_sync_api, "sync_playwright", lambda: FakePlaywrightContextManager())
         monkeypatch.setattr(
-            auth_module,
+            auth_sso_module,
             "_launch_chromium_persistent_context_sync",
             lambda *args, **kwargs: fake_context,  # noqa: ARG005
         )
         monkeypatch.setattr(
-            auth_module,
+            auth_sso_module,
             "_extract_sso_login_view_url",
             lambda current_url, html: "https://sso.kaist.ac.kr/auth/kaist/user/login/view",  # noqa: ARG005
         )
@@ -2047,10 +2051,10 @@ def test_install_browser_reports_linux_dependency_hint(tmp_path: Path, monkeypat
     try:
         paths = resolve_paths()
         monkeypatch.setattr(auth_module.sys, "platform", "linux")
-        monkeypatch.setattr(auth_module, "configure_playwright_env", lambda paths: tmp_path / "pw-browsers")
-        monkeypatch.setattr(auth_module, "_playwright_install_cmd", lambda paths: (["playwright"], {}))
+        monkeypatch.setattr(auth_browser_module, "configure_playwright_env", lambda paths: tmp_path / "pw-browsers")
+        monkeypatch.setattr(auth_browser_module, "_playwright_install_cmd", lambda paths: (["playwright"], {}))
         monkeypatch.setattr(
-            auth_module.subprocess,
+            auth_browser_module.subprocess,
             "run",
             lambda *args, **kwargs: subprocess.CompletedProcess(
                 args=args[0],
