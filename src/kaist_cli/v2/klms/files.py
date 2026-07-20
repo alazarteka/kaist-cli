@@ -17,9 +17,12 @@ from .auth import AuthService, looks_logged_out_html, looks_login_url
 from .cache import load_cache_entry, load_cache_value, save_cache_value
 from .config import KlmsConfig, abs_url, load_config
 from .courses import (
+    _CourseMetadataMap,
+    _CourseMetadataRow,
     _course_code_base,
-    _course_metadata_row,
+    _course_metadata_map,
     _course_matches_query,
+    _empty_course_metadata_row,
     _extract_course_code_from_resource_index,
     _is_noise_course,
     _load_recent_courses_from_bootstrap,
@@ -236,34 +239,18 @@ def _extract_material_title_from_page(html: str) -> str | None:
     return None
 
 
-def _course_map_from_dashboard(html: str, *, base_url: str, configured_ids: tuple[str, ...]) -> dict[str, dict[str, str | None]]:
-    courses = {
-        str(course.id): _course_metadata_row(course)
-        for course in _select_dashboard_courses(
+def _course_map_from_dashboard(html: str, *, base_url: str, configured_ids: tuple[str, ...]) -> _CourseMetadataMap:
+    return _course_metadata_map(
+        _select_dashboard_courses(
             html,
             base_url=base_url,
             exclude_patterns=(),
             course_query=None,
             include_past=True,
             allow_termless_fallback=True,
-        )
-    }
-    for configured_id in configured_ids:
-        course_id = str(configured_id).strip()
-        if not course_id:
-            continue
-        courses.setdefault(
-            course_id,
-            {
-                "course_id": course_id,
-                "course_title": None,
-                "course_title_variants": (),
-                "course_code": None,
-                "course_code_base": None,
-                "term_label": None,
-            },
-        )
-    return courses
+        ),
+        configured_ids=configured_ids,
+    )
 
 
 def _build_file_item(
@@ -970,6 +957,132 @@ class FileService:
             callback=callback,
         )
 
+    def _pull_prepared_items_with_context(
+        self,
+        *,
+        context: Any,
+        config: KlmsConfig,
+        items: list[FileItem],
+        subdir: str | None,
+        dest: str | None,
+        if_exists: str,
+        auth_mode: str,
+    ) -> dict[str, Any]:
+        """Download prepared file items and retain their generic pull outcomes.
+
+        Callers own candidate discovery and any surface-specific result decoration.
+        """
+        candidate_course_ids = {str(item.course_id).strip() for item in items if str(item.course_id or "").strip()}
+        include_course_dirs = len(candidate_course_ids) != 1
+        base_root = _resolve_destination_root(files_root=self._paths.files_root, subdir=subdir, dest=dest)
+
+        outcomes: list[tuple[FileItem, dict[str, Any]]] = []
+        downloaded_count = 0
+        skipped_count = 0
+        failed_count = 0
+        total = len(items)
+        for index, item in enumerate(items, start=1):
+            _emit_pull_progress(index, total, item.title)
+            target_subdir = _pull_subdir_for_item(
+                item,
+                base_subdir=None,
+                include_course_dir=include_course_dirs,
+            )
+            try:
+                result = self.download_item_with_context(
+                    context=context,
+                    config=config,
+                    item=item,
+                    filename_override=None,
+                    subdir=target_subdir,
+                    dest=str(base_root),
+                    if_exists=if_exists,
+                    auth_mode=auth_mode,
+                )
+            except CommandError as exc:
+                failed_count += 1
+                _emit_pull_progress(index, total, item.title, status="failed", detail=exc.message)
+                outcomes.append(
+                    (
+                        item,
+                        {
+                            "status": "failed",
+                            "id": item.id,
+                            "title": item.title,
+                            "course_id": item.course_id,
+                            "course_title": item.course_title,
+                            "error": {"code": exc.code, "message": exc.message},
+                        },
+                    )
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001
+                failed_count += 1
+                _emit_pull_progress(index, total, item.title, status="failed", detail=str(exc))
+                outcomes.append(
+                    (
+                        item,
+                        {
+                            "status": "failed",
+                            "id": item.id,
+                            "title": item.title,
+                            "course_id": item.course_id,
+                            "course_title": item.course_title,
+                            "error": {"code": "DOWNLOAD_FAILED", "message": str(exc)},
+                        },
+                    )
+                )
+                continue
+
+            if bool(result.get("skipped")):
+                skipped_count += 1
+                _emit_pull_progress(index, total, item.title, status="skipped", detail=str(result.get("reason") or "exists"))
+                outcomes.append(
+                    (
+                        item,
+                        {
+                            "status": "skipped",
+                            "reason": result.get("reason"),
+                            "id": item.id,
+                            "title": item.title,
+                            "course_id": item.course_id,
+                            "course_title": item.course_title,
+                            "path": result.get("path"),
+                            "filename": result.get("filename"),
+                        },
+                    )
+                )
+                continue
+
+            downloaded_count += 1
+            outcomes.append(
+                (
+                    item,
+                    {
+                        "status": "downloaded",
+                        "id": item.id,
+                        "title": item.title,
+                        "course_id": item.course_id,
+                        "course_title": item.course_title,
+                        "path": result.get("path"),
+                        "filename": result.get("filename"),
+                        "transport": result.get("transport"),
+                    },
+                )
+            )
+
+        results = [result for _item, result in outcomes]
+        return {
+            "root": str(base_root),
+            "candidate_count": len(items),
+            "downloaded_count": downloaded_count,
+            "skipped_count": skipped_count,
+            "failed_count": failed_count,
+            "outcomes": outcomes,
+            "source": "http" if downloaded_count and all(result.get("transport") == "http" for result in results if result.get("status") == "downloaded") else "mixed",
+            "capability": "degraded" if failed_count else "partial",
+        }
+
     def pull(
         self,
         *,
@@ -1010,110 +1123,35 @@ class FileService:
             candidates = [item for item in items if item.downloadable and str(item.download_url or item.url or "").strip()]
             if limit is not None:
                 candidates = candidates[: max(0, limit)]
-            candidate_course_ids = {str(item.course_id).strip() for item in candidates if str(item.course_id or "").strip()}
-            include_course_dirs = len(candidate_course_ids) != 1
-
-            results: list[dict[str, Any]] = []
-            downloaded_count = 0
-            skipped_count = 0
-            failed_count = 0
-            base_root = _resolve_destination_root(files_root=self._paths.files_root, subdir=subdir, dest=dest)
-
-            total = len(candidates)
-            for index, item in enumerate(candidates, start=1):
-                _emit_pull_progress(index, total, item.title)
-                target_subdir = _pull_subdir_for_item(
-                    item,
-                    base_subdir=None,
-                    include_course_dir=include_course_dirs,
-                )
-                try:
-                    result = self._download_resolved_item(
-                        context=context,
-                        config=config,
-                        item=item,
-                        filename_override=None,
-                        subdir=target_subdir,
-                        dest=str(base_root),
-                        if_exists=if_exists,
-                        auth_mode=auth_mode,
-                    )
-                except CommandError as exc:
-                    failed_count += 1
-                    _emit_pull_progress(index, total, item.title, status="failed", detail=exc.message)
-                    results.append(
-                        {
-                            "status": "failed",
-                            "id": item.id,
-                            "title": item.title,
-                            "course_id": item.course_id,
-                            "course_title": item.course_title,
-                            "error": {"code": exc.code, "message": exc.message},
-                        }
-                    )
-                    continue
-                except Exception as exc:  # noqa: BLE001
-                    failed_count += 1
-                    _emit_pull_progress(index, total, item.title, status="failed", detail=str(exc))
-                    results.append(
-                        {
-                            "status": "failed",
-                            "id": item.id,
-                            "title": item.title,
-                            "course_id": item.course_id,
-                            "course_title": item.course_title,
-                            "error": {"code": "DOWNLOAD_FAILED", "message": str(exc)},
-                        }
-                    )
-                    continue
-
-                if bool(result.get("skipped")):
-                    skipped_count += 1
-                    _emit_pull_progress(index, total, item.title, status="skipped", detail=str(result.get("reason") or "exists"))
-                    results.append(
-                        {
-                            "status": "skipped",
-                            "reason": result.get("reason"),
-                            "id": item.id,
-                            "title": item.title,
-                            "course_id": item.course_id,
-                            "course_title": item.course_title,
-                            "path": result.get("path"),
-                            "filename": result.get("filename"),
-                        }
-                    )
-                else:
-                    downloaded_count += 1
-                    results.append(
-                        {
-                            "status": "downloaded",
-                            "id": item.id,
-                            "title": item.title,
-                            "course_id": item.course_id,
-                            "course_title": item.course_title,
-                            "path": result.get("path"),
-                            "filename": result.get("filename"),
-                            "transport": result.get("transport"),
-                        }
-                    )
+            pull_result = self._pull_prepared_items_with_context(
+                context=context,
+                config=config,
+                items=candidates,
+                subdir=subdir,
+                dest=dest,
+                if_exists=if_exists,
+                auth_mode=auth_mode,
+            )
+            results = [result for _item, result in pull_result["outcomes"]]
+            base_root = str(pull_result["root"])
 
             payload = {
-                "root": str(base_root),
+                "root": base_root,
                 "course_id": str(course_id).strip() or None if course_id else None,
                 "course_query": str(course_query).strip() or None if course_query else None,
                 "if_exists": if_exists,
-                "dest": str(base_root) if dest else None,
+                "dest": base_root if dest else None,
                 "requested_limit": limit,
-                "candidate_count": len(candidates),
-                "downloaded_count": downloaded_count,
-                "skipped_count": skipped_count,
-                "failed_count": failed_count,
+                "candidate_count": pull_result["candidate_count"],
+                "downloaded_count": pull_result["downloaded_count"],
+                "skipped_count": pull_result["skipped_count"],
+                "failed_count": pull_result["failed_count"],
                 "results": results,
             }
             return CommandResult(
                 data=payload,
-                source="http" if downloaded_count and all(result.get("transport") == "http" for result in results if result.get("status") == "downloaded") else "mixed",
-                capability="degraded" if failed_count else "partial",
+                source=str(pull_result["source"]),
+                capability=str(pull_result["capability"]),
             )
 
         return self._auth.run_authenticated(
@@ -1176,7 +1214,7 @@ class FileService:
         config: KlmsConfig,
         course_id: str | None,
         course_query: str | None = None,
-    ) -> dict[str, dict[str, str | None]]:
+    ) -> _CourseMetadataMap:
         course_map = _course_map_from_dashboard(bootstrap.dashboard_html, base_url=config.base_url, configured_ids=config.course_ids)
         course_map = _merge_course_metadata_rows(
             course_map,
@@ -1188,14 +1226,7 @@ class FileService:
         )
         if course_id:
             target = str(course_id).strip()
-            course_meta = course_map.get(target) or {
-                "course_id": target,
-                "course_title": None,
-                "course_title_variants": (),
-                "course_code": None,
-                "course_code_base": None,
-                "term_label": None,
-            }
+            course_meta = course_map.get(target) or _empty_course_metadata_row(target)
             return {target: course_meta}
         discovered = _select_dashboard_courses(
             bootstrap.dashboard_html,
@@ -1219,7 +1250,7 @@ class FileService:
         *,
         config: KlmsConfig,
         auth_mode: str,
-        course_map: dict[str, dict[str, str | None]],
+        course_map: _CourseMetadataMap,
         limit: int | None,
         bootstrap: KlmsSessionBootstrap,
         deadline: RefreshDeadline | None,
@@ -1252,7 +1283,7 @@ class FileService:
 
             batch = course_meta_list[start : start + MAX_FILE_HTTP_WORKERS]
             index_paths = []
-            path_to_course: dict[str, dict[str, str | None]] = {}
+            path_to_course: dict[str, _CourseMetadataRow] = {}
             for course_meta in batch:
                 current_course_id = str(course_meta.get("course_id") or "").strip() or None
                 if not current_course_id:
@@ -1359,7 +1390,7 @@ class FileService:
         *,
         config: KlmsConfig,
         auth_mode: str,
-        course_map: dict[str, dict[str, str | None]],
+        course_map: _CourseMetadataMap,
         limit: int | None,
         bootstrap: KlmsSessionBootstrap,
         deadline: RefreshDeadline | None,
@@ -1381,7 +1412,7 @@ class FileService:
         for course_id in course_ids:
             if deadline is not None and deadline.hard_expired():
                 raise TimeoutError("Interactive file refresh budget expired.")
-            course_meta = course_map.get(course_id) or {"course_id": course_id, "course_title": None, "course_code": None}
+            course_meta = course_map.get(course_id) or _empty_course_metadata_row(course_id)
             result = self._call_course_contents_api(
                 config=config,
                 bootstrap=bootstrap,

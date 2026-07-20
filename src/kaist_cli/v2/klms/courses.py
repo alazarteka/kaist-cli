@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from collections.abc import Iterable
+from typing import Any, TypeAlias
 
 from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 
@@ -22,6 +23,10 @@ SEMESTER_LABELS = {
     "3": "Fall",
     "4": "Winter",
 }
+
+_CourseMetadataValue: TypeAlias = str | None | tuple[str, ...]
+_CourseMetadataRow: TypeAlias = dict[str, _CourseMetadataValue]
+_CourseMetadataMap: TypeAlias = dict[str, _CourseMetadataRow]
 
 
 def _norm_text(value: str) -> str:
@@ -138,7 +143,7 @@ def _course_aliases(course: Any) -> tuple[str, ...]:
     return tuple(aliases)
 
 
-def _course_metadata_row(course: Course) -> dict[str, str | None | tuple[str, ...]]:
+def _course_metadata_row(course: Course) -> _CourseMetadataRow:
     return {
         "course_id": str(course.id),
         "course_title": course.title,
@@ -149,23 +154,44 @@ def _course_metadata_row(course: Course) -> dict[str, str | None | tuple[str, ..
     }
 
 
+def _empty_course_metadata_row(course_id: str) -> _CourseMetadataRow:
+    return {
+        "course_id": str(course_id).strip(),
+        "course_title": None,
+        "course_title_variants": (),
+        "course_code": None,
+        "course_code_base": None,
+        "term_label": None,
+    }
+
+
+def _course_metadata_map(
+    courses: Iterable[Course],
+    *,
+    configured_ids: Iterable[str] = (),
+) -> _CourseMetadataMap:
+    rows: _CourseMetadataMap = {}
+    for course in courses:
+        course_id = str(course.id).strip()
+        if course_id:
+            rows[course_id] = _course_metadata_row(course)
+    for configured_id in configured_ids:
+        course_id = str(configured_id).strip()
+        if course_id:
+            rows.setdefault(course_id, _empty_course_metadata_row(course_id))
+    return rows
+
+
 def _merge_course_metadata_rows(
-    rows: dict[str, dict[str, str | None | tuple[str, ...]]],
-    courses: list[Course],
-) -> dict[str, dict[str, str | None | tuple[str, ...]]]:
+    rows: _CourseMetadataMap,
+    courses: Iterable[Course],
+) -> _CourseMetadataMap:
     merged = {str(key): dict(value) for key, value in rows.items()}
     for course in courses:
         course_id = str(course.id).strip()
         if not course_id:
             continue
-        row = merged.get(course_id) or {
-            "course_id": course_id,
-            "course_title": None,
-            "course_title_variants": (),
-            "course_code": None,
-            "course_code_base": None,
-            "term_label": None,
-        }
+        row = merged.get(course_id) or _empty_course_metadata_row(course_id)
         existing_title = str(row.get("course_title") or "").strip() or None
         existing_variants = row.get("course_title_variants")
         if not isinstance(existing_variants, (list, tuple)):

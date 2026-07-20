@@ -88,7 +88,7 @@ def _iso_now_utc() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _epoch_from_iso(value: str | None) -> int | None:
+def _epoch_from_iso(value: str | None) -> float | None:
     text = str(value or "").strip()
     if not text:
         return None
@@ -99,7 +99,7 @@ def _epoch_from_iso(value: str | None) -> int | None:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp())
+    return dt.timestamp()
 
 
 def _discover_course_ids_from_dashboard(html: str, *, configured_ids: tuple[str, ...]) -> list[str]:
@@ -287,7 +287,22 @@ def _filter_assignments(
         ]
     if since_iso:
         floor = str(since_iso).strip()
-        filtered = [assignment for assignment in filtered if assignment.due_iso and assignment.due_iso >= floor]
+        floor_epoch = _epoch_from_iso(floor)
+
+        def is_on_or_after_floor(assignment: Assignment) -> bool:
+            due_iso = assignment.due_iso
+            if not due_iso:
+                return False
+            due_epoch = _epoch_from_iso(due_iso)
+            if floor_epoch is None or due_epoch is None:
+                return due_iso >= floor
+            return due_epoch >= floor_epoch
+
+        filtered = [
+            assignment
+            for assignment in filtered
+            if is_on_or_after_floor(assignment)
+        ]
     filtered = sorted(
         filtered,
         key=lambda assignment: (
@@ -751,7 +766,7 @@ class AssignmentService:
         base_limit = min(max(limit or 50, 1), 50)
         recent_floor = _epoch_from_iso(since_iso) or int(time.time()) - (180 * 24 * 3600)
         args_candidates = [
-            {"limitnum": base_limit, "timesortfrom": recent_floor},
+            {"limitnum": base_limit, "timesortfrom": int(recent_floor)},
             {"limitnum": base_limit, "timesortfrom": 0},
             {},
         ]

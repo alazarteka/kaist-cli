@@ -29,7 +29,7 @@ from kaist_cli.v2.klms.auth_session import clear_auth_session, load_auth_session
 from kaist_cli.v2.klms.auth import AuthService
 from kaist_cli.v2.klms.auth import _EasyLoginSignals, _extract_easy_login_error_message, _extract_easy_login_number, _extract_sso_login_view_url, _request_email_otp_delivery, _should_update_easy_login_number, _submit_password_login, looks_login_url
 from kaist_cli.v2.klms.assignments import AssignmentService, _extract_assignment_detail_from_html, _extract_assignment_rows_from_calendar_data, _filter_assignments
-from kaist_cli.v2.klms.courses import CourseService, _course_is_current_term, _course_matches_query, _discover_courses_from_dashboard, _parse_recent_courses_payload
+from kaist_cli.v2.klms.courses import CourseService, _course_is_current_term, _course_matches_query, _course_metadata_map, _discover_courses_from_dashboard, _parse_recent_courses_payload
 from kaist_cli.v2.klms.capture import _courseboard_runtime_capture_summary, _extract_courseboard_js_hints
 from kaist_cli.v2.klms.config import load_config
 from kaist_cli.v2.klms.dashboard import DashboardService, _build_inbox_items, _decorate_today_assignments, _filter_inbox_assignments, _filter_inbox_files, _select_materials, _select_recent_notices
@@ -2137,6 +2137,31 @@ def test_parse_recent_courses_payload_extracts_courses_and_term() -> None:
     assert _course_matches_query(courses[0], "Special Topics") is True
 
 
+def test_course_metadata_map_keeps_dashboard_metadata_and_configured_fallback() -> None:
+    course = Course(
+        id="180871",
+        title="Introduction to Algorithms",
+        url="https://klms.kaist.ac.kr/course/view.php?id=180871",
+        course_code="CS.30000_2026_1",
+        course_code_base="CS.30000",
+        term_label="2026 Spring",
+        title_variants=("알고리즘 개론",),
+    )
+
+    course_map = _course_metadata_map([course], configured_ids=("180871", "178434"))
+
+    assert course_map["180871"]["course_title"] == "Introduction to Algorithms"
+    assert course_map["180871"]["course_title_variants"] == ("Introduction to Algorithms", "알고리즘 개론")
+    assert course_map["178434"] == {
+        "course_id": "178434",
+        "course_title": None,
+        "course_title_variants": (),
+        "course_code": None,
+        "course_code_base": None,
+        "term_label": None,
+    }
+
+
 def test_course_without_term_label_is_not_current_term() -> None:
     course = Course(
         id="147806",
@@ -2265,6 +2290,100 @@ def test_filter_assignments_matches_course_query_via_shared_course_aliases() -> 
         include_past=False,
     )
     assert [assignment.id for assignment in filtered] == ["1210948"]
+
+
+@pytest.mark.parametrize(
+    "since_iso",
+    [
+        "2026-03-17T00:00:00.500Z",
+        "2026-03-17T09:00:00.500+09:00",
+    ],
+)
+def test_filter_assignments_since_compares_fractional_iso_offsets_as_instants(since_iso: str) -> None:
+    assignments = [
+        Assignment(
+            id="before",
+            title="Just before",
+            url=None,
+            due_raw=None,
+            due_iso="2026-03-17T00:00:00.499Z",
+            course_id="180871",
+            course_title="Introduction to Algorithms",
+            course_code="CS.30000_2026_1",
+            course_code_base="CS.30000",
+        ),
+        Assignment(
+            id="equal",
+            title="Equal instant",
+            url=None,
+            due_raw=None,
+            due_iso="2026-03-17T00:00:00.500Z",
+            course_id="180871",
+            course_title="Introduction to Algorithms",
+            course_code="CS.30000_2026_1",
+            course_code_base="CS.30000",
+        ),
+        Assignment(
+            id="after",
+            title="Just after",
+            url=None,
+            due_raw=None,
+            due_iso="2026-03-17T00:00:00.501Z",
+            course_id="180871",
+            course_title="Introduction to Algorithms",
+            course_code="CS.30000_2026_1",
+            course_code_base="CS.30000",
+        ),
+    ]
+
+    filtered = _filter_assignments(
+        assignments,
+        course_id=None,
+        course_query=None,
+        since_iso=since_iso,
+        limit=None,
+        include_past=True,
+    )
+
+    assert [assignment.id for assignment in filtered] == ["equal", "after"]
+
+
+def test_filter_assignments_since_preserves_lexical_fallback_for_invalid_timestamps() -> None:
+    def assignment(item_id: str, due_iso: str) -> Assignment:
+        return Assignment(
+            id=item_id,
+            title=item_id,
+            url=None,
+            due_raw=None,
+            due_iso=due_iso,
+            course_id="180871",
+            course_title="Introduction to Algorithms",
+            course_code="CS.30000_2026_1",
+            course_code_base="CS.30000",
+        )
+
+    invalid_floor = _filter_assignments(
+        [assignment("lexical-before", "aaa"), assignment("lexical-after", "zzz")],
+        course_id=None,
+        course_query=None,
+        since_iso="not-a-timestamp",
+        limit=None,
+        include_past=True,
+    )
+    malformed_due = _filter_assignments(
+        [
+            assignment("lexical-before", "2026-02-not-a-timestamp"),
+            assignment("lexical-after", "2026-04-not-a-timestamp"),
+        ],
+        course_id=None,
+        course_query=None,
+        since_iso="2026-03-17T00:00:00Z",
+        limit=None,
+        include_past=True,
+    )
+
+    assert [item.id for item in invalid_floor] == ["lexical-after"]
+    assert [item.id for item in malformed_due] == ["lexical-after"]
 
 
 def test_filter_assignments_defaults_to_current_term_course_ids() -> None:

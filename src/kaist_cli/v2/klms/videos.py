@@ -11,9 +11,12 @@ from ..contracts import CommandError, CommandResult
 from .auth import AuthService, looks_logged_out_html, looks_login_url
 from .config import KlmsConfig, abs_url, load_config
 from .courses import (
+    _CourseMetadataMap,
+    _CourseMetadataRow,
     _course_code_base,
+    _course_metadata_map,
     _course_matches_query,
-    _course_metadata_row,
+    _empty_course_metadata_row,
     _discover_courses_from_dashboard,
     _is_noise_course,
     _load_recent_courses_from_bootstrap,
@@ -53,27 +56,11 @@ def _simplify_video_title(text: str) -> str:
     return title
 
 
-def _course_map_from_dashboard(html: str, *, base_url: str, configured_ids: tuple[str, ...]) -> dict[str, dict[str, str | None]]:
-    courses = {
-        str(course.id): _course_metadata_row(course)
-        for course in _discover_courses_from_dashboard(html, base_url=base_url)
-    }
-    for configured_id in configured_ids:
-        course_id = str(configured_id).strip()
-        if not course_id:
-            continue
-        courses.setdefault(
-            course_id,
-            {
-                "course_id": course_id,
-                "course_title": None,
-                "course_title_variants": (),
-                "course_code": None,
-                "course_code_base": None,
-                "term_label": None,
-            },
-        )
-    return courses
+def _course_map_from_dashboard(html: str, *, base_url: str, configured_ids: tuple[str, ...]) -> _CourseMetadataMap:
+    return _course_metadata_map(
+        _discover_courses_from_dashboard(html, base_url=base_url),
+        configured_ids=configured_ids,
+    )
 
 
 def _merge_videos(items: list[Video]) -> list[Video]:
@@ -338,7 +325,7 @@ class VideoService:
         for start in range(0, len(course_meta_list), MAX_VIDEO_HTTP_WORKERS):
             batch = course_meta_list[start : start + MAX_VIDEO_HTTP_WORKERS]
             course_paths: list[str] = []
-            path_to_course: dict[str, dict[str, str | None]] = {}
+            path_to_course: dict[str, _CourseMetadataRow] = {}
             for course_meta in batch:
                 current_course_id = str(course_meta.get("course_id") or "").strip() or None
                 if not current_course_id:
@@ -349,7 +336,7 @@ class VideoService:
 
             responses = fetch_html_batch(bootstrap.http, course_paths, max_workers=MAX_VIDEO_HTTP_WORKERS)
             index_paths: list[str] = []
-            index_to_course: dict[str, dict[str, str | None]] = {}
+            index_to_course: dict[str, _CourseMetadataRow] = {}
             for path in course_paths:
                 response = responses.get(path)
                 if response is None:
@@ -436,7 +423,7 @@ class VideoService:
         config: KlmsConfig,
         course_id: str | None,
         course_query: str | None = None,
-    ) -> dict[str, dict[str, str | None]]:
+    ) -> _CourseMetadataMap:
         course_map = _course_map_from_dashboard(bootstrap.dashboard_html, base_url=config.base_url, configured_ids=config.course_ids)
         course_map = _merge_course_metadata_rows(
             course_map,
@@ -448,14 +435,7 @@ class VideoService:
         )
         if course_id:
             target = str(course_id).strip()
-            course_meta = course_map.get(target) or {
-                "course_id": target,
-                "course_title": None,
-                "course_title_variants": (),
-                "course_code": None,
-                "course_code_base": None,
-                "term_label": None,
-            }
+            course_meta = course_map.get(target) or _empty_course_metadata_row(target)
             return {target: course_meta}
         discovered = _select_dashboard_courses(
             bootstrap.dashboard_html,

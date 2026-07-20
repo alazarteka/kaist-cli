@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import sys
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -16,9 +15,11 @@ from .assignments import _attachment_filename_from_url, _looks_like_attachment_u
 from ...core.state_store import read_json_file, update_json_file
 from .config import KlmsConfig, abs_url, load_config
 from .courses import (
+    _CourseMetadataMap,
     _course_code_base,
+    _course_metadata_map,
     _course_matches_query,
-    _course_metadata_row,
+    _empty_course_metadata_row,
     _load_recent_courses_from_bootstrap,
     _merge_course_metadata_rows,
     _norm_text,
@@ -36,18 +37,6 @@ NOTICE_BOARD_TTL_SECONDS = 6 * 3600
 NOTICE_LIST_TTL_SECONDS = 5 * 60
 NOTICE_STORE_VERSION = 1
 MAX_NOTICE_HTTP_WORKERS = 4
-
-
-def _emit_pull_progress(index: int, total: int, title: str, *, status: str | None = None, detail: str | None = None) -> None:
-    prefix = f"[{index}/{total}]"
-    safe_title = " ".join(str(title or "unnamed attachment").split()) or "unnamed attachment"
-    if status is None:
-        message = f"{prefix} downloading {safe_title} ..."
-    else:
-        message = f"{prefix} {status} {safe_title}"
-        if detail:
-            message += f" ({detail})"
-    print(message, file=sys.stderr, flush=True)
 
 
 def _extract_course_ids_from_dashboard(
@@ -92,7 +81,7 @@ def _course_meta_map_from_dashboard(
     configured_ids: tuple[str, ...] = (),
     course_query: str | None = None,
     course_id: str | None = None,
-) -> dict[str, dict[str, str | None]]:
+) -> _CourseMetadataMap:
     selected = _select_dashboard_courses(
         html,
         base_url=base_url,
@@ -101,34 +90,10 @@ def _course_meta_map_from_dashboard(
         include_past=False,
         allow_termless_fallback=True,
     )
-    out = {
-        str(course.id): _course_metadata_row(course)
-        for course in selected
-        if str(course.id).strip()
-    }
-    for configured_id in configured_ids:
-        target = str(configured_id).strip()
-        if target and target not in out:
-            out[target] = {
-                "course_id": target,
-                "course_title": None,
-                "course_title_variants": (),
-                "course_code": None,
-                "course_code_base": None,
-                "term_label": None,
-            }
-    if course_id:
-        target = str(course_id).strip()
-        if target and target not in out:
-            out[target] = {
-                "course_id": target,
-                "course_title": None,
-                "course_title_variants": (),
-                "course_code": None,
-                "course_code_base": None,
-                "term_label": None,
-            }
-    return out
+    return _course_metadata_map(
+        selected,
+        configured_ids=(*configured_ids, course_id) if course_id else configured_ids,
+    )
 
 
 def _course_meta_map_for_request(
@@ -138,7 +103,7 @@ def _course_meta_map_for_request(
     config: KlmsConfig,
     course_id: str | None = None,
     course_query: str | None = None,
-) -> dict[str, dict[str, str | None]]:
+) -> _CourseMetadataMap:
     course_meta = _course_meta_map_from_dashboard(
         bootstrap.dashboard_html,
         base_url=config.base_url,
@@ -157,7 +122,7 @@ def _course_meta_map_for_request(
     )
     if course_id:
         target = str(course_id).strip()
-        return {target: course_meta.get(target) or {"course_id": target, "course_title": None, "course_title_variants": (), "course_code": None, "course_code_base": None, "term_label": None}} if target else {}
+        return {target: course_meta.get(target) or _empty_course_metadata_row(target)} if target else {}
     if not course_query:
         return course_meta
     return {
@@ -1358,7 +1323,7 @@ class NoticeService:
         dest: str | None = None,
         if_exists: str = "skip",
     ) -> CommandResult:
-        from .files import FileService, _pull_subdir_for_item, _resolve_destination_root
+        from .files import FileService
         from .models import FileItem
 
         if subdir and dest:
@@ -1415,35 +1380,18 @@ class NoticeService:
                 limit=limit,
                 bootstrap=bootstrap,
             )
-            attachment_course_ids = {
-                str(board_to_course.get(str(notice.board_id or "").strip()) or "").strip()
-                for notice in notices
-                for attachment in notice.attachments
-                if str(attachment.get("url") or "").strip()
-            }
-            attachment_course_ids.discard("")
-            include_course_dirs = len(attachment_course_ids) != 1
             downloader = FileService(self._paths, self._auth)
-            results: list[dict[str, Any]] = []
-            candidate_count = 0
-            downloaded_count = 0
-            skipped_count = 0
-            failed_count = 0
-            base_root = _resolve_destination_root(files_root=self._paths.files_root, subdir=subdir, dest=dest)
-
-            total = sum(1 for notice in notices for attachment in notice.attachments if str(attachment.get("url") or "").strip())
-            current = 0
+            prepared_items: list[FileItem] = []
+            attachment_contexts: list[dict[str, Any]] = []
             for notice in notices:
                 for index, attachment in enumerate(notice.attachments):
                     attachment_url = str(attachment.get("url") or "").strip()
                     if not attachment_url:
                         continue
-                    current += 1
-                    candidate_count += 1
                     resolved_course_id = board_to_course.get(str(notice.board_id or "").strip())
                     course_row = course_meta.get(resolved_course_id or "", {})
+                    course_title = course_row.get("course_title") if isinstance(course_row, dict) else None
                     attachment_title = str(attachment.get("title") or attachment.get("filename") or notice.title or "attachment")
-                    _emit_pull_progress(current, total, attachment_title)
                     item = FileItem(
                         id=f"{notice.id or 'notice'}:{index}",
                         title=attachment_title,
@@ -1459,110 +1407,88 @@ class NoticeService:
                         kind="file",
                         downloadable=True,
                         course_id=resolved_course_id,
-                        course_title=course_row.get("course_title") if isinstance(course_row, dict) else None,
+                        course_title=course_title,
                         course_code=course_row.get("course_code") if isinstance(course_row, dict) else None,
                         course_code_base=course_row.get("course_code_base") if isinstance(course_row, dict) else None,
                         source="html:notice-attachment",
                         confidence=0.82,
                         auth_mode=auth_mode,
                     )
-                    target_subdir = _pull_subdir_for_item(
-                        item,
-                        base_subdir=None,
-                        include_course_dir=include_course_dirs,
+                    prepared_items.append(item)
+                    attachment_contexts.append(
+                        {
+                            "notice_id": notice.id,
+                            "notice_title": notice.title,
+                            "board_id": notice.board_id,
+                            "course_id": resolved_course_id,
+                            "course_title": course_title,
+                            "filename": item.filename,
+                        }
                     )
-                    try:
-                        result = downloader.download_item_with_context(
-                            context=context,
-                            config=config,
-                            item=item,
-                            filename_override=None,
-                            subdir=target_subdir,
-                            dest=str(base_root),
-                            if_exists=if_exists,
-                            auth_mode=auth_mode,
-                        )
-                    except CommandError as exc:
-                        failed_count += 1
-                        _emit_pull_progress(current, total, attachment_title, status="failed", detail=exc.message)
-                        results.append(
-                            {
-                                "status": "failed",
-                                "notice_id": notice.id,
-                                "notice_title": notice.title,
-                                "board_id": notice.board_id,
-                                "course_id": resolved_course_id,
-                                "course_title": course_row.get("course_title") if isinstance(course_row, dict) else None,
-                                "filename": item.filename,
-                                "error": {"code": exc.code, "message": exc.message},
-                            }
-                        )
-                        continue
-                    except Exception as exc:
-                        failed_count += 1
-                        _emit_pull_progress(current, total, attachment_title, status="failed", detail=str(exc))
-                        results.append(
-                            {
-                                "status": "failed",
-                                "notice_id": notice.id,
-                                "notice_title": notice.title,
-                                "board_id": notice.board_id,
-                                "course_id": resolved_course_id,
-                                "course_title": course_row.get("course_title") if isinstance(course_row, dict) else None,
-                                "filename": item.filename,
-                                "error": {"code": "DOWNLOAD_FAILED", "message": str(exc)},
-                            }
-                        )
-                        continue
 
-                    if bool(result.get("skipped")):
-                        skipped_count += 1
-                        _emit_pull_progress(current, total, attachment_title, status="skipped", detail=str(result.get("reason") or "exists"))
-                        results.append(
-                            {
-                                "status": "skipped",
-                                "notice_id": notice.id,
-                                "notice_title": notice.title,
-                                "board_id": notice.board_id,
-                                "course_id": resolved_course_id,
-                                "course_title": course_row.get("course_title") if isinstance(course_row, dict) else None,
-                                "path": result.get("path"),
-                                "filename": result.get("filename"),
-                                "transport": result.get("transport"),
-                            }
-                        )
-                    else:
-                        downloaded_count += 1
-                        results.append(
-                            {
-                                "status": "downloaded",
-                                "notice_id": notice.id,
-                                "notice_title": notice.title,
-                                "board_id": notice.board_id,
-                                "course_id": resolved_course_id,
-                                "course_title": course_row.get("course_title") if isinstance(course_row, dict) else None,
-                                "path": result.get("path"),
-                                "filename": result.get("filename"),
-                                "transport": result.get("transport"),
-                            }
-                        )
+            pull_result = downloader._pull_prepared_items_with_context(
+                context=context,
+                config=config,
+                items=prepared_items,
+                subdir=subdir,
+                dest=dest,
+                if_exists=if_exists,
+                auth_mode=auth_mode,
+            )
+            results: list[dict[str, Any]] = []
+            for (_item, outcome), attachment_context in zip(
+                pull_result["outcomes"],
+                attachment_contexts,
+                strict=True,
+            ):
+                if outcome.get("status") == "failed":
+                    results.append(
+                        {
+                            "status": "failed",
+                            "notice_id": attachment_context["notice_id"],
+                            "notice_title": attachment_context["notice_title"],
+                            "board_id": attachment_context["board_id"],
+                            "course_id": attachment_context["course_id"],
+                            "course_title": attachment_context["course_title"],
+                            "filename": attachment_context["filename"],
+                            "error": outcome.get("error"),
+                        }
+                    )
+                    continue
+
+                results.append(
+                    {
+                        "status": outcome.get("status"),
+                        "notice_id": attachment_context["notice_id"],
+                        "notice_title": attachment_context["notice_title"],
+                        "board_id": attachment_context["board_id"],
+                        "course_id": attachment_context["course_id"],
+                        "course_title": attachment_context["course_title"],
+                        "path": outcome.get("path"),
+                        "filename": outcome.get("filename"),
+                        "transport": outcome.get("transport"),
+                    }
+                )
 
             payload = {
-                "root": str(base_root),
+                "root": pull_result["root"],
                 "course_id": str(course_id).strip() or None if course_id else None,
                 "course_query": str(course_query).strip() or None if course_query else None,
                 "since_iso": since_iso,
                 "if_exists": if_exists,
-                "dest": str(base_root) if dest else None,
+                "dest": pull_result["root"] if dest else None,
                 "requested_limit": limit,
-                "candidate_count": candidate_count,
-                "downloaded_count": downloaded_count,
-                "skipped_count": skipped_count,
-                "failed_count": failed_count,
+                "candidate_count": pull_result["candidate_count"],
+                "downloaded_count": pull_result["downloaded_count"],
+                "skipped_count": pull_result["skipped_count"],
+                "failed_count": pull_result["failed_count"],
                 "results": results,
             }
-            source = "http" if downloaded_count and all(row.get("transport") == "http" for row in results if row.get("status") == "downloaded") else "mixed"
-            return CommandResult(data=payload, source=source, capability="degraded" if failed_count else "partial")
+            return CommandResult(
+                data=payload,
+                source=str(pull_result["source"]),
+                capability=str(pull_result["capability"]),
+            )
 
         return self._auth.run_authenticated(
             config=config,
