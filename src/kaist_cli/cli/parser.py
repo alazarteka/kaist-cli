@@ -52,6 +52,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format. auto selects table/text in TTY and json in non-TTY.",
     )
     parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON envelopes (alias for --format json).",
+    )
+    parser.add_argument(
         "--agent",
         action="store_true",
         help="Global agent mode. Forces strict JSON envelopes and deterministic key ordering; use it before the command, e.g. `kaist --agent klms today`.",
