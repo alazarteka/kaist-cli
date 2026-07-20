@@ -21,12 +21,9 @@ def _utc_now_iso() -> str:
 
 
 def _same_origin(url_a: str, url_b: str) -> bool:
-    try:
-        a = urlparse(url_a)
-        b = urlparse(url_b)
-        return (a.scheme, a.netloc) == (b.scheme, b.netloc)
-    except Exception:
-        return False
+    a = urlparse(url_a)
+    b = urlparse(url_b)
+    return (a.scheme, a.netloc) == (b.scheme, b.netloc)
 
 
 def _dedupe_strings(values: list[str]) -> list[str]:
@@ -256,7 +253,6 @@ _COURSEBOARD_RUNTIME_CAPTURE_JS = r"""
     try {
       window.sessionStorage.setItem(STORAGE_KEY, JSON.stringify(events.slice(-MAX_EVENTS)));
     } catch (_error) {
-      // Ignore storage failures.
     }
   }
 
@@ -393,7 +389,6 @@ _COURSEBOARD_RUNTIME_CAPTURE_JS = r"""
           bodyPreview = preview(init.body);
         }
       } catch (_error) {
-        // Best-effort logging only.
       }
       push({
         requestId,

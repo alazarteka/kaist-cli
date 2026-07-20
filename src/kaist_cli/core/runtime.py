@@ -11,11 +11,6 @@ class RuntimeConfig:
 
 @dataclass(frozen=True)
 class SharedAuthRuntime:
-    """
-    Shared runtime marker for systems that use browser/session auth.
-
-    System adapters can compose their own runtime implementations while sharing
-    this common config object.
-    """
+    """Shared browser/session auth runtime config for system adapters."""
 
     config: RuntimeConfig = RuntimeConfig()

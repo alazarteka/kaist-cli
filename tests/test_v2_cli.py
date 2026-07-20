@@ -214,8 +214,7 @@ def test_auth_status_detects_storage_state_and_cookie_stats(tmp_path: Path) -> N
 
 
 def test_auth_status_session_expiry_unknown_without_cookie_expiry(tmp_path: Path) -> None:
-    # A bare MoodleSession session cookie carries no absolute expiry; status must say
-    # so honestly rather than inventing a fixed refresh window.
+    # Bare MoodleSession with expires=-1 has no absolute expiry; status source stays unknown.
     _write_config(tmp_path)
     storage_state_path = tmp_path / "kaist-home" / "private" / "klms" / "storage_state.json"
     storage_state_path.parent.mkdir(parents=True, exist_ok=True)

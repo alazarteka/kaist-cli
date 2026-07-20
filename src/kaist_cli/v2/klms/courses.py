@@ -13,7 +13,7 @@ from .config import KlmsConfig, abs_url, load_config
 from .discovery import load_recent_courses_args
 from .models import Course
 from .paths import KlmsPaths
-from .session import build_session_bootstrap, fetch_html_batch
+from .session import KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
 from .validate import looks_klms_error_html
 
 
@@ -212,19 +212,17 @@ def _merge_course_metadata_rows(
 
 def _load_recent_courses_from_bootstrap(
     paths: KlmsPaths,
-    bootstrap: Any,
+    bootstrap: KlmsSessionBootstrap,
     *,
     exclude_patterns: tuple[str, ...],
 ) -> list[Course]:
-    sesskey = str(getattr(bootstrap, "dashboard_sesskey", "") or "").strip()
-    http = getattr(bootstrap, "http", None)
-    config = getattr(bootstrap, "config", None)
-    if not sesskey or http is None or config is None or not hasattr(http, "post_text"):
+    sesskey = str(getattr(bootstrap, "dashboard_sesskey", None) or "").strip()
+    if not sesskey:
         return []
     try:
         args = load_recent_courses_args(paths, limit=200)
         args["limit"] = max(200, int(args.get("limit") or 0))
-        response = http.post_text(
+        response = bootstrap.http.post_text(
             f"/lib/ajax/service.php?sesskey={sesskey}&info=core_course_get_recent_courses",
             body=json.dumps([{"index": 0, "methodname": "core_course_get_recent_courses", "args": args}]),
             headers={"Content-Type": "application/json"},
@@ -232,7 +230,7 @@ def _load_recent_courses_from_bootstrap(
         )
         return _parse_recent_courses_payload(
             response.text,
-            base_url=config.base_url,
+            base_url=bootstrap.config.base_url,
             auth_mode=str(getattr(bootstrap, "auth_mode", "") or "") or None,
             exclude_patterns=exclude_patterns,
             include_all=True,
@@ -240,6 +238,8 @@ def _load_recent_courses_from_bootstrap(
             limit=None,
             course_query=None,
         )
+    except CommandError:
+        raise
     except Exception:
         return []
 

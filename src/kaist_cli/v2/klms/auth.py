@@ -636,7 +636,7 @@ def _page_has_authenticated_klms_session(page: Any, *, config: KlmsConfig) -> bo
         return False
     html = _safe_page_content(page)
     if html is None:
-        return True
+        return False
     return not looks_logged_out_html(html)
 
 
@@ -696,12 +696,7 @@ def storage_state_cookie_stats(paths: KlmsPaths) -> dict[str, Any] | None:
 
 
 def record_auth_verified(paths: KlmsPaths) -> None:
-    """Persist the moment a live dashboard check last confirmed an authenticated session.
-
-    This is the honest "we know you were logged in at X" signal — written only when
-    ``_context_dashboard_state`` actually reached an authenticated dashboard, never on
-    mere file activity.
-    """
+    """Write last_verified_at after a live dashboard check confirms an authenticated session."""
     ensure_private_dirs(paths)
     try:
         paths.auth_verified_path.write_text(
@@ -1056,12 +1051,7 @@ class AuthService:
 
     @staticmethod
     def _session_expiry(cookie_stats: dict[str, Any] | None) -> dict[str, Any]:
-        """Report when the saved session expires, grounded in real cookie data.
-
-        Uses only the persisted ``MoodleSession`` cookie. When that auth cookie has
-        no absolute expiry, we say so honestly rather than using an unrelated
-        persistent cookie as a proxy; the live dashboard check remains the real gate.
-        """
+        """Report MoodleSession cookie expiry; unknown when the cookie has no absolute expiry."""
         if not isinstance(cookie_stats, dict) or "read_error" in cookie_stats:
             return {
                 "source": "unknown",
@@ -1150,12 +1140,7 @@ class AuthService:
         return CommandResult(data=snapshot, source="bootstrap", capability="partial")
 
     def _live_check(self, *, timeout_seconds: float = 20.0) -> dict[str, Any]:
-        """Confirm the saved session against a live KLMS dashboard fetch.
-
-        Returns an authenticated, unauthenticated, or unknown result rather than
-        raising, so ``auth status --verify`` always renders. A successful check also
-        refreshes ``last_verified_at`` via ``run_authenticated_with_state``.
-        """
+        """Live dashboard check for ``auth status --verify``; never raises to the caller."""
         config = maybe_load_config(self._paths)
         if config is None:
             return {
@@ -1548,12 +1533,9 @@ class AuthService:
             updated["finished_at"] = utc_now_iso()
             return updated
 
-        try:
-            from .auth_session import update_auth_session
+        from .auth_session import update_auth_session
 
-            update_auth_session(self._paths, updater=updater)
-        except Exception:
-            pass
+        update_auth_session(self._paths, updater=updater)
 
     def _require_active_auth_session(self, session_id: str) -> dict[str, Any]:
         payload = self._load_current_auth_session()
