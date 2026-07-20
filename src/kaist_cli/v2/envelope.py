@@ -2,14 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime, timezone
 from typing import Any
 
+from ..core.timeutil import utc_now_iso
 from .contracts import CommandError, CommandResult
-
-
-def utc_now_iso() -> str:
-    return datetime.now(tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def success_envelope(args: argparse.Namespace, result: CommandResult) -> dict[str, Any]:

@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 from typing import Any
 
-
-def utc_now_iso() -> str:
-    return datetime.now(tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+from .timeutil import utc_now_iso
 
 
 def _sanitize_schema_part(value: str | None) -> str:

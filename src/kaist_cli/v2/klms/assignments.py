@@ -10,6 +10,8 @@ from typing import Any
 from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 
 from ..contracts import CommandError, CommandResult
+from ...core.timeutil import iso_from_epoch_seconds as _iso_from_epoch, utc_now_iso as _iso_now_utc
+from .moodle_html import extend_dict_candidates, table_col_index, unwrap_moodle_ajax_data as _unwrap_moodle_ajax_data
 from .auth import AuthService, extract_sesskey, looks_logged_out_html, looks_login_url
 from .config import KlmsConfig, abs_url, load_config
 from .courses import (
@@ -73,19 +75,6 @@ def _parse_datetime_guess(raw: str) -> str | None:
         except ValueError:
             continue
     return None
-
-
-def _iso_from_epoch(epoch: float | int | None) -> str | None:
-    if not isinstance(epoch, (int, float)):
-        return None
-    try:
-        return datetime.fromtimestamp(float(epoch), tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    except Exception:
-        return None
-
-
-def _iso_now_utc() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _epoch_from_iso(value: str | None) -> float | None:
@@ -198,18 +187,12 @@ def _extract_assignment_rows_from_calendar_data(
 ) -> list[Assignment]:
     candidates: list[dict[str, Any]] = []
 
-    def push_list(items: Any) -> None:
-        if isinstance(items, list):
-            for item in items:
-                if isinstance(item, dict):
-                    candidates.append(item)
-
     if isinstance(data, dict):
-        push_list(data.get("events"))
-        push_list(data.get("data"))
-        push_list(data.get("items"))
+        extend_dict_candidates(candidates, data.get("events"))
+        extend_dict_candidates(candidates, data.get("data"))
+        extend_dict_candidates(candidates, data.get("items"))
     elif isinstance(data, list):
-        push_list(data)
+        extend_dict_candidates(candidates, data)
 
     assignments: list[Assignment] = []
     for row in candidates:
@@ -366,15 +349,8 @@ def _extract_assignments_from_index_html(
     headers, table = found
     headers_norm = [header.lower() for header in headers]
 
-    def col_index(*needles: str) -> int | None:
-        for needle in needles:
-            for index, header in enumerate(headers_norm):
-                if needle in header:
-                    return index
-        return None
-
-    name_i = col_index("assignment", "과제", "과제명", "name", "제목") or 0
-    due_i = col_index("due", "마감", "기한", "종료")
+    name_i = table_col_index(headers_norm, "assignment", "과제", "과제명", "name", "제목") or 0
+    due_i = table_col_index(headers_norm, "due", "마감", "기한", "종료")
     rows = table.find_all("tr")
     if rows and rows[0].find_all("th"):
         rows = rows[1:]
@@ -814,7 +790,7 @@ class AssignmentService:
                         response_text = str(result or "")
                     finally:
                         page.close()
-                data = self._unwrap_moodle_ajax_data(response_text)
+                data = _unwrap_moodle_ajax_data(response_text)
                 if data is None:
                     continue
                 assignments = _extract_assignment_rows_from_calendar_data(
@@ -901,18 +877,6 @@ class AssignmentService:
             include_past=include_past,
         )
 
-    @staticmethod
-    def _unwrap_moodle_ajax_data(text: str) -> Any | None:
-        try:
-            payload = json.loads(text)
-        except Exception:
-            return None
-        if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
-            return None
-        first = payload[0]
-        if bool(first.get("error")):
-            return None
-        return first.get("data")
 
 
 def _looks_like_attachment_url(url: str) -> bool:

@@ -1,18 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import textwrap
 
 from ..core.distribution import discover_distribution_info
 from ..core.system_registry import default_registry
-
-
-class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
-    pass
-
-
-def _dedent(text: str) -> str:
-    return textwrap.dedent(text).strip()
+from .help_format import HelpFormatter, dedent as _dedent
 
 
 def build_parser() -> argparse.ArgumentParser:

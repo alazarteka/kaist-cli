@@ -1,19 +1,12 @@
 from __future__ import annotations
 
 import argparse
-import textwrap
 from typing import Any
 
+from ...cli.help_format import HelpFormatter as _HelpFormatter
+from ...cli.help_format import dedent as _dedent
 from ...core.contracts import SystemAdapter
 from ...core.updater import check_for_update, perform_self_update
-
-
-class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
-    pass
-
-
-def _dedent(text: str) -> str:
-    return textwrap.dedent(text).strip()
 
 
 class UpdateAdapter(SystemAdapter):

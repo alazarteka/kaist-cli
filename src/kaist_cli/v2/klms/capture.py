@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -10,14 +9,16 @@ from urllib.parse import quote, urlparse
 from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 
 from ..contracts import CommandResult
+from ...core.timeutil import utc_now_iso as _utc_now_iso
 from .auth import AuthService, extract_sesskey
 from .config import KlmsConfig, abs_url, load_config
 from .discovery import map_discovery_report, summarize_json_shape
+from .moodle_html import (
+    discover_notice_board_ids_from_course_page as _discover_notice_board_ids_from_course_page,
+    extend_dict_candidates,
+    unwrap_moodle_ajax_data as _unwrap_moodle_ajax_data,
+)
 from .paths import KlmsPaths, chmod_best_effort, ensure_private_dirs
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _same_origin(url_a: str, url_b: str) -> bool:
@@ -42,43 +43,6 @@ def _extract_course_ids_from_dashboard(html: str, *, configured_ids: tuple[str, 
     out: list[str] = [str(course_id).strip() for course_id in configured_ids if str(course_id).strip()]
     out.extend(re.findall(r"/course/view\.php\?id=(\d+)", html))
     return _dedupe_strings(out)[: max(0, limit)]
-
-
-def _discover_notice_board_ids_from_course_page(html: str) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    found: list[str] = []
-
-    def in_header_like_region(element: Any) -> bool:
-        current = element
-        for _ in range(12):
-            if not current or not getattr(current, "attrs", None):
-                break
-            classes = " ".join(current.attrs.get("class", [])).lower()
-            if any(
-                marker in classes
-                for marker in ("ks-header", "all-menu", "tooltip-layer", "breadcrumb", "navbar", "footer", "menu")
-            ):
-                return True
-            current = current.parent
-        return False
-
-    for anchor in soup.find_all("a", href=True):
-        href = str(anchor["href"])
-        if "mod/courseboard/view.php" not in href:
-            continue
-        match = re.search(r"[?&]id=(\d+)", href)
-        if not match:
-            continue
-        board_id = match.group(1)
-        label = anchor.get_text(" ", strip=True).lower()
-        if anchor.get("target") == "_blank" or in_header_like_region(anchor):
-            continue
-        if board_id in {"32044", "32045", "32047", "531193"}:
-            continue
-        if label in {"notice", "guide to klms", "q&a", "faq"}:
-            continue
-        found.append(board_id)
-    return _dedupe_strings(found)
 
 
 def _extract_surface_links(html: str, *, base_url: str, per_pattern_limit: int) -> list[str]:
@@ -113,19 +77,6 @@ def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
     chmod_best_effort(path, 0o600)
 
 
-def _unwrap_moodle_ajax_data(text: str) -> Any | None:
-    try:
-        payload = json.loads(text)
-    except Exception:
-        return None
-    if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
-        return None
-    first = payload[0]
-    if bool(first.get("error")):
-        return None
-    return first.get("data")
-
-
 def _moodle_ajax_state(text: str) -> str:
     try:
         payload = json.loads(text)
@@ -144,18 +95,12 @@ def _moodle_ajax_state(text: str) -> str:
 def _extract_assignment_rows_from_calendar_data(data: Any, *, base_url: str) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
 
-    def push_list(items: Any) -> None:
-        if isinstance(items, list):
-            for item in items:
-                if isinstance(item, dict):
-                    candidates.append(item)
-
     if isinstance(data, dict):
-        push_list(data.get("events"))
-        push_list(data.get("data"))
-        push_list(data.get("items"))
+        extend_dict_candidates(candidates, data.get("events"))
+        extend_dict_candidates(candidates, data.get("data"))
+        extend_dict_candidates(candidates, data.get("items"))
     elif isinstance(data, list):
-        push_list(data)
+        extend_dict_candidates(candidates, data)
 
     out: list[dict[str, Any]] = []
     for row in candidates:

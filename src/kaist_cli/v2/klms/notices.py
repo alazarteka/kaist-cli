@@ -9,6 +9,11 @@ from urllib.parse import parse_qs, urlparse
 from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 
 from ..contracts import CommandError, CommandResult
+from ...core.timeutil import cache_is_fresh_enough as _cache_is_fresh_enough, iso_from_epoch_seconds as _iso_from_epoch_seconds
+from .moodle_html import (
+    discover_notice_board_ids_from_course_page as _discover_notice_board_ids_from_course_page,
+    table_col_index,
+)
 from .auth import AuthService, looks_logged_out_html, looks_login_url
 from .cache import list_cache_entries, load_cache_entry, save_cache_value
 from .assignments import _attachment_filename_from_url, _looks_like_attachment_url, _parse_datetime_guess
@@ -132,38 +137,6 @@ def _course_meta_map_for_request(
     }
 
 
-def _discover_notice_board_ids_from_course_page(html: str) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    found: list[str] = []
-
-    def in_header_like_region(element: Any) -> bool:
-        current = element
-        for _ in range(12):
-            if not current or not getattr(current, "attrs", None):
-                break
-            classes = " ".join(current.attrs.get("class", [])).lower()
-            if any(marker in classes for marker in ("ks-header", "all-menu", "tooltip-layer", "breadcrumb", "navbar", "footer", "menu")):
-                return True
-            current = current.parent
-        return False
-
-    for anchor in soup.find_all("a", href=True):
-        href = str(anchor["href"])
-        if "mod/courseboard/view.php" not in href:
-            continue
-        match = re.search(r"[?&]id=(\d+)", href)
-        if not match:
-            continue
-        board_id = match.group(1)
-        label = _norm_text(anchor.get_text(" ", strip=True)).lower()
-        if anchor.get("target") == "_blank" or in_header_like_region(anchor):
-            continue
-        if board_id in {"32044", "32045", "32047", "531193"}:
-            continue
-        if label in {"notice", "guide to klms", "q&a", "faq"}:
-            continue
-        found.append(board_id)
-    return list(dict.fromkeys(found))
 
 
 def _extract_pagination_pages(soup: BeautifulSoup) -> list[int]:
@@ -235,15 +208,8 @@ def _parse_notice_items_from_soup(
         headers, table = found
         headers_norm = [header.lower() for header in headers]
 
-        def col_index(*needles: str) -> int | None:
-            for needle in needles:
-                for index, header in enumerate(headers_norm):
-                    if needle in header:
-                        return index
-            return None
-
-        title_i = col_index("title", "제목", "subject") or 0
-        date_i = col_index("date", "작성", "등록", "posted", "일자")
+        title_i = table_col_index(headers_norm, "title", "제목", "subject") or 0
+        date_i = table_col_index(headers_norm, "date", "작성", "등록", "posted", "일자")
         rows = table.find_all("tr")
         if rows and rows[0].find_all("th"):
             rows = rows[1:]
@@ -618,27 +584,6 @@ def _collect_notice_attachments(soup: BeautifulSoup, *, base_url: str) -> tuple[
             }
         )
     return tuple(out)
-
-
-def _iso_from_epoch_seconds(value: float | int | None) -> str | None:
-    if not isinstance(value, (int, float)):
-        return None
-    try:
-        return datetime.fromtimestamp(float(value), tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    except Exception:
-        return None
-
-
-def _cache_is_fresh_enough(entry: dict[str, Any] | None, *, max_age_seconds: int = 3600) -> bool:
-    if not isinstance(entry, dict):
-        return False
-    age_seconds = entry.get("age_seconds")
-    if isinstance(age_seconds, (int, float)):
-        return float(age_seconds) <= float(max_age_seconds)
-    stored_at = entry.get("stored_at")
-    if isinstance(stored_at, (int, float)):
-        return (datetime.now(timezone.utc).timestamp() - float(stored_at)) <= float(max_age_seconds)
-    return False
 
 
 def _finalize_notice_items(items: list[Notice], *, since_iso: str | None, limit: int | None) -> list[Notice]:
