@@ -29,10 +29,18 @@ from kaist_cli.v2.klms import auth as auth_module
 from kaist_cli.v2.klms import auth_browser as auth_browser_module
 from kaist_cli.v2.klms import auth_otp as auth_otp_module
 from kaist_cli.v2.klms import auth_sso as auth_sso_module
+from kaist_cli.v2.klms import cache as cache_module
 from kaist_cli.v2.klms import secrets as secrets_module
 from kaist_cli.cli.output import emit_text
+from kaist_cli.core.state_store import file_lock
 from kaist_cli.v2.contracts import CommandError, CommandResult
-from kaist_cli.v2.klms.cache import load_cache_entry, load_cache_value, save_cache_value
+from kaist_cli.v2.klms.cache import (
+    clear_cache_entries,
+    list_cache_entries,
+    load_cache_entry,
+    load_cache_value,
+    save_cache_value,
+)
 from kaist_cli.v2.klms import dashboard as dashboard_module
 from kaist_cli.v2.klms.auth_session import clear_auth_session, load_auth_session, save_auth_session
 from kaist_cli.v2.klms.auth import AuthService
@@ -95,6 +103,220 @@ def test_cache_round_trip(tmp_path: Path) -> None:
         save_cache_value(paths, "notice-board-ids::test", ["1", "2"], ttl_seconds=60)
         assert load_cache_value(paths, "notice-board-ids::test") == ["1", "2"]
     finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+
+def test_cache_read_of_absent_home_is_non_mutating(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        assert not paths.home_root.exists()
+
+        assert load_cache_value(paths, "missing") is None
+        assert list_cache_entries(paths) == {}
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert not paths.home_root.exists()
+    assert not paths.private_root.exists()
+    assert not paths.cache_path.exists()
+
+
+def test_cache_save_calculates_expiry_inside_mutation(monkeypatch) -> None:
+    paths = resolve_paths()
+    time_calls: list[float] = []
+
+    def fake_time() -> float:
+        time_calls.append(123.0)
+        return 123.0
+
+    def fake_update(_paths: object, *, updater) -> None:  # type: ignore[no-untyped-def]
+        assert time_calls == []
+        entries: dict[str, object] = {}
+        updater(entries)
+        assert entries == {
+            "timing::entry": {
+                "stored_at": 123.0,
+                "expires_at": 183.0,
+                "value": {"ok": True},
+            }
+        }
+
+    monkeypatch.setattr(cache_module.time, "time", fake_time)
+    monkeypatch.setattr(cache_module, "_update_cache_entries", fake_update)
+
+    save_cache_value(paths, "timing::entry", {"ok": True}, ttl_seconds=60)
+    assert time_calls == [123.0]
+
+
+def test_cache_reads_legacy_document_without_mutating_and_migrates_on_save(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        paths.private_root.mkdir(parents=True, exist_ok=True)
+        legacy_text = json.dumps(
+            {
+                "entries": {
+                    "legacy::entry": {
+                        "stored_at": 1.0,
+                        "expires_at": time.time() + 60,
+                        "value": ["legacy"],
+                    }
+                }
+            }
+        )
+        paths.cache_path.write_text(legacy_text, encoding="utf-8")
+
+        assert load_cache_value(paths, "legacy::entry") == ["legacy"]
+        assert paths.cache_path.read_text(encoding="utf-8") == legacy_text
+
+        save_cache_value(paths, "fresh::entry", ["fresh"], ttl_seconds=60)
+        migrated = json.loads(paths.cache_path.read_text(encoding="utf-8"))
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert migrated["version"] == 1
+    assert migrated["entries"]["legacy::entry"]["value"] == ["legacy"]
+    assert migrated["entries"]["fresh::entry"]["value"] == ["fresh"]
+    assert paths.cache_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_cache_corrupt_read_does_not_mutate_and_save_repairs(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        paths.private_root.mkdir(parents=True, exist_ok=True)
+        corrupt_text = '{"entries": '
+        paths.cache_path.write_text(corrupt_text, encoding="utf-8")
+
+        assert load_cache_value(paths, "missing") is None
+        assert list_cache_entries(paths) == {}
+        assert paths.cache_path.read_text(encoding="utf-8") == corrupt_text
+
+        save_cache_value(paths, "repaired::entry", {"ok": True}, ttl_seconds=60)
+        repaired = json.loads(paths.cache_path.read_text(encoding="utf-8"))
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert repaired["version"] == 1
+    assert set(repaired["entries"]) == {"repaired::entry"}
+    assert repaired["entries"]["repaired::entry"]["value"] == {"ok": True}
+
+
+@pytest.mark.parametrize("version", [0, -1, True, False, 1.0, 0.5, 2, "future"])
+def test_cache_future_or_invalid_version_is_a_read_only_miss(tmp_path: Path, version: object) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        paths.private_root.mkdir(parents=True, exist_ok=True)
+        cache_text = json.dumps(
+            {
+                "version": version,
+                "entries": {
+                    "future::entry": {
+                        "stored_at": 1.0,
+                        "expires_at": time.time() + 60,
+                        "value": ["future"],
+                    }
+                },
+            }
+        )
+        paths.cache_path.write_text(cache_text, encoding="utf-8")
+
+        assert load_cache_value(paths, "future::entry") is None
+        assert list_cache_entries(paths) == {}
+        save_cache_value(paths, "fresh::entry", ["fresh"], ttl_seconds=60)
+        assert clear_cache_entries(paths, prefixes=("future::",)) == 0
+        assert paths.cache_path.read_text(encoding="utf-8") == cache_text
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+
+def test_cache_save_waits_for_process_lock(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    child: subprocess.Popen[str] | None = None
+    try:
+        paths = resolve_paths()
+        ready_path = tmp_path / "cache-child-ready"
+        go_path = tmp_path / "cache-child-go"
+        attempt_path = tmp_path / "cache-child-attempt"
+        done_path = tmp_path / "cache-child-done"
+        script = """
+from pathlib import Path
+import os
+import time
+
+from kaist_cli.v2.klms.cache import save_cache_value
+from kaist_cli.v2.klms.paths import resolve_paths
+
+ready_path = Path(os.environ["CACHE_READY_PATH"])
+go_path = Path(os.environ["CACHE_GO_PATH"])
+attempt_path = Path(os.environ["CACHE_ATTEMPT_PATH"])
+done_path = Path(os.environ["CACHE_DONE_PATH"])
+ready_path.write_text("ready", encoding="utf-8")
+while not go_path.exists():
+    time.sleep(0.01)
+attempt_path.write_text("attempt", encoding="utf-8")
+save_cache_value(resolve_paths(), "child::entry", {"source": "child"}, ttl_seconds=60)
+done_path.write_text("done", encoding="utf-8")
+"""
+        child_env = os.environ.copy()
+        child_env["PYTHONPATH"] = str(ROOT / "src")
+        child_env["CACHE_READY_PATH"] = str(ready_path)
+        child_env["CACHE_GO_PATH"] = str(go_path)
+        child_env["CACHE_ATTEMPT_PATH"] = str(attempt_path)
+        child_env["CACHE_DONE_PATH"] = str(done_path)
+        child = subprocess.Popen(
+            [sys.executable, "-c", script],
+            cwd=ROOT,
+            env=child_env,
+            text=True,
+            stderr=subprocess.PIPE,
+        )
+
+        def wait_for(path: Path) -> bool:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if path.exists():
+                    return True
+                time.sleep(0.01)
+            return path.exists()
+
+        lock_path = paths.cache_path.with_suffix(paths.cache_path.suffix + ".lock")
+        with file_lock(lock_path):
+            assert wait_for(ready_path)
+            go_path.touch()
+            assert wait_for(attempt_path)
+            with pytest.raises(subprocess.TimeoutExpired):
+                child.wait(timeout=0.2)
+
+        assert child.wait(timeout=3.0) == 0, child.stderr.read()
+        assert done_path.exists()
+        assert load_cache_value(paths, "child::entry") == {"source": "child"}
+    finally:
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.wait()
         if old_home is None:
             os.environ.pop("KAIST_CLI_HOME", None)
         else:
@@ -459,4 +681,3 @@ def test_sync_reset_clears_v2_klms_cache_entries(tmp_path: Path) -> None:
     assert payload["data"]["removed_entries"] == 2
     assert payload["data"]["providers"]["notices"]["entry_count"] == 0
     assert payload["data"]["providers"]["files"]["entry_count"] == 0
-
