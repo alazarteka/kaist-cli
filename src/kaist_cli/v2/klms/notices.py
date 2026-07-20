@@ -9,7 +9,10 @@ from urllib.parse import parse_qs, urlparse
 from bs4 import BeautifulSoup, Tag  # type: ignore[import-untyped]
 
 from ..contracts import CommandError, CommandResult
-from ...core.timeutil import iso_from_epoch_seconds as _iso_from_epoch_seconds
+from ...core.timeutil import (
+    cache_is_fresh_enough as _cache_is_fresh_enough,
+    iso_from_epoch_seconds as _iso_from_epoch_seconds,
+)
 from .moodle_html import (
     discover_notice_board_ids_from_course_page as _discover_notice_board_ids_from_course_page,
     table_col_index,
@@ -35,9 +38,7 @@ from .file_metadata import file_extension, guess_mime_type
 from .models import Notice
 from .paths import KlmsPaths
 from .provider_state import (
-    CachedProviderSnapshot,
     ProviderLoad,
-    load_cached_or_refresh,
     provider_warning as _provider_warning,
     run_list_authenticated,
 )
@@ -160,12 +161,13 @@ def _extract_pagination_pages(soup: BeautifulSoup) -> list[int]:
 
 def _plan_notice_page_sequence(first_soup: BeautifulSoup, *, max_pages: int) -> tuple[int, list[int]]:
     pages = [page for page in _extract_pagination_pages(first_soup) if page >= 0]
-    if pages:
-        first_page_index = 0 if 0 in pages else min(pages)
-        sequence = [first_page_index] + [page for page in pages if page != first_page_index]
-    else:
-        first_page_index = 0
-        sequence = [0, 1]
+    # The initial response always came from the no-query board URL, so it is
+    # page 0 even when pagination only links to later explicit pages.  Treat
+    # discovered links as bounds rather than a sparse fetch plan: omitted
+    # intermediate links must not make a canonical cache entry incomplete.
+    first_page_index = 0
+    highest_page = max(pages) if pages else 1
+    sequence = list(range(first_page_index, highest_page + 1))
     return first_page_index, sequence[: max(0, max_pages)]
 
 
@@ -741,7 +743,7 @@ class NoticeService:
     def _notice_board_cache_key(config: KlmsConfig, course_ids: list[str]) -> str:
         return "::".join(
             [
-                "notice-board-map-v2",
+                "notice-board-map-v3",
                 config.base_url.rstrip("/"),
                 config.dashboard_path,
                 ",".join(course_ids),
@@ -750,7 +752,7 @@ class NoticeService:
 
     @staticmethod
     def _fallback_notice_board_ids_from_cache(paths: KlmsPaths, config: KlmsConfig) -> list[str]:
-        prefix = f"notice-board-map-v2::{config.base_url.rstrip('/')}::{config.dashboard_path}::"
+        prefix = f"notice-board-map-v3::{config.base_url.rstrip('/')}::{config.dashboard_path}::"
         candidates = list_cache_entries(paths, prefixes=(prefix,))
         if not candidates:
             return []
@@ -786,9 +788,21 @@ class NoticeService:
     def _notice_list_cache_key(config: KlmsConfig, board_ids: list[str], max_pages: int) -> str:
         return "::".join(
             [
-                "notice-list-v2",
+                "notice-list-v3",
                 config.base_url.rstrip("/"),
                 str(max_pages),
+                ",".join(board_ids),
+            ]
+        )
+
+    @staticmethod
+    def _notice_list_snapshot_cache_key(config: KlmsConfig, board_ids: list[str], max_pages: int, limit: int) -> str:
+        return "::".join(
+            [
+                "notice-list-snapshot-v1",
+                config.base_url.rstrip("/"),
+                str(max_pages),
+                str(max(0, int(limit))),
                 ",".join(board_ids),
             ]
         )
@@ -805,7 +819,7 @@ class NoticeService:
         if exact is not None:
             return exact
 
-        prefix = f"notice-list-v2::{config.base_url.rstrip('/')}::"
+        prefix = f"notice-list-v3::{config.base_url.rstrip('/')}::"
         suffix = f"::{','.join(board_ids)}"
         candidates = list_cache_entries(self._paths, prefixes=(prefix,))
         matches: list[tuple[bool, int, float, dict[str, Any]]] = []
@@ -823,6 +837,43 @@ class NoticeService:
                 continue
             stored_at = float(entry.get("stored_at") or 0.0)
             matches.append((bool(entry.get("stale")), cached_max_pages, -stored_at, entry))
+        if not matches:
+            return None
+        matches.sort(key=lambda item: (item[0], item[1], item[2]))
+        return matches[0][3]
+
+    def _load_notice_snapshot_entry(
+        self,
+        *,
+        config: KlmsConfig,
+        board_ids: list[str],
+        max_pages: int,
+        since_iso: str | None,
+        limit: int | None,
+    ) -> dict[str, Any] | None:
+        if limit is None:
+            return None
+        prefix = f"notice-list-snapshot-v1::{config.base_url.rstrip('/')}::{max_pages}::"
+        suffix = f"::{','.join(board_ids)}"
+        matches: list[tuple[bool, int, float, dict[str, Any]]] = []
+        for key, entry in list_cache_entries(self._paths, prefixes=(prefix,)).items():
+            if not str(key).endswith(suffix):
+                continue
+            parts = str(key).split("::", 4)
+            if len(parts) != 5:
+                continue
+            try:
+                coverage_limit = int(parts[3])
+            except ValueError:
+                continue
+            value = entry.get("value")
+            if coverage_limit < limit or not isinstance(value, dict) or not isinstance(value.get("items"), list):
+                continue
+            snapshot_floor = value.get("since_iso")
+            if snapshot_floor is not None:
+                if not since_iso or str(since_iso).strip() < str(snapshot_floor).strip():
+                    continue
+            matches.append((bool(entry.get("stale")), coverage_limit, -float(entry.get("stored_at") or 0.0), entry))
         if not matches:
             return None
         matches.sort(key=lambda item: (item[0], item[1], item[2]))
@@ -917,10 +968,111 @@ class NoticeService:
         cache_key = self._notice_list_cache_key(config, board_ids, max_pages)
         cache_entry = self._load_notice_cache_entry(config=config, board_ids=board_ids, max_pages=max_pages)
         cached_rows = cache_entry.get("value") if isinstance(cache_entry, dict) else None
-        cached_items = [Notice(**row) for row in cached_rows if isinstance(row, dict)] if isinstance(cached_rows, list) else []
+        cache_has_list = isinstance(cached_rows, list)
+        cached_items = [Notice(**row) for row in cached_rows if isinstance(row, dict)] if cache_has_list else []
         cached_filtered = _finalize_notice_items(cached_items, since_iso=since_iso, limit=limit)
+        snapshot_entry = self._load_notice_snapshot_entry(
+            config=config,
+            board_ids=board_ids,
+            max_pages=max_pages,
+            since_iso=since_iso,
+            limit=limit,
+        )
+        snapshot_value = snapshot_entry.get("value") if isinstance(snapshot_entry, dict) else None
+        snapshot_rows = snapshot_value.get("items") if isinstance(snapshot_value, dict) else None
+        snapshot_has_list = isinstance(snapshot_rows, list)
+        snapshot_items = [Notice(**row) for row in snapshot_rows if isinstance(row, dict)] if snapshot_has_list else []
+        snapshot_filtered = _finalize_notice_items(snapshot_items, since_iso=since_iso, limit=limit)
 
-        def refresh() -> tuple[list[dict[str, Any]], Any, Any]:
+        def cached_load(
+            entry: dict[str, Any],
+            items: list[Notice],
+            *,
+            bounded: bool,
+            refresh_attempted: bool,
+            warnings: tuple[dict[str, Any], ...] = (),
+        ) -> ProviderLoad:
+            return ProviderLoad(
+                items=[item.to_dict() for item in items],
+                source="html",
+                capability="partial",
+                freshness_mode="bounded_cache" if bounded else "cache",
+                cache_hit=True,
+                stale=bool(entry.get("stale")),
+                fetched_at=_iso_from_epoch_seconds(entry.get("stored_at")),
+                expires_at=_iso_from_epoch_seconds(entry.get("expires_at")),
+                refresh_attempted=refresh_attempted,
+                ok=True,
+                warnings=warnings,
+                bounded_cache=bounded,
+            )
+
+        def fallback_warnings(code: str, message: str, *, error: str | None = None, bounded: bool, entry: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+            warnings: list[dict[str, Any]] = []
+            if bool(entry.get("stale")):
+                warnings.append(_provider_warning("STALE_CACHE", "Returning stale notice cache because live refresh could not finish."))
+            if bounded:
+                warnings.append(
+                    _provider_warning(
+                        "BOUNDED_CACHE",
+                        "Returning a bounded notice snapshot; it may omit notices outside the requested limit.",
+                    )
+                )
+            extra = {"error": error} if error is not None else {}
+            warnings.append(_provider_warning(code, message, **extra))
+            return tuple(warnings)
+
+        cache_candidates = (
+            (cache_entry, cached_filtered, False) if cache_has_list else None,
+            (snapshot_entry, snapshot_filtered, True) if snapshot_has_list else None,
+        )
+        if prefer_cache:
+            for candidate in cache_candidates:
+                if candidate is None:
+                    continue
+                entry, items, bounded = candidate
+                if not bool(entry.get("stale")) or _cache_is_fresh_enough(entry):
+                    warnings = (
+                        (_provider_warning("BOUNDED_CACHE", "Returning a bounded notice snapshot; it may omit notices outside the requested limit."),)
+                        if bounded
+                        else ()
+                    )
+                    return cached_load(entry, items, bounded=bounded, refresh_attempted=False, warnings=warnings)
+
+        fallback_candidate = next((candidate for candidate in cache_candidates if candidate is not None), None)
+
+        if deadline is not None and deadline.hard_expired():
+            if fallback_candidate is not None:
+                entry, items, bounded = fallback_candidate
+                return cached_load(
+                    entry,
+                    items,
+                    bounded=bounded,
+                    refresh_attempted=False,
+                    warnings=fallback_warnings(
+                        "LIVE_REFRESH_TIMEOUT",
+                        "Interactive refresh budget expired before notice refresh started.",
+                        bounded=bounded,
+                        entry=entry,
+                    ),
+                )
+            return ProviderLoad(
+                items=[],
+                source="html",
+                capability="degraded",
+                freshness_mode="live",
+                cache_hit=False,
+                stale=False,
+                fetched_at=None,
+                expires_at=None,
+                refresh_attempted=False,
+                ok=False,
+                warnings=(
+                    _provider_warning("LIVE_REFRESH_TIMEOUT", "Interactive refresh budget expired before notice refresh started."),
+                ),
+            )
+
+        try:
             live_items = self._refresh_notice_items(
                 config=config,
                 auth_mode=auth_mode,
@@ -931,27 +1083,89 @@ class NoticeService:
                 bootstrap=bootstrap,
                 deadline=deadline,
             )
-            live_filtered = _finalize_notice_items(live_items, since_iso=since_iso, limit=limit)
-            return ([item.to_dict() for item in live_filtered], "html", "partial")
-
-        def fresh_timestamps() -> tuple[str | None, str | None]:
-            fresh_entry = load_cache_entry(self._paths, cache_key)
-            return (
-                _iso_from_epoch_seconds((fresh_entry or {}).get("stored_at")),
-                _iso_from_epoch_seconds((fresh_entry or {}).get("expires_at")),
+        except TimeoutError:
+            if fallback_candidate is not None:
+                entry, items, bounded = fallback_candidate
+                return cached_load(
+                    entry,
+                    items,
+                    bounded=bounded,
+                    refresh_attempted=True,
+                    warnings=fallback_warnings(
+                        "LIVE_REFRESH_TIMEOUT",
+                        "Notice refresh exceeded the interactive deadline.",
+                        bounded=bounded,
+                        entry=entry,
+                    ),
+                )
+            return ProviderLoad(
+                items=[],
+                source="html",
+                capability="degraded",
+                freshness_mode="live",
+                cache_hit=False,
+                stale=False,
+                fetched_at=None,
+                expires_at=None,
+                refresh_attempted=True,
+                ok=False,
+                warnings=(
+                    _provider_warning("LIVE_REFRESH_TIMEOUT", "Notice refresh exceeded the interactive deadline."),
+                ),
+            )
+        except CommandError:
+            raise
+        except Exception as exc:
+            if fallback_candidate is not None:
+                entry, items, bounded = fallback_candidate
+                return cached_load(
+                    entry,
+                    items,
+                    bounded=bounded,
+                    refresh_attempted=True,
+                    warnings=fallback_warnings(
+                        "LIVE_REFRESH_FAILED",
+                        "Notice refresh failed; returning cached notice data.",
+                        error=str(exc),
+                        bounded=bounded,
+                        entry=entry,
+                    ),
+                )
+            return ProviderLoad(
+                items=[],
+                source="html",
+                capability="degraded",
+                freshness_mode="live",
+                cache_hit=False,
+                stale=False,
+                fetched_at=None,
+                expires_at=None,
+                refresh_attempted=True,
+                ok=False,
+                warnings=(
+                    _provider_warning("LIVE_REFRESH_FAILED", "Notice refresh failed.", error=str(exc)),
+                ),
             )
 
-        return load_cached_or_refresh(
-            prefer_cache=prefer_cache,
-            deadline=deadline,
-            snapshot=CachedProviderSnapshot(
-                items=[item.to_dict() for item in cached_filtered],
-                cache_entry=cache_entry,
-                source="html",
-            ),
-            refresh=refresh,
-            resource_label="notice",
-            fresh_timestamps=fresh_timestamps,
+        live_filtered = _finalize_notice_items(live_items, since_iso=since_iso, limit=limit)
+        fresh_entry = load_cache_entry(self._paths, cache_key) or self._load_notice_snapshot_entry(
+            config=config,
+            board_ids=board_ids,
+            max_pages=max_pages,
+            since_iso=since_iso,
+            limit=limit,
+        )
+        return ProviderLoad(
+            items=[item.to_dict() for item in live_filtered],
+            source="html",
+            capability="partial",
+            freshness_mode="live",
+            cache_hit=False,
+            stale=False,
+            fetched_at=_iso_from_epoch_seconds((fresh_entry or {}).get("stored_at")),
+            expires_at=_iso_from_epoch_seconds((fresh_entry or {}).get("expires_at")),
+            refresh_attempted=True,
+            ok=True,
         )
 
     def refresh_cache_with_context(
@@ -1386,6 +1600,11 @@ class NoticeService:
         bootstrap: KlmsSessionBootstrap,
         deadline: RefreshDeadline | None,
     ) -> list[Notice]:
+        # Canonical entries represent all requested boards and pages.  A limited
+        # refresh, a missing first-page response, or an incremental early stop is
+        # useful for this call but is not reusable canonical cache data.
+        cacheable = limit is None
+        snapshotable = True
         first_paths = [f"/mod/courseboard/view.php?id={board_id}" for board_id in board_ids]
         first_responses = fetch_html_batch(
             bootstrap.http,
@@ -1405,6 +1624,8 @@ class NoticeService:
         for board_id, first_path in zip(board_ids, first_paths):
             response = first_responses.get(first_path)
             if response is None:
+                cacheable = False
+                snapshotable = False
                 continue
             if looks_login_url(response.url) or looks_logged_out_html(response.text):
                 raise CommandError(
@@ -1416,7 +1637,11 @@ class NoticeService:
                 )
             first_soup = BeautifulSoup(response.text, "html.parser")
             first_page_index, page_sequence = _plan_notice_page_sequence(first_soup, max_pages=max_pages)
-            for page_index in page_sequence:
+            queued_page_indices = set(page_sequence)
+            fetched_page_indices: set[int] = set()
+            while queued_page_indices:
+                page_index = min(queued_page_indices)
+                queued_page_indices.remove(page_index)
                 if deadline is not None and deadline.hard_expired():
                     raise TimeoutError("Interactive notice refresh budget expired.")
                 if page_index == first_page_index:
@@ -1436,6 +1661,15 @@ class NoticeService:
                         )
                     page_html = page_response.text
                 page_soup = BeautifulSoup(page_html, "html.parser")
+                fetched_page_indices.add(page_index)
+                discovered_pages = _extract_pagination_pages(page_soup)
+                if discovered_pages:
+                    highest_page = min(max(discovered_pages), max(0, max_pages - 1))
+                    queued_page_indices.update(
+                        discovered_page
+                        for discovered_page in range(first_page_index, highest_page + 1)
+                        if discovered_page not in fetched_page_indices
+                    )
                 parsed = _parse_notice_items_from_soup(
                     page_soup,
                     board_id=board_id,
@@ -1475,6 +1709,11 @@ class NoticeService:
                 if limit is not None and _matching_notice_count(all_items, since_iso=since_iso) >= limit:
                     break
                 if parsed and not page_has_new_or_changed:
+                    # Pagination markup is not reliable enough to prove that a
+                    # requested multi-page scope ended here.  Preserve the
+                    # incremental stop, but never label it as canonical data.
+                    if max_pages > 1:
+                        cacheable = False
                     break
             if limit is not None and _matching_notice_count(all_items, since_iso=since_iso) >= limit:
                 break
@@ -1518,7 +1757,23 @@ class NoticeService:
             all_items = updated_items
 
         _persist_notice_store(self._paths, all_items)
-        save_cache_value(self._paths, self._notice_list_cache_key(config, board_ids, max_pages), [item.to_dict() for item in all_items], ttl_seconds=NOTICE_LIST_TTL_SECONDS)
+        if cacheable:
+            save_cache_value(
+                self._paths,
+                self._notice_list_cache_key(config, board_ids, max_pages),
+                [item.to_dict() for item in all_items],
+                ttl_seconds=NOTICE_LIST_TTL_SECONDS,
+            )
+        elif snapshotable and limit is not None:
+            save_cache_value(
+                self._paths,
+                self._notice_list_snapshot_cache_key(config, board_ids, max_pages, limit),
+                {
+                    "items": [item.to_dict() for item in all_items],
+                    "since_iso": str(since_iso).strip() if since_iso else None,
+                },
+                ttl_seconds=NOTICE_LIST_TTL_SECONDS,
+            )
         return all_items
 
     def _resolve_notice_board_map(
@@ -1600,6 +1855,7 @@ class NoticeService:
             return {}
 
         board_map: dict[str, list[str]] = {}
+        cacheable = True
         paths = [f"/course/view.php?id={selected_course_id}&section=0" for selected_course_id in course_ids]
         responses = fetch_html_batch(
             bootstrap.http,
@@ -1610,6 +1866,7 @@ class NoticeService:
         for selected_course_id, path in zip(course_ids, paths):
             response = responses.get(path)
             if response is None:
+                cacheable = False
                 continue
             if looks_login_url(response.url) or looks_logged_out_html(response.text):
                 raise CommandError(
@@ -1623,7 +1880,8 @@ class NoticeService:
             if board_ids:
                 board_map[selected_course_id] = board_ids
         if any(board_map.values()):
-            save_cache_value(self._paths, cache_key, board_map, ttl_seconds=NOTICE_BOARD_TTL_SECONDS)
+            if cacheable:
+                save_cache_value(self._paths, cache_key, board_map, ttl_seconds=NOTICE_BOARD_TTL_SECONDS)
             return board_map
         if allow_stale_cache and cached_board_ids:
             return {

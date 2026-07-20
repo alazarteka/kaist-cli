@@ -46,7 +46,7 @@ from kaist_cli.v2.klms.discovery import load_recent_courses_args, map_discovery_
 from kaist_cli.v2.klms.files import FileService, _extract_file_items_from_course_contents, _extract_file_items_from_html, _normalize_file_item_metadata, _pull_subdir_for_item, _sanitize_relpath, _synthesize_file_item_from_url, _unwrap_moodle_ajax_payload
 from kaist_cli.v2.klms.media_recency import load_media_recency, observe_files, observe_videos
 from kaist_cli.v2.klms.models import Assignment, Course, FileItem, Notice, Video
-from kaist_cli.v2.klms.notices import NoticeService, _discover_notice_board_ids_from_course_page, _extract_course_ids_from_dashboard, _parse_notice_detail_from_html, _parse_notice_items_from_soup
+from kaist_cli.v2.klms.notices import NoticeService, _discover_notice_board_ids_from_course_page, _extract_course_ids_from_dashboard, _parse_notice_detail_from_html, _parse_notice_items_from_soup, _plan_notice_page_sequence
 from kaist_cli.v2.klms.paths import resolve_paths
 from kaist_cli.v2.klms.provider_state import ProviderLoad
 from kaist_cli.v2.klms.request import RequestService
@@ -815,3 +815,404 @@ def test_notice_board_resolution_falls_back_to_recent_cached_board_map(tmp_path:
 
     assert resolved == ["838536", "947531"]
 
+def test_notice_board_map_with_missing_course_response_preserves_canonical_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    paths = resolve_paths()
+    config = load_config(paths)
+    service = NoticeService(paths, AuthService(paths))
+    course_ids = ["180871", "178434"]
+    cache_key = service._notice_board_cache_key(config, course_ids)
+    canonical_map = {"180871": ["838536"], "178434": ["947531"]}
+    save_cache_value(paths, cache_key, canonical_map, ttl_seconds=60)
+    cache_payload = json.loads(paths.cache_path.read_text(encoding="utf-8"))
+    cache_payload["entries"][cache_key]["expires_at"] = 0
+    paths.cache_path.write_text(json.dumps(cache_payload), encoding="utf-8")
+    before = load_cache_entry(paths, cache_key)
+    assert before is not None
+
+    dashboard_html = """
+    <html><body>
+      <a href="/course/view.php?id=180871">Introduction to Algorithms(CS.30000_2026_1)</a>
+      <a href="/course/view.php?id=178434">Operating Systems and Lab(CS.34100_2026_1)</a>
+    </body></html>
+    """
+    course_page = "<a href=\"/mod/courseboard/view.php?id=999001\">Course Board</a>"
+    response = SimpleNamespace(url="https://klms.kaist.ac.kr/course/view.php?id=180871", text=course_page, via="http")
+
+    def partial_batch(_http: object, request_paths: list[str], **kwargs: object) -> dict[str, SimpleNamespace]:  # noqa: ARG001
+        assert request_paths == [
+            "/course/view.php?id=180871&section=0",
+            "/course/view.php?id=178434&section=0",
+        ]
+        return {request_paths[0]: response}
+
+    monkeypatch.setattr("kaist_cli.v2.klms.notices.fetch_html_batch", partial_batch)
+    board_map = service._resolve_notice_board_map(
+        context=object(),
+        config=config,
+        explicit_board_id=None,
+        bootstrap=SimpleNamespace(dashboard_html=dashboard_html, http=object()),
+        allow_stale_cache=False,
+    )
+
+    after = load_cache_entry(paths, cache_key)
+    assert board_map == {"180871": ["999001"]}
+    assert after is not None
+    assert after["value"] == canonical_map
+    assert after["stored_at"] == before["stored_at"]
+
+def test_notice_board_map_fallback_ignores_v2_entries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    paths = resolve_paths()
+    config = load_config(paths)
+    service = NoticeService(paths, AuthService(paths))
+    canonical_key = service._notice_board_cache_key(config, ["180871"])
+    legacy_key = canonical_key.replace("notice-board-map-v3", "notice-board-map-v2", 1)
+    save_cache_value(paths, legacy_key, {"180871": ["legacy-board"]}, ttl_seconds=60)
+
+    assert service._fallback_notice_board_ids_from_cache(paths, config) == []
+
+    save_cache_value(paths, canonical_key, {"180871": ["canonical-board"]}, ttl_seconds=60)
+    assert service._fallback_notice_board_ids_from_cache(paths, config) == ["canonical-board"]
+
+def test_notice_refresh_fetches_page_one_linked_from_default_page_and_caches_complete_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    paths = resolve_paths()
+    config = load_config(paths)
+    service = NoticeService(paths, AuthService(paths))
+    board_id = "838536"
+    first_path = f"/mod/courseboard/view.php?id={board_id}"
+    next_path = f"{first_path}&page=1"
+    first_html = """
+    <table>
+      <tr><th>Title</th><th>Date</th></tr>
+      <tr><td><a href="/mod/courseboard/article.php?id=838536&bwid=1">New notice</a></td><td>2026-03-03</td></tr>
+    </table>
+    <a href="/mod/courseboard/view.php?id=838536&page=1">Older</a>
+    """
+    second_html = """
+    <table>
+      <tr><th>Title</th><th>Date</th></tr>
+      <tr><td><a href="/mod/courseboard/article.php?id=838536&bwid=2">Older notice</a></td><td>2026-03-02</td></tr>
+    </table>
+    """
+    requested_paths: list[str] = []
+
+    class FakeHttp:
+        def get_html(self, path: str, *, timeout_seconds: float = 20.0, context: Any | None = None):  # type: ignore[no-untyped-def]  # noqa: ARG002
+            requested_paths.append(path)
+            assert path == next_path
+            return SimpleNamespace(url=f"https://klms.kaist.ac.kr{path}", text=second_html, via="http")
+
+    first_response = SimpleNamespace(url=f"https://klms.kaist.ac.kr{first_path}", text=first_html, via="http")
+    monkeypatch.setattr(
+        "kaist_cli.v2.klms.notices.fetch_html_batch",
+        lambda _http, paths, **kwargs: {path: first_response for path in paths},
+    )
+    monkeypatch.setattr("kaist_cli.v2.klms.notices._enrich_notice_items_from_detail", lambda items, **kwargs: items)
+
+    notices = service._refresh_notice_items(
+        config=config,
+        auth_mode="profile",
+        board_ids=[board_id],
+        max_pages=2,
+        since_iso=None,
+        limit=None,
+        bootstrap=SimpleNamespace(http=FakeHttp()),
+        deadline=None,
+    )
+
+    assert requested_paths == [next_path]
+    assert [notice.id for notice in notices] == ["1", "2"]
+    cached_rows = load_cache_value(paths, service._notice_list_cache_key(config, [board_id], 2))
+    assert isinstance(cached_rows, list)
+    assert [row["id"] for row in cached_rows] == ["1", "2"]
+
+def test_notice_page_plan_fills_gaps_between_discovered_page_links() -> None:
+    soup = BeautifulSoup(
+        """
+        <a href="/mod/courseboard/view.php?id=838536&page=0">1</a>
+        <a href="/mod/courseboard/view.php?id=838536&page=2">3</a>
+        """,
+        "html.parser",
+    )
+
+    assert _plan_notice_page_sequence(soup, max_pages=3) == (0, [0, 1, 2])
+
+def test_notice_refresh_discovers_pagination_chain_before_caching_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    paths = resolve_paths()
+    config = load_config(paths)
+    service = NoticeService(paths, AuthService(paths))
+    board_id = "838536"
+    first_path = f"/mod/courseboard/view.php?id={board_id}"
+    page_one_path = f"{first_path}&page=1"
+    page_two_path = f"{first_path}&page=2"
+    page_html = {
+        first_path: """
+        <table><tr><th>Title</th><th>Date</th></tr>
+          <tr><td><a href="/mod/courseboard/article.php?id=838536&bwid=1">Page zero</a></td><td>2026-03-03</td></tr>
+        </table>
+        <a href="/mod/courseboard/view.php?id=838536&page=1">Next</a>
+        """,
+        page_one_path: """
+        <table><tr><th>Title</th><th>Date</th></tr>
+          <tr><td><a href="/mod/courseboard/article.php?id=838536&bwid=2">Page one</a></td><td>2026-03-02</td></tr>
+        </table>
+        <a href="/mod/courseboard/view.php?id=838536&page=2">Next</a>
+        """,
+        page_two_path: """
+        <table><tr><th>Title</th><th>Date</th></tr>
+          <tr><td><a href="/mod/courseboard/article.php?id=838536&bwid=3">Page two</a></td><td>2026-03-01</td></tr>
+        </table>
+        """,
+    }
+    requested_paths: list[str] = []
+
+    class FakeHttp:
+        def get_html(self, path: str, *, timeout_seconds: float = 20.0, context: Any | None = None):  # type: ignore[no-untyped-def]  # noqa: ARG002
+            requested_paths.append(path)
+            return SimpleNamespace(url=f"https://klms.kaist.ac.kr{path}", text=page_html[path], via="http")
+
+    first_response = SimpleNamespace(url=f"https://klms.kaist.ac.kr{first_path}", text=page_html[first_path], via="http")
+    monkeypatch.setattr(
+        "kaist_cli.v2.klms.notices.fetch_html_batch",
+        lambda _http, paths, **kwargs: {path: first_response for path in paths},
+    )
+    monkeypatch.setattr("kaist_cli.v2.klms.notices._enrich_notice_items_from_detail", lambda items, **kwargs: items)
+
+    notices = service._refresh_notice_items(
+        config=config,
+        auth_mode="profile",
+        board_ids=[board_id],
+        max_pages=3,
+        since_iso=None,
+        limit=None,
+        bootstrap=SimpleNamespace(http=FakeHttp()),
+        deadline=None,
+    )
+
+    assert requested_paths == [page_one_path, page_two_path]
+    assert [notice.id for notice in notices] == ["1", "2", "3"]
+    cached_rows = load_cache_value(paths, service._notice_list_cache_key(config, [board_id], 3))
+    assert isinstance(cached_rows, list)
+    assert [row["id"] for row in cached_rows] == ["1", "2", "3"]
+
+def test_notice_refresh_caches_short_board_when_max_pages_exceeds_available_pages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    paths = resolve_paths()
+    config = load_config(paths)
+    service = NoticeService(paths, AuthService(paths))
+    board_id = "838536"
+    first_path = f"/mod/courseboard/view.php?id={board_id}"
+    page_one_path = f"{first_path}&page=1"
+    first_html = """
+    <table><tr><th>Title</th><th>Date</th></tr>
+      <tr><td><a href="/mod/courseboard/article.php?id=838536&bwid=1">Only notice</a></td><td>2026-03-03</td></tr>
+    </table>
+    """
+    second_html = "<table><tr><th>Title</th><th>Date</th></tr></table>"
+    requested_paths: list[str] = []
+
+    class FakeHttp:
+        def get_html(self, path: str, *, timeout_seconds: float = 20.0, context: Any | None = None):  # type: ignore[no-untyped-def]  # noqa: ARG002
+            requested_paths.append(path)
+            assert path == page_one_path
+            return SimpleNamespace(url=f"https://klms.kaist.ac.kr{path}", text=second_html, via="http")
+
+    first_response = SimpleNamespace(url=f"https://klms.kaist.ac.kr{first_path}", text=first_html, via="http")
+    monkeypatch.setattr(
+        "kaist_cli.v2.klms.notices.fetch_html_batch",
+        lambda _http, paths, **kwargs: {path: first_response for path in paths},
+    )
+    monkeypatch.setattr("kaist_cli.v2.klms.notices._enrich_notice_items_from_detail", lambda items, **kwargs: items)
+
+    notices = service._refresh_notice_items(
+        config=config,
+        auth_mode="profile",
+        board_ids=[board_id],
+        max_pages=3,
+        since_iso=None,
+        limit=None,
+        bootstrap=SimpleNamespace(http=FakeHttp()),
+        deadline=None,
+    )
+
+    assert requested_paths == [page_one_path]
+    assert [notice.id for notice in notices] == ["1"]
+    cached_rows = load_cache_value(paths, service._notice_list_cache_key(config, [board_id], 3))
+    assert isinstance(cached_rows, list)
+    assert [row["id"] for row in cached_rows] == ["1"]
+
+def test_limited_notice_refresh_cannot_overwrite_canonical_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    paths = resolve_paths()
+    config = load_config(paths)
+    service = NoticeService(paths, AuthService(paths))
+    cache_key = service._notice_list_cache_key(config, ["838536"], 1)
+    original = [{"board_id": "838536", "id": "cached", "title": "Canonical", "url": None, "posted_raw": None, "posted_iso": "2026-03-01T00:00:00Z"}]
+    save_cache_value(paths, cache_key, original, ttl_seconds=60)
+    board_html = """
+    <table>
+      <tr><th>Title</th><th>Date</th></tr>
+      <tr><td><a href="/mod/courseboard/article.php?id=838536&bwid=2">Newer</a></td><td>2026-03-03</td></tr>
+      <tr><td><a href="/mod/courseboard/article.php?id=838536&bwid=1">Older</a></td><td>2026-03-02</td></tr>
+    </table>
+    """
+    response = SimpleNamespace(url="https://klms.kaist.ac.kr/mod/courseboard/view.php?id=838536", text=board_html, via="http")
+    monkeypatch.setattr(
+        "kaist_cli.v2.klms.notices.fetch_html_batch",
+        lambda _http, paths, **kwargs: {path: response for path in paths},
+    )
+    monkeypatch.setattr("kaist_cli.v2.klms.notices._enrich_notice_items_from_detail", lambda items, **kwargs: items)
+
+    items = service._refresh_notice_items(
+        config=config,
+        auth_mode="profile",
+        board_ids=["838536"],
+        max_pages=1,
+        since_iso=None,
+        limit=1,
+        bootstrap=SimpleNamespace(http=object()),
+        deadline=None,
+    )
+
+    assert [item.id for item in items] == ["2", "1"]
+    assert load_cache_value(paths, cache_key) == original
+
+def test_complete_notice_cache_supports_later_since_and_limit_without_refresh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    paths = resolve_paths()
+    config = load_config(paths)
+    service = NoticeService(paths, AuthService(paths))
+    cache_key = service._notice_list_cache_key(config, ["838536"], 1)
+    save_cache_value(
+        paths,
+        cache_key,
+        [
+            {"board_id": "838536", "id": "old", "title": "Old", "url": None, "posted_raw": None, "posted_iso": "2026-03-01T00:00:00Z"},
+            {"board_id": "838536", "id": "new", "title": "New", "url": None, "posted_raw": None, "posted_iso": "2026-03-03T00:00:00Z"},
+        ],
+        ttl_seconds=60,
+    )
+    monkeypatch.setattr(service, "_resolve_notice_board_ids", lambda **kwargs: ["838536"])
+    monkeypatch.setattr(service, "_refresh_notice_items", lambda **kwargs: (_ for _ in ()).throw(AssertionError("complete cache should be filtered locally")))
+
+    items = service._list_html(
+        context=object(),
+        config=config,
+        auth_mode="profile",
+        notice_board_id=None,
+        course_id=None,
+        course_query=None,
+        max_pages=1,
+        since_iso="2026-03-02T00:00:00Z",
+        limit=1,
+        bootstrap=SimpleNamespace(),
+    )
+
+    assert [item.id for item in items] == ["new"]
+
+@pytest.mark.parametrize(
+    ("cached_rows", "expected_count"),
+    [
+        ([], 0),
+        (
+            [
+                {
+                    "board_id": "838536",
+                    "id": "423326",
+                    "title": "Exam notice",
+                    "url": "https://klms.kaist.ac.kr/mod/courseboard/article.php?id=838536&bwid=423326",
+                    "posted_raw": "2026-03-16 09:57",
+                    "posted_iso": "2026-03-16T00:57:00Z",
+                    "source": "html:courseboard",
+                    "confidence": 0.7,
+                }
+            ],
+            1,
+        ),
+    ],
+)
+def test_notice_dashboard_live_failure_falls_back_to_fresh_list_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cached_rows: list[dict[str, object]], expected_count: int) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    paths = resolve_paths()
+    config = load_config(paths)
+    service = NoticeService(paths, AuthService(paths))
+    save_cache_value(paths, service._notice_list_cache_key(config, ["838536"], 1), cached_rows, ttl_seconds=60)
+    monkeypatch.setattr(service, "_resolve_notice_board_ids", lambda **kwargs: ["838536"])
+    monkeypatch.setattr(service, "_refresh_notice_items", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("network down")))
+
+    result = service.load_for_dashboard(
+        context=object(),
+        config=config,
+        auth_mode="profile",
+        bootstrap=SimpleNamespace(),
+        prefer_cache=False,
+    )
+
+    assert len(result.items) == expected_count
+    assert result.cache_hit is True
+    assert result.refresh_attempted is True
+    assert result.ok is True
+    assert [warning["code"] for warning in result.warnings] == ["LIVE_REFRESH_FAILED"]
+    assert result.provider_status()["status"] == "fallback"
+
+def test_notice_dashboard_uses_compatible_bounded_snapshot_after_live_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    paths = resolve_paths()
+    config = load_config(paths)
+    service = NoticeService(paths, AuthService(paths))
+    board_id = "838536"
+    first_path = f"/mod/courseboard/view.php?id={board_id}"
+    response = SimpleNamespace(
+        url=f"https://klms.kaist.ac.kr{first_path}",
+        text="""
+        <table><tr><th>Title</th><th>Date</th></tr>
+          <tr><td><a href="/mod/courseboard/article.php?id=838536&bwid=2">Newer</a></td><td>2026-03-03</td></tr>
+          <tr><td><a href="/mod/courseboard/article.php?id=838536&bwid=1">Older</a></td><td>2026-03-02</td></tr>
+        </table>
+        """,
+        via="http",
+    )
+    monkeypatch.setattr("kaist_cli.v2.klms.notices.fetch_html_batch", lambda _http, request_paths, **kwargs: {path: response for path in request_paths})
+    monkeypatch.setattr("kaist_cli.v2.klms.notices._enrich_notice_items_from_detail", lambda items, **kwargs: items)
+
+    service._refresh_notice_items(
+        config=config,
+        auth_mode="profile",
+        board_ids=[board_id],
+        max_pages=1,
+        since_iso=None,
+        limit=1,
+        bootstrap=SimpleNamespace(http=object()),
+        deadline=None,
+    )
+
+    assert load_cache_entry(paths, service._notice_list_cache_key(config, [board_id], 1)) is None
+    assert service._load_notice_snapshot_entry(config=config, board_ids=[board_id], max_pages=1, since_iso=None, limit=1) is not None
+    monkeypatch.setattr(service, "_resolve_notice_board_ids", lambda **kwargs: [board_id])
+    monkeypatch.setattr(service, "_refresh_notice_items", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("network down")))
+
+    result = service.load_for_dashboard(
+        context=object(),
+        config=config,
+        auth_mode="profile",
+        bootstrap=SimpleNamespace(),
+        limit=1,
+        prefer_cache=False,
+    )
+
+    assert [item["id"] for item in result.items] == ["2"]
+    assert result.bounded_cache is True
+    assert result.provider_status()["status"] == "bounded_fallback"
+    assert [warning["code"] for warning in result.warnings] == ["BOUNDED_CACHE", "LIVE_REFRESH_FAILED"]

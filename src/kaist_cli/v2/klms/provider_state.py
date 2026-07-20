@@ -23,6 +23,7 @@ class ProviderLoad:
     refresh_attempted: bool
     ok: bool = True
     warnings: tuple[dict[str, Any], ...] = ()
+    bounded_cache: bool = False
 
     def to_command_result(self) -> CommandResult:
         return CommandResult(data=self.items, source=self.source, capability=self.capability)
@@ -30,10 +31,15 @@ class ProviderLoad:
     def provider_status(self) -> dict[str, Any]:
         if not self.ok:
             status = "failed"
+        elif self.cache_hit and self.refresh_attempted and any(
+            str(warning.get("code") or "") in {"LIVE_REFRESH_TIMEOUT", "LIVE_REFRESH_FAILED"}
+            for warning in self.warnings
+        ):
+            status = "bounded_fallback" if self.bounded_cache else "fallback"
         elif self.refresh_attempted:
             status = "refreshed"
         elif self.cache_hit:
-            status = "cache_hit"
+            status = "bounded_cache" if self.bounded_cache else "cache_hit"
         else:
             status = "skipped"
         payload: dict[str, Any] = {
@@ -49,6 +55,7 @@ class ProviderLoad:
             "fetched_at": self.fetched_at,
             "expires_at": self.expires_at,
             "refresh_attempted": self.refresh_attempted,
+            "bounded_cache": self.bounded_cache,
         }
         if self.warnings:
             payload["warning_codes"] = [str(warning.get("code") or "") for warning in self.warnings if str(warning.get("code") or "").strip()]
@@ -78,6 +85,8 @@ class CachedProviderSnapshot:
     source: Source
     capability: Capability = "partial"
     empty_fail_source: Source = "html"
+    bounded_cache: bool = False
+    cache_warning: dict[str, Any] | None = None
 
 
 def _resource_title(resource_label: str) -> str:
@@ -101,11 +110,13 @@ def load_cached_or_refresh(
 
     def _cached_load(*, refresh_attempted: bool, warnings: list[dict[str, Any]]) -> ProviderLoad:
         assert cache_entry is not None
+        if snapshot.cache_warning is not None:
+            warnings.insert(0, dict(snapshot.cache_warning))
         return ProviderLoad(
             items=list(cached_items),
             source=snapshot.source,
             capability=snapshot.capability,
-            freshness_mode="cache",
+            freshness_mode="bounded_cache" if snapshot.bounded_cache else "cache",
             cache_hit=True,
             stale=bool(cache_entry.get("stale")),
             fetched_at=iso_from_epoch_seconds(cache_entry.get("stored_at")),
@@ -113,6 +124,7 @@ def load_cached_or_refresh(
             refresh_attempted=refresh_attempted,
             ok=True,
             warnings=tuple(warnings),
+            bounded_cache=snapshot.bounded_cache,
         )
 
     def _empty_fail(*, refresh_attempted: bool, warnings: tuple[dict[str, Any], ...]) -> ProviderLoad:
@@ -134,7 +146,7 @@ def load_cached_or_refresh(
         return _cached_load(refresh_attempted=False, warnings=[])
 
     if deadline is not None and deadline.hard_expired():
-        if cache_entry is not None and cached_items:
+        if cache_entry is not None:
             warnings: list[dict[str, Any]] = []
             if not cache_is_fresh_enough(cache_entry):
                 warnings.append(
@@ -165,7 +177,7 @@ def load_cached_or_refresh(
     try:
         live_items, live_source, live_capability = refresh()
     except TimeoutError:
-        if cache_entry is not None and cached_items:
+        if cache_entry is not None:
             warnings = []
             if not cache_is_fresh_enough(cache_entry):
                 warnings.append(
@@ -195,7 +207,7 @@ def load_cached_or_refresh(
     except CommandError:
         raise
     except Exception as exc:
-        if cache_entry is not None and cached_items:
+        if cache_entry is not None:
             warnings = []
             if not cache_is_fresh_enough(cache_entry):
                 warnings.append(
