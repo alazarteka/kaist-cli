@@ -3380,7 +3380,7 @@ def test_file_course_map_matches_recent_course_alias_variant(tmp_path: Path, mon
             """
         )
         monkeypatch.setattr(
-            "kaist_cli.v2.klms.files._load_recent_courses_from_bootstrap",
+            "kaist_cli.v2.klms.courses._load_recent_courses_from_bootstrap",
             lambda *args, **kwargs: [
                 Course(
                     id="178434",
@@ -3426,7 +3426,7 @@ def test_video_course_map_matches_recent_course_alias_variant(tmp_path: Path, mo
             """
         )
         monkeypatch.setattr(
-            "kaist_cli.v2.klms.videos._load_recent_courses_from_bootstrap",
+            "kaist_cli.v2.klms.courses._load_recent_courses_from_bootstrap",
             lambda *args, **kwargs: [
                 Course(
                     id="178434",

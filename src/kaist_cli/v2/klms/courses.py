@@ -244,6 +244,63 @@ def _load_recent_courses_from_bootstrap(
         return []
 
 
+def _course_map_from_dashboard(html: str, *, base_url: str, configured_ids: tuple[str, ...]) -> _CourseMetadataMap:
+    return _course_metadata_map(
+        _select_dashboard_courses(
+            html,
+            base_url=base_url,
+            exclude_patterns=(),
+            course_query=None,
+            include_past=True,
+            allow_termless_fallback=True,
+        ),
+        configured_ids=configured_ids,
+    )
+
+
+def course_map_for_request(
+    paths: KlmsPaths,
+    bootstrap: KlmsSessionBootstrap,
+    *,
+    config: KlmsConfig,
+    course_id: str | None,
+    course_query: str | None = None,
+) -> _CourseMetadataMap:
+    course_map = _course_map_from_dashboard(
+        bootstrap.dashboard_html,
+        base_url=config.base_url,
+        configured_ids=config.course_ids,
+    )
+    course_map = _merge_course_metadata_rows(
+        course_map,
+        _load_recent_courses_from_bootstrap(
+            paths,
+            bootstrap,
+            exclude_patterns=config.exclude_course_title_patterns,
+        ),
+    )
+    if course_id:
+        target = str(course_id).strip()
+        course_meta = course_map.get(target) or _empty_course_metadata_row(target)
+        return {target: course_meta}
+    discovered = _select_dashboard_courses(
+        bootstrap.dashboard_html,
+        base_url=config.base_url,
+        exclude_patterns=config.exclude_course_title_patterns,
+        course_query=None,
+        include_past=False,
+        allow_termless_fallback=True,
+    )
+    selected_ids = {str(course.id).strip() for course in discovered if str(course.id).strip()}
+    return {
+        key: value
+        for key, value in course_map.items()
+        if key in selected_ids
+        and not _is_noise_course(str(value.get("course_title") or ""), config.exclude_course_title_patterns)
+        and _course_matches_query(value, course_query)
+    }
+
+
 def _course_matches_query(course: Course, query: str | None) -> bool:
     needle = _normalize_course_match_value(query)
     if not needle:

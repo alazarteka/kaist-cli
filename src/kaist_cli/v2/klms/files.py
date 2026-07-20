@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlparse
 from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 
 from ..contracts import CommandError, CommandResult
-from ...core.timeutil import cache_is_fresh_enough as _cache_is_fresh_enough, iso_from_epoch_seconds as _iso_from_epoch_seconds
+from ...core.timeutil import iso_from_epoch_seconds as _iso_from_epoch_seconds
 from .moodle_html import unwrap_moodle_ajax_payload as _unwrap_moodle_ajax_payload
 from .auth import AuthService, looks_logged_out_html, looks_login_url
 from .cache import load_cache_entry, load_cache_value, save_cache_value
@@ -21,22 +21,17 @@ from .courses import (
     _CourseMetadataMap,
     _CourseMetadataRow,
     _course_code_base,
-    _course_metadata_map,
-    _course_matches_query,
+    course_map_for_request,
     _empty_course_metadata_row,
     _extract_course_code_from_resource_index,
-    _is_noise_course,
-    _load_recent_courses_from_bootstrap,
-    _merge_course_metadata_rows,
     _norm_text,
-    _select_dashboard_courses,
 )
 from .deadline import RefreshDeadline
 from .file_metadata import file_extension, guess_mime_type, normalize_filename
 from .media_recency import enrich_files_with_recency, observe_files
 from .models import FileItem
 from .paths import KlmsPaths
-from .provider_state import ProviderLoad
+from .provider_state import CachedProviderSnapshot, ProviderLoad, load_cached_or_refresh, run_list_authenticated
 from .session import KlmsDownloadFallback, KlmsHttpSession, KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
 from .validate import looks_klms_error_html
 
@@ -238,20 +233,6 @@ def _extract_material_title_from_page(html: str) -> str | None:
         if title:
             return title
     return None
-
-
-def _course_map_from_dashboard(html: str, *, base_url: str, configured_ids: tuple[str, ...]) -> _CourseMetadataMap:
-    return _course_metadata_map(
-        _select_dashboard_courses(
-            html,
-            base_url=base_url,
-            exclude_patterns=(),
-            course_query=None,
-            include_past=True,
-            allow_termless_fallback=True,
-        ),
-        configured_ids=configured_ids,
-    )
 
 
 def _build_file_item(
@@ -478,12 +459,6 @@ def _synthesize_file_item_from_url(
     return item
 
 
-def _provider_warning(code: str, message: str, **extra: Any) -> dict[str, Any]:
-    payload: dict[str, Any] = {"code": code, "message": message}
-    payload.update(extra)
-    return payload
-
-
 def _file_provider_source(items: list[FileItem]) -> str:
     has_api = any(str(item.source or "").startswith("api:") for item in items)
     has_html = any(str(item.source or "").startswith("html:") for item in items)
@@ -660,58 +635,8 @@ class FileService:
         cached_items.sort(key=lambda item: (item.course_title or "", item.kind, item.title.lower()))
         cached_limited = cached_items[: max(0, limit)] if limit is not None else cached_items
         cached_source = _file_provider_source(cached_limited)
-        cache_fresh_enough = _cache_is_fresh_enough(cache_entry)
-        if prefer_cache and cache_entry is not None and (not bool(cache_entry.get("stale")) or cache_fresh_enough):
-            return ProviderLoad(
-                items=[item.to_dict() for item in cached_limited],
-                source=cached_source,
-                capability="partial",
-                freshness_mode="cache",
-                cache_hit=True,
-                stale=bool(cache_entry.get("stale")),
-                fetched_at=_iso_from_epoch_seconds(cache_entry.get("stored_at")),
-                expires_at=_iso_from_epoch_seconds(cache_entry.get("expires_at")),
-                refresh_attempted=False,
-                ok=True,
-            )
 
-        if deadline is not None and deadline.hard_expired():
-            if cache_entry is not None and cached_limited:
-                warnings: list[dict[str, Any]] = []
-                if not _cache_is_fresh_enough(cache_entry):
-                    warnings.append(_provider_warning("LIVE_REFRESH_TIMEOUT", "Interactive refresh budget expired before file refresh completed."))
-                if bool(cache_entry.get("stale")):
-                    warnings.insert(0, _provider_warning("STALE_CACHE", "Returning stale file cache because live refresh could not finish in time."))
-                return ProviderLoad(
-                    items=[item.to_dict() for item in cached_limited],
-                    source=cached_source,
-                    capability="partial",
-                    freshness_mode="cache",
-                    cache_hit=True,
-                    stale=bool(cache_entry.get("stale")),
-                    fetched_at=_iso_from_epoch_seconds(cache_entry.get("stored_at")),
-                    expires_at=_iso_from_epoch_seconds(cache_entry.get("expires_at")),
-                    refresh_attempted=True,
-                    ok=True,
-                    warnings=tuple(warnings),
-                )
-            return ProviderLoad(
-                items=[],
-                source="html",
-                capability="degraded",
-                freshness_mode="live",
-                cache_hit=False,
-                stale=False,
-                fetched_at=None,
-                expires_at=None,
-                refresh_attempted=False,
-                ok=False,
-                warnings=(
-                    _provider_warning("LIVE_REFRESH_TIMEOUT", "Interactive refresh budget expired before file refresh started."),
-                ),
-            )
-
-        try:
+        def refresh() -> tuple[list[dict[str, Any]], Any, Any]:
             live_items = self._refresh_file_items(
                 config=config,
                 auth_mode=auth_mode,
@@ -720,91 +645,30 @@ class FileService:
                 bootstrap=bootstrap,
                 deadline=deadline,
             )
-        except TimeoutError:
-            if cache_entry is not None and cached_limited:
-                warnings: list[dict[str, Any]] = []
-                if not _cache_is_fresh_enough(cache_entry):
-                    warnings.append(_provider_warning("LIVE_REFRESH_TIMEOUT", "File refresh exceeded the interactive deadline."))
-                if bool(cache_entry.get("stale")):
-                    warnings.insert(0, _provider_warning("STALE_CACHE", "Returning stale file cache because live refresh timed out."))
-                return ProviderLoad(
-                    items=[item.to_dict() for item in cached_limited],
-                    source=cached_source,
-                    capability="partial",
-                    freshness_mode="cache",
-                    cache_hit=True,
-                    stale=bool(cache_entry.get("stale")),
-                    fetched_at=_iso_from_epoch_seconds(cache_entry.get("stored_at")),
-                    expires_at=_iso_from_epoch_seconds(cache_entry.get("expires_at")),
-                    refresh_attempted=True,
-                    ok=True,
-                    warnings=tuple(warnings),
-                )
-            return ProviderLoad(
-                items=[],
-                source="html",
-                capability="degraded",
-                freshness_mode="live",
-                cache_hit=False,
-                stale=False,
-                fetched_at=None,
-                expires_at=None,
-                refresh_attempted=True,
-                ok=False,
-                warnings=(
-                    _provider_warning("LIVE_REFRESH_TIMEOUT", "File refresh exceeded the interactive deadline."),
-                ),
-            )
-        except CommandError:
-            raise
-        except Exception as exc:
-            if cache_entry is not None and cached_limited:
-                warnings: list[dict[str, Any]] = []
-                if not _cache_is_fresh_enough(cache_entry):
-                    warnings.append(_provider_warning("LIVE_REFRESH_FAILED", "File refresh failed; returning cached file data.", error=str(exc)))
-                if bool(cache_entry.get("stale")):
-                    warnings.insert(0, _provider_warning("STALE_CACHE", "Returning stale file cache because live refresh failed."))
-                return ProviderLoad(
-                    items=[item.to_dict() for item in cached_limited],
-                    source=cached_source,
-                    capability="partial",
-                    freshness_mode="cache",
-                    cache_hit=True,
-                    stale=bool(cache_entry.get("stale")),
-                    fetched_at=_iso_from_epoch_seconds(cache_entry.get("stored_at")),
-                    expires_at=_iso_from_epoch_seconds(cache_entry.get("expires_at")),
-                    refresh_attempted=True,
-                    ok=True,
-                    warnings=tuple(warnings),
-                )
-            return ProviderLoad(
-                items=[],
-                source="html",
-                capability="degraded",
-                freshness_mode="live",
-                cache_hit=False,
-                stale=False,
-                fetched_at=None,
-                expires_at=None,
-                refresh_attempted=True,
-                ok=False,
-                warnings=(
-                    _provider_warning("LIVE_REFRESH_FAILED", "File refresh failed.", error=str(exc)),
-                ),
+            return (
+                [item.to_dict() for item in live_items],
+                _file_provider_source(live_items),
+                "partial",
             )
 
-        fresh_entry = load_cache_entry(self._paths, cache_key)
-        return ProviderLoad(
-            items=[item.to_dict() for item in live_items],
-            source=_file_provider_source(live_items),
-            capability="partial",
-            freshness_mode="live",
-            cache_hit=False,
-            stale=False,
-            fetched_at=_iso_from_epoch_seconds((fresh_entry or {}).get("stored_at")),
-            expires_at=_iso_from_epoch_seconds((fresh_entry or {}).get("expires_at")),
-            refresh_attempted=True,
-            ok=True,
+        def fresh_timestamps() -> tuple[str | None, str | None]:
+            fresh_entry = load_cache_entry(self._paths, cache_key)
+            return (
+                _iso_from_epoch_seconds((fresh_entry or {}).get("stored_at")),
+                _iso_from_epoch_seconds((fresh_entry or {}).get("expires_at")),
+            )
+
+        return load_cached_or_refresh(
+            prefer_cache=prefer_cache,
+            deadline=deadline,
+            snapshot=CachedProviderSnapshot(
+                items=[item.to_dict() for item in cached_limited],
+                cache_entry=cache_entry,
+                source=cached_source,  # type: ignore[arg-type]
+            ),
+            refresh=refresh,
+            resource_label="file",
+            fresh_timestamps=fresh_timestamps,
         )
 
     def refresh_cache_with_context(
@@ -828,24 +692,13 @@ class FileService:
         )
 
     def list(self, *, course_id: str | None = None, course_query: str | None = None, limit: int | None = None) -> CommandResult:
-        config = load_config(self._paths)
-
-        def callback(context: Any, auth_mode: str) -> CommandResult:
-            return self.list_with_context(
-                context=context,
-                config=config,
-                auth_mode=auth_mode,
-                course_id=course_id,
-                course_query=course_query,
-                limit=limit,
-            )
-
-        return self._auth.run_authenticated(
-            config=config,
-            headless=True,
-            accept_downloads=False,
-            timeout_seconds=10.0,
-            callback=callback,
+        return run_list_authenticated(
+            self._auth,
+            paths=self._paths,
+            list_with_context=self.list_with_context,
+            course_id=course_id,
+            course_query=course_query,
+            limit=limit,
         )
 
     def get(self, file_id_or_url: str) -> CommandResult:
@@ -1172,35 +1025,13 @@ class FileService:
         course_id: str | None,
         course_query: str | None = None,
     ) -> _CourseMetadataMap:
-        course_map = _course_map_from_dashboard(bootstrap.dashboard_html, base_url=config.base_url, configured_ids=config.course_ids)
-        course_map = _merge_course_metadata_rows(
-            course_map,
-            _load_recent_courses_from_bootstrap(
-                self._paths,
-                bootstrap,
-                exclude_patterns=config.exclude_course_title_patterns,
-            ),
+        return course_map_for_request(
+            self._paths,
+            bootstrap,
+            config=config,
+            course_id=course_id,
+            course_query=course_query,
         )
-        if course_id:
-            target = str(course_id).strip()
-            course_meta = course_map.get(target) or _empty_course_metadata_row(target)
-            return {target: course_meta}
-        discovered = _select_dashboard_courses(
-            bootstrap.dashboard_html,
-            base_url=config.base_url,
-            exclude_patterns=config.exclude_course_title_patterns,
-            course_query=None,
-            include_past=False,
-            allow_termless_fallback=True,
-        )
-        selected_ids = {str(course.id).strip() for course in discovered if str(course.id).strip()}
-        return {
-            key: value
-            for key, value in course_map.items()
-            if key in selected_ids
-            and not _is_noise_course(str(value.get("course_title") or ""), config.exclude_course_title_patterns)
-            and _course_matches_query(value, course_query)
-        }
 
     def _refresh_file_items(
         self,

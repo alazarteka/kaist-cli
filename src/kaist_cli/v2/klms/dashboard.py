@@ -368,19 +368,10 @@ class DashboardService:
         deadline = RefreshDeadline.start()
         notice_floor_iso = since_iso or (now - timedelta(days=21)).isoformat(timespec="seconds")
 
-        def callback(context: Any, auth_mode: str, dashboard_state: dict[str, Any]) -> CommandResult:
-            bootstrap = build_session_bootstrap(
-                self._paths,
-                context=context,
-                config=config,
-                auth_mode=auth_mode,
-                timeout_seconds=10.0,
-                dashboard_url=str(dashboard_state.get("final_url") or ""),
-                dashboard_html=str(dashboard_state.get("html") or ""),
-            )
+        def build_result(context: Any, auth_mode: str, bootstrap: Any) -> CommandResult:
             warnings: list[dict[str, Any]] = []
             provider_status: dict[str, Any] = {}
-            loads = self._run_components_parallel(
+            loads = self._collect_parallel_loads(
                 [
                     (
                         "assignments",
@@ -454,13 +445,7 @@ class DashboardService:
                 capability=_merge_capability(successes, had_warnings=bool(warnings)),
             )
 
-        return self._auth.run_authenticated_with_state(
-            config=config,
-            headless=True,
-            accept_downloads=False,
-            timeout_seconds=deadline.request_timeout(10.0, use_soft=False),
-            callback=callback,
-        )
+        return self._with_dashboard_session(config=config, deadline=deadline, build_result=build_result)
 
     def today(
         self,
@@ -478,19 +463,10 @@ class DashboardService:
         deadline = RefreshDeadline.start()
         notice_floor_iso = (now - timedelta(days=notice_days)).isoformat(timespec="seconds")
 
-        def callback(context: Any, auth_mode: str, dashboard_state: dict[str, Any]) -> CommandResult:
-            bootstrap = build_session_bootstrap(
-                self._paths,
-                context=context,
-                config=config,
-                auth_mode=auth_mode,
-                timeout_seconds=10.0,
-                dashboard_url=str(dashboard_state.get("final_url") or ""),
-                dashboard_html=str(dashboard_state.get("html") or ""),
-            )
+        def build_result(context: Any, auth_mode: str, bootstrap: Any) -> CommandResult:
             warnings: list[dict[str, Any]] = []
             provider_status: dict[str, Any] = {}
-            loads = self._run_components_parallel(
+            loads = self._collect_parallel_loads(
                 [
                     (
                         "assignments",
@@ -570,13 +546,7 @@ class DashboardService:
                 capability=_merge_capability(successes, had_warnings=bool(warnings)),
             )
 
-        return self._auth.run_authenticated_with_state(
-            config=config,
-            headless=True,
-            accept_downloads=False,
-            timeout_seconds=deadline.request_timeout(10.0, use_soft=False),
-            callback=callback,
-        )
+        return self._with_dashboard_session(config=config, deadline=deadline, build_result=build_result)
 
     def week(
         self,
@@ -594,16 +564,7 @@ class DashboardService:
             hard_seconds=WEEK_COMMAND_HARD_SECONDS,
         )
 
-        def callback(context: Any, auth_mode: str, dashboard_state: dict[str, Any]) -> CommandResult:
-            bootstrap = build_session_bootstrap(
-                self._paths,
-                context=context,
-                config=config,
-                auth_mode=auth_mode,
-                timeout_seconds=10.0,
-                dashboard_url=str(dashboard_state.get("final_url") or ""),
-                dashboard_html=str(dashboard_state.get("html") or ""),
-            )
+        def build_result(context: Any, auth_mode: str, bootstrap: Any) -> CommandResult:
             warnings: list[dict[str, Any]] = []
             provider_status: dict[str, Any] = {}
             assignments_load = self._run_component(
@@ -624,7 +585,7 @@ class DashboardService:
             warnings.extend(assignments_load.provider_warnings("assignments"))
             provider_status["assignments"] = assignments_load.provider_status()
 
-            loads = self._run_components_parallel(
+            loads = self._collect_parallel_loads(
                 [
                     (
                         "notices",
@@ -710,6 +671,27 @@ class DashboardService:
                 capability=_merge_capability(successes, had_warnings=bool(warnings)),
             )
 
+        return self._with_dashboard_session(config=config, deadline=deadline, build_result=build_result)
+
+    def _with_dashboard_session(
+        self,
+        *,
+        config: Any,
+        deadline: RefreshDeadline,
+        build_result: Callable[[Any, str, Any], CommandResult],
+    ) -> CommandResult:
+        def callback(context: Any, auth_mode: str, dashboard_state: dict[str, Any]) -> CommandResult:
+            bootstrap = build_session_bootstrap(
+                self._paths,
+                context=context,
+                config=config,
+                auth_mode=auth_mode,
+                timeout_seconds=10.0,
+                dashboard_url=str(dashboard_state.get("final_url") or ""),
+                dashboard_html=str(dashboard_state.get("html") or ""),
+            )
+            return build_result(context, auth_mode, bootstrap)
+
         return self._auth.run_authenticated_with_state(
             config=config,
             headless=True,
@@ -768,6 +750,16 @@ class DashboardService:
                 ),
             )
         return result
+
+    @classmethod
+    def _collect_parallel_loads(
+        cls,
+        components: list[tuple[str, Callable[[], ProviderLoad]]],
+        *,
+        warnings: list[dict[str, Any]],
+        provider_status: dict[str, Any],
+    ) -> dict[str, ProviderLoad]:
+        return cls._run_components_parallel(components, warnings=warnings, provider_status=provider_status)
 
     @classmethod
     def _run_components_parallel(
