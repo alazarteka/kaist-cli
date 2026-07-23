@@ -7,7 +7,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from bs4 import BeautifulSoup  # type: ignore[import-untyped]
+from bs4 import BeautifulSoup, Tag  # type: ignore[import-untyped]
 
 from ..contracts import CommandError, CommandResult
 from ...core.timeutil import iso_from_epoch_seconds as _iso_from_epoch, utc_now_iso as _iso_now_utc
@@ -34,6 +34,7 @@ from .paths import KlmsPaths
 from .provider_state import ProviderLoad, live_provider_load_from_result, run_list_authenticated
 from .session import KlmsSessionBootstrap, build_session_bootstrap
 from .validate import looks_klms_error_html
+from .browser_types import BrowserContextLike
 
 
 KAIST_LOCAL_TZ = timezone(timedelta(hours=9))
@@ -454,7 +455,7 @@ def _looks_meaningful_assignment_body(text: str | None, *, title: str, course_ti
     return True
 
 
-def _extract_assignment_body_from_node(node: Any, *, title: str, course_title: str | None) -> tuple[str | None, str | None]:
+def _extract_assignment_body_from_node(node: Tag | None, *, title: str, course_title: str | None) -> tuple[str | None, str | None]:
     if node is None:
         return None, None
     class_names = {str(value).strip().lower() for value in (node.get("class") or []) if str(value).strip()}
@@ -504,7 +505,7 @@ class AssignmentService:
     def list_with_context(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         course_id: str | None = None,
@@ -577,7 +578,7 @@ class AssignmentService:
     def load_for_dashboard(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         course_id: str | None = None,
@@ -615,7 +616,7 @@ class AssignmentService:
         target_course_id = str(course_id_hint).strip() if course_id_hint else ""
         target_course_id = target_course_id or None
 
-        def callback(context: Any, auth_mode: str) -> CommandResult:
+        def callback(context: BrowserContextLike, auth_mode: str) -> CommandResult:
             page = context.new_page()
             try:
                 page.goto(abs_url(config.base_url, f"/mod/assign/view.php?id={target_id}"), wait_until="domcontentloaded", timeout=30_000)
@@ -662,7 +663,7 @@ class AssignmentService:
     def _list_api(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         course_id: str | None,
@@ -782,7 +783,7 @@ class AssignmentService:
     def _list_html(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         course_id: str | None,
         course_query: str | None,

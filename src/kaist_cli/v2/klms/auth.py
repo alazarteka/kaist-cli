@@ -85,7 +85,8 @@ from .auth_sso import (
 )
 from .config import KlmsConfig, maybe_load_config, save_config
 from .paths import KlmsPaths, chmod_best_effort, configure_playwright_env, ensure_private_dirs
-from .secrets import KeychainSecretStore
+from .secrets import KeychainSecretStore, SecretStore
+from .browser_types import BrowserContextLike
 
 AuthMode = Literal["profile", "storage_state", "none"]
 
@@ -126,7 +127,7 @@ def load_auth_verified(paths: KlmsPaths) -> str | None:
     return value or None
 
 class AuthService(AuthOtpMixin, AuthEasyLoginMixin):
-    def __init__(self, paths: KlmsPaths, *, secret_store: KeychainSecretStore | None = None) -> None:
+    def __init__(self, paths: KlmsPaths, *, secret_store: SecretStore | None = None) -> None:
         self._paths = paths
         self._secret_store = secret_store or KeychainSecretStore()
 
@@ -693,7 +694,7 @@ class AuthService(AuthOtpMixin, AuthEasyLoginMixin):
         }
         return CommandResult(data=report, source="bootstrap", capability="partial")
 
-    def _persist_context_state(self, context: Any) -> None:
+    def _persist_context_state(self, context: BrowserContextLike) -> None:
         context.storage_state(path=str(self._paths.storage_state_path))
         chmod_best_effort(self._paths.storage_state_path, 0o600)
 
@@ -754,11 +755,8 @@ class AuthService(AuthOtpMixin, AuthEasyLoginMixin):
             capability="full",
         )
 
-    def _context_has_authenticated_page(self, context: Any, *, config: KlmsConfig) -> bool:
-        pages = getattr(context, "pages", None)
-        if not isinstance(pages, list):
-            return False
-        return any(_page_has_authenticated_klms_session(page, config=config) for page in pages)
+    def _context_has_authenticated_page(self, context: BrowserContextLike, *, config: KlmsConfig) -> bool:
+        return any(_page_has_authenticated_klms_session(page, config=config) for page in context.pages)
 
     def login(
         self,
@@ -812,7 +810,7 @@ class AuthService(AuthOtpMixin, AuthEasyLoginMixin):
             wait_seconds=wait_seconds,
         )
 
-    def _context_dashboard_state(self, context: Any, *, config: KlmsConfig, timeout_ms: int) -> dict[str, Any]:
+    def _context_dashboard_state(self, context: BrowserContextLike, *, config: KlmsConfig, timeout_ms: int) -> dict[str, Any]:
         page = context.new_page()
         try:
             page.goto(config.base_url.rstrip("/") + config.dashboard_path, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -977,7 +975,7 @@ class AuthService(AuthOtpMixin, AuthEasyLoginMixin):
 
         from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
 
-        def probe_context(context: Any, *, auth_mode: str) -> dict[str, Any]:
+        def probe_context(context: BrowserContextLike, *, auth_mode: str) -> dict[str, Any]:
             page = context.new_page()
             try:
                 try:

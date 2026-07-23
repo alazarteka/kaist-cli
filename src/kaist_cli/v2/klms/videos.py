@@ -24,6 +24,7 @@ from .provider_state import run_list_authenticated
 from .session import KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
 from .validate import looks_klms_error_html
 from .moodle_html import in_header_like_region
+from .browser_types import BrowserContextLike
 
 MAX_VIDEO_HTTP_WORKERS = 4
 
@@ -193,7 +194,7 @@ class VideoService:
     def list_with_context(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         course_id: str | None = None,
@@ -244,7 +245,7 @@ class VideoService:
         if not target:
             raise CommandError(code="CONFIG_INVALID", message="Video ID or URL is required.", exit_code=40)
 
-        def callback(context: Any, auth_mode: str) -> CommandResult:
+        def callback(context: BrowserContextLike, auth_mode: str) -> CommandResult:
             resolved = self._resolve_target_video(
                 context=context,
                 config=config,
@@ -265,7 +266,7 @@ class VideoService:
     def _list_html(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         course_id: str | None,
@@ -399,7 +400,7 @@ class VideoService:
     def _resolve_target_video(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         target: str,
@@ -464,7 +465,7 @@ class VideoService:
     def _resolve_video_detail(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         bootstrap: KlmsSessionBootstrap,
         item: Video,

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from bs4 import BeautifulSoup  # type: ignore[import-untyped]
+from bs4 import BeautifulSoup, Tag  # type: ignore[import-untyped]
 
 from ..contracts import CommandError, CommandResult
 from ...core.timeutil import iso_from_epoch_seconds as _iso_from_epoch_seconds
@@ -34,6 +34,7 @@ from .paths import KlmsPaths
 from .provider_state import CachedProviderSnapshot, ProviderLoad, load_cached_or_refresh, run_list_authenticated
 from .session import KlmsDownloadFallback, KlmsHttpSession, KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
 from .validate import looks_klms_error_html
+from .browser_types import BrowserContextLike
 
 ALLOWED_MODULES = {"resource", "folder", "url", "page", "coursefile"}
 DOWNLOADABLE_MODULES = {"resource", "coursefile"}
@@ -190,7 +191,7 @@ def _extract_module_from_url(url: str) -> tuple[str | None, str | None]:
     return (match.group(1) if match else None), (module_id_text or None)
 
 
-def _extract_module_id_from_node(node: Any) -> str | None:
+def _extract_module_id_from_node(node: Tag | None) -> str | None:
     current = node
     for _ in range(8):
         if current is None:
@@ -580,7 +581,7 @@ class FileService:
     def list_with_context(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         course_id: str | None = None,
@@ -608,7 +609,7 @@ class FileService:
     def load_for_dashboard(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         course_id: str | None = None,
@@ -674,7 +675,7 @@ class FileService:
     def refresh_cache_with_context(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         course_id: str | None = None,
@@ -707,7 +708,7 @@ class FileService:
         if not target:
             raise CommandError(code="CONFIG_INVALID", message="File ID or URL is required.", exit_code=40)
 
-        def callback(context: Any, auth_mode: str) -> CommandResult:
+        def callback(context: BrowserContextLike, auth_mode: str) -> CommandResult:
             resolved = self._resolve_target_item(context=context, config=config, auth_mode=auth_mode, target=target)
             return CommandResult(data=resolved.to_dict(), source="api" if str(resolved.source or "").startswith("api:") else "html", capability="partial")
 
@@ -742,7 +743,7 @@ class FileService:
         if if_exists not in {"skip", "overwrite"}:
             raise CommandError(code="CONFIG_INVALID", message="if_exists must be 'skip' or 'overwrite'.", exit_code=40)
 
-        def callback(context: Any, auth_mode: str) -> CommandResult:
+        def callback(context: BrowserContextLike, auth_mode: str) -> CommandResult:
             item = self._resolve_target_item(context=context, config=config, auth_mode=auth_mode, target=target)
             if not item.downloadable or not item.download_url:
                 raise CommandError(
@@ -774,7 +775,7 @@ class FileService:
     def _pull_prepared_items_with_context(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         items: list[FileItem],
         subdir: str | None,
@@ -914,7 +915,7 @@ class FileService:
         if if_exists not in {"skip", "overwrite"}:
             raise CommandError(code="CONFIG_INVALID", message="if_exists must be 'skip' or 'overwrite'.", exit_code=40)
 
-        def callback(context: Any, auth_mode: str) -> CommandResult:
+        def callback(context: BrowserContextLike, auth_mode: str) -> CommandResult:
             bootstrap = build_session_bootstrap(
                 self._paths,
                 context=context,
@@ -975,7 +976,7 @@ class FileService:
     def _list_html(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         course_id: str | None,
@@ -1302,7 +1303,7 @@ class FileService:
     def _resolve_target_item(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         target: str,
@@ -1351,7 +1352,7 @@ class FileService:
             )
         return self._resolve_item(context=context, config=config, item=selected)
 
-    def _resolve_item(self, *, context: Any, config: KlmsConfig, item: FileItem) -> FileItem:
+    def _resolve_item(self, *, context: BrowserContextLike, config: KlmsConfig, item: FileItem) -> FileItem:
         if item.download_url and _looks_like_direct_file_url(item.download_url):
             return replace(
                 item,
@@ -1436,7 +1437,7 @@ class FileService:
     def _download_resolved_item(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         item: FileItem,
         filename_override: str | None,
@@ -1539,7 +1540,7 @@ class FileService:
     def download_item_with_context(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         item: FileItem,
         filename_override: str | None = None,

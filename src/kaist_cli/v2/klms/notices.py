@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from bs4 import BeautifulSoup  # type: ignore[import-untyped]
+from bs4 import BeautifulSoup, Tag  # type: ignore[import-untyped]
 
 from ..contracts import CommandError, CommandResult
 from ...core.timeutil import iso_from_epoch_seconds as _iso_from_epoch_seconds
@@ -43,6 +43,7 @@ from .provider_state import (
 )
 from .session import KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
 from .validate import looks_klms_error_html
+from .browser_types import BrowserContextLike
 
 NOTICE_BOARD_TTL_SECONDS = 6 * 3600
 NOTICE_LIST_TTL_SECONDS = 5 * 60
@@ -500,7 +501,7 @@ def _extract_notice_meta_from_soup(soup: BeautifulSoup) -> tuple[str | None, str
     return author, posted_raw
 
 
-def _select_notice_body_node(soup: BeautifulSoup) -> Any:
+def _select_notice_body_node(soup: BeautifulSoup) -> Tag | BeautifulSoup:
     selectors = (
         (".courseboard_view .content", True),
         (".courseboard .content", True),
@@ -544,7 +545,7 @@ def _select_notice_body_node(soup: BeautifulSoup) -> Any:
     return best or soup.body or soup
 
 
-def _sanitize_notice_body_node(body_node: Any) -> tuple[str | None, str | None]:
+def _sanitize_notice_body_node(body_node: Tag | BeautifulSoup) -> tuple[str | None, str | None]:
     fragment = BeautifulSoup(str(body_node), "html.parser")
     for selector in (
         ".pre_next",
@@ -830,7 +831,7 @@ class NoticeService:
     def list_with_context(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         notice_board_id: str | None = None,
@@ -864,7 +865,7 @@ class NoticeService:
     def load_for_dashboard(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         notice_board_id: str | None = None,
@@ -956,7 +957,7 @@ class NoticeService:
     def refresh_cache_with_context(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         max_pages: int = 1,
@@ -1012,7 +1013,7 @@ class NoticeService:
         if not target_notice_id:
             raise CommandError(code="CONFIG_INVALID", message="Notice ID is required.", exit_code=40)
 
-        def callback(context: Any, auth_mode: str) -> CommandResult:
+        def callback(context: BrowserContextLike, auth_mode: str) -> CommandResult:
             bootstrap = build_session_bootstrap(
                 self._paths,
                 context=context,
@@ -1156,7 +1157,7 @@ class NoticeService:
         if if_exists not in {"skip", "overwrite"}:
             raise CommandError(code="CONFIG_INVALID", message="if_exists must be 'skip' or 'overwrite'.", exit_code=40)
 
-        def callback(context: Any, auth_mode: str) -> CommandResult:
+        def callback(context: BrowserContextLike, auth_mode: str) -> CommandResult:
             bootstrap = build_session_bootstrap(
                 self._paths,
                 context=context,
@@ -1320,7 +1321,7 @@ class NoticeService:
     def _list_html(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         notice_board_id: str | None,
@@ -1521,7 +1522,7 @@ class NoticeService:
     def _resolve_notice_board_map(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         explicit_board_id: str | None,
         course_id: str | None = None,
@@ -1633,7 +1634,7 @@ class NoticeService:
     def _resolve_notice_board_ids(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         explicit_board_id: str | None,
         course_id: str | None = None,

@@ -4,7 +4,7 @@ import json
 import re
 from typing import Any
 
-from bs4 import BeautifulSoup  # type: ignore[import-untyped]
+from bs4 import BeautifulSoup, Tag  # type: ignore[import-untyped]
 
 HEADER_LIKE_MARKERS = (
     "ks-header",
@@ -20,7 +20,7 @@ _SKIP_NOTICE_BOARD_IDS = {"32044", "32045", "32047", "531193"}
 _SKIP_NOTICE_BOARD_LABELS = {"notice", "guide to klms", "q&a", "faq"}
 
 
-def in_header_like_region(element: Any) -> bool:
+def in_header_like_region(element: Tag) -> bool:
     current = element
     for _ in range(12):
         if not current or not getattr(current, "attrs", None):

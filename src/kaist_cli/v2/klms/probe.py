@@ -10,7 +10,8 @@ from urllib.request import Request, build_opener, HTTPRedirectHandler
 
 from ..contracts import CommandError, CommandResult
 from .auth import APP_LOGIN_PATHS, AuthService, extract_sesskey, looks_logged_out_html, looks_login_url
-from .config import abs_url, maybe_load_config
+from .browser_types import BrowserContextLike
+from .config import KlmsConfig, abs_url, maybe_load_config
 from .discovery import load_json_summary, load_recent_courses_args
 from .paths import KlmsPaths
 
@@ -150,7 +151,7 @@ class CapabilityProbeService:
             capability="partial",
         )
 
-    def _live_validation(self, *, config: Any, timeout_seconds: float) -> dict[str, Any]:
+    def _live_validation(self, *, config: KlmsConfig, timeout_seconds: float) -> dict[str, Any]:
         base_url = str(config.base_url)
         dashboard_path = str(config.dashboard_path)
         checks: list[dict[str, Any]] = []
@@ -254,8 +255,8 @@ class CapabilityProbeService:
             "browser_content_api_validation": content_api_validation,
         }
 
-    def _browser_content_api_probe(self, *, config: Any, timeout_seconds: float) -> dict[str, Any]:
-        def callback(context: Any, auth_mode: str) -> dict[str, Any]:
+    def _browser_content_api_probe(self, *, config: KlmsConfig, timeout_seconds: float) -> dict[str, Any]:
+        def callback(context: BrowserContextLike, auth_mode: str) -> dict[str, Any]:
             page = context.new_page()
             try:
                 page.goto(config.base_url.rstrip("/") + config.dashboard_path, wait_until="domcontentloaded", timeout=max(1_000, int(timeout_seconds * 1000)))

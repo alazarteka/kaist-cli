@@ -19,6 +19,7 @@ from .moodle_html import (
     unwrap_moodle_ajax_data as _unwrap_moodle_ajax_data,
 )
 from .paths import KlmsPaths, chmod_best_effort, ensure_private_dirs
+from .browser_types import BrowserContextLike, PageLike
 
 
 def _same_origin(url_a: str, url_b: str) -> bool:
@@ -753,7 +754,7 @@ class EndpointCaptureService:
         per_surface_links = max(0, min(per_surface_links, 5))
         manual_courseboard_seconds = max(0, min(int(manual_courseboard_seconds), 300))
 
-        def callback(context: Any, auth_mode: str) -> CommandResult:
+        def callback(context: BrowserContextLike, auth_mode: str) -> CommandResult:
             report = self._discover_with_context(
                 context=context,
                 config=config,
@@ -793,7 +794,7 @@ class EndpointCaptureService:
     def _discover_with_context(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         auth_mode: str,
         max_courses: int,
@@ -998,7 +999,7 @@ class EndpointCaptureService:
     def _run_targeted_probes(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         dashboard_html: str,
         course_ids: list[str],
@@ -1068,7 +1069,7 @@ class EndpointCaptureService:
         )
         return results
 
-    def _probe_calendar_events(self, *, context: Any, config: KlmsConfig, sesskey: str) -> dict[str, Any]:
+    def _probe_calendar_events(self, *, context: BrowserContextLike, config: KlmsConfig, sesskey: str) -> dict[str, Any]:
         page = context.new_page()
         try:
             page.goto(abs_url(config.base_url, config.dashboard_path), wait_until="domcontentloaded", timeout=30_000)
@@ -1135,7 +1136,7 @@ class EndpointCaptureService:
         finally:
             page.close()
 
-    def _probe_courseboard_js_hints(self, *, context: Any, config: KlmsConfig, board_ids: list[str]) -> dict[str, Any]:
+    def _probe_courseboard_js_hints(self, *, context: BrowserContextLike, config: KlmsConfig, board_ids: list[str]) -> dict[str, Any]:
         if not board_ids:
             return {"status": "skipped", "reason": "No notice boards discovered.", "endpoints": [], "types": []}
 
@@ -1178,7 +1179,7 @@ class EndpointCaptureService:
     def _probe_courseboard_runtime(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         config: KlmsConfig,
         board_ids: list[str],
         manual_seconds: int = 0,
@@ -1286,7 +1287,7 @@ class EndpointCaptureService:
             page.close()
 
     @staticmethod
-    def _selector_href(page: Any, selector: str) -> str | None:
+    def _selector_href(page: PageLike, selector: str) -> str | None:
         try:
             href = page.eval_on_selector(selector, "el => el.href || el.getAttribute('href') || ''")
         except Exception:
@@ -1295,7 +1296,7 @@ class EndpointCaptureService:
         return text or None
 
     @staticmethod
-    def _click_selector(page: Any, selector: str, *, wait_for_navigation: bool, settle_ms: int) -> bool:
+    def _click_selector(page: PageLike, selector: str, *, wait_for_navigation: bool, settle_ms: int) -> bool:
         try:
             locator = page.locator(selector).first
             if locator.count() == 0:
@@ -1311,7 +1312,7 @@ class EndpointCaptureService:
             return False
 
     @staticmethod
-    def _drain_courseboard_capture(page: Any) -> list[dict[str, Any]]:
+    def _drain_courseboard_capture(page: PageLike) -> list[dict[str, Any]]:
         try:
             raw = page.evaluate(
                 "() => (window.__kaistCourseboardCapture && window.__kaistCourseboardCapture.drain ? window.__kaistCourseboardCapture.drain() : [])"
@@ -1323,7 +1324,7 @@ class EndpointCaptureService:
         return [dict(item) for item in raw if isinstance(item, dict)]
 
     @staticmethod
-    def _courseboard_dom_summary(page: Any) -> dict[str, Any]:
+    def _courseboard_dom_summary(page: PageLike) -> dict[str, Any]:
         try:
             payload = page.evaluate(
                 """
@@ -1339,7 +1340,7 @@ class EndpointCaptureService:
             return {}
         return payload if isinstance(payload, dict) else {}
 
-    def _probe_course_contents(self, *, context: Any, config: KlmsConfig, sesskey: str, course_ids: list[str]) -> dict[str, Any]:
+    def _probe_course_contents(self, *, context: BrowserContextLike, config: KlmsConfig, sesskey: str, course_ids: list[str]) -> dict[str, Any]:
         if not course_ids:
             return {
                 "probe": "core_course_get_contents",
@@ -1429,7 +1430,7 @@ class EndpointCaptureService:
     def _visit_page(
         self,
         *,
-        context: Any,
+        context: BrowserContextLike,
         target: str,
         visited_urls: list[str],
         visit_errors: list[dict[str, str]],

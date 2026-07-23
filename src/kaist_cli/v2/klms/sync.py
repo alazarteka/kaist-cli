@@ -12,6 +12,7 @@ from .files import FileService
 from .notices import NoticeService
 from .paths import KlmsPaths
 from .session import build_session_bootstrap
+from .browser_types import BrowserContextLike
 
 SYNC_CACHE_PREFIXES = (
     "notice-board-ids::",
@@ -137,7 +138,7 @@ class SyncService:
     def run(self) -> CommandResult:
         config = load_config(self._paths)
 
-        def callback(context: Any, auth_mode: str, dashboard_state: dict[str, Any]) -> CommandResult:
+        def callback(context: BrowserContextLike, auth_mode: str, dashboard_state: dict[str, Any]) -> CommandResult:
             bootstrap = build_session_bootstrap(
                 self._paths,
                 context=context,

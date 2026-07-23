@@ -19,6 +19,7 @@ from .auth_browser import (
 )
 from .config import KlmsConfig
 from .paths import KlmsPaths
+from .browser_types import BrowserContextLike, PageLike
 
 HTML_LOGIN_MARKERS = (
     "notloggedin",
@@ -141,13 +142,13 @@ def _looks_like_easy_login_page(url: str) -> bool:
     lowered = (url or "").lower()
     return EASY_LOGIN_VIEW_NEEDLE.lower() in lowered or EASY_LOGIN_SUBMIT_NEEDLE.lower() in lowered
 
-def _safe_page_content(page: Any) -> str | None:
+def _safe_page_content(page: PageLike) -> str | None:
     try:
         return str(page.content() or "")
     except Exception:
         return None
 
-def _safe_page_url(page: Any) -> str | None:
+def _safe_page_url(page: PageLike) -> str | None:
     try:
         url = str(page.url or "").strip()
     except Exception:
@@ -199,7 +200,7 @@ def _extract_email_otp_error_message(html: str) -> str | None:
             return text
     return None
 
-def _submit_password_login(page: Any, *, username: str, password: str) -> bool:
+def _submit_password_login(page: PageLike, *, username: str, password: str) -> bool:
     script = """
     ([username, password]) => {
       const visible = (node) => {
@@ -272,7 +273,7 @@ def _submit_password_login(page: Any, *, username: str, password: str) -> bool:
     except Exception:
         return False
 
-def _submit_email_otp_code(page: Any, *, otp: str) -> bool:
+def _submit_email_otp_code(page: PageLike, *, otp: str) -> bool:
     script = """
     (otp) => {
       const visible = (node) => {
@@ -333,7 +334,7 @@ def _submit_email_otp_code(page: Any, *, otp: str) -> bool:
     except Exception:
         return False
 
-def _request_email_otp_delivery(page: Any) -> bool:
+def _request_email_otp_delivery(page: PageLike) -> bool:
     script = """
     () => {
       const visible = (node) => {
@@ -482,7 +483,7 @@ def _evaluate_easy_login_policy_payload(payload: dict[str, Any]) -> str:
         retryable=False,
     )
 
-def _submit_easy_login_link(page: Any) -> bool:
+def _submit_easy_login_link(page: PageLike) -> bool:
     try:
         return bool(
             page.evaluate(
@@ -500,7 +501,7 @@ def _submit_easy_login_link(page: Any) -> bool:
     except Exception:
         return False
 
-def _complete_easy_login_device_registration(page: Any) -> bool:
+def _complete_easy_login_device_registration(page: PageLike) -> bool:
     try:
         submitted = bool(
             page.evaluate(
@@ -524,7 +525,7 @@ def _complete_easy_login_device_registration(page: Any) -> bool:
         pass
     return False
 
-def _page_has_authenticated_klms_session(page: Any, *, config: KlmsConfig) -> bool:
+def _page_has_authenticated_klms_session(page: PageLike, *, config: KlmsConfig) -> bool:
     url = _safe_page_url(page)
     if not url:
         return False
@@ -594,7 +595,7 @@ def storage_state_cookie_stats(paths: KlmsPaths) -> dict[str, Any] | None:
 
 
 class AuthEasyLoginMixin:
-    def _wait_for_easy_login_init(self, page: Any, *, timeout_seconds: float) -> str:
+    def _wait_for_easy_login_init(self, page: PageLike, *, timeout_seconds: float) -> str:
         deadline = time.monotonic() + max(1.0, timeout_seconds)
         while time.monotonic() < deadline:
             current_url = str(page.url or "")
@@ -647,8 +648,8 @@ class AuthEasyLoginMixin:
     def _wait_for_easy_login_approval(
         self,
         *,
-        page: Any,
-        context: Any,
+        page: PageLike,
+        context: BrowserContextLike,
         config: KlmsConfig,
         username: str,
         wait_seconds: float,
