@@ -111,7 +111,7 @@ class RequestService:
                     payload["json_parse_ok"] = True
                 except Exception as exc:  # noqa: BLE001
                     payload["json_parse_ok"] = False
-                    payload["json_parse_error"] = str(exc)
+                    payload["parse_error"] = str(exc)
             return CommandResult(data=payload, source="browser", capability="full")
 
         return self._auth.run_authenticated(

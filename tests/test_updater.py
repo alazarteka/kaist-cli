@@ -705,6 +705,34 @@ def test_sync_claude_plugin_metadata_rejects_corrupt_manifests(tmp_path: Path) -
     with pytest.raises(updater.SelfUpdateError, match="non-empty plugins list"):
         updater._sync_claude_plugin_metadata(install_root, version="0.5.3")  # type: ignore[attr-defined]
 
+    (skill_root / "plugin.json").write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+    (skill_root / "marketplace.json").write_text(
+        json.dumps(
+            {
+                "name": "kaist-cli",
+                "owner": {"name": "kaist-cli"},
+                "plugins": [{"name": "kaist-cli", "source": "."}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(updater.SelfUpdateError, match="must be a JSON object"):
+        updater._sync_claude_plugin_metadata(install_root, version="0.5.3")  # type: ignore[attr-defined]
+
+    (skill_root / "plugin.json").write_text(json.dumps({"name": "kaist-cli"}), encoding="utf-8")
+    (skill_root / "marketplace.json").write_text(
+        json.dumps(
+            {
+                "name": "kaist-cli",
+                "owner": {"name": "kaist-cli"},
+                "plugins": ["not-an-object"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(updater.SelfUpdateError, match="plugins\\[0\\] must be an object"):
+        updater._sync_claude_plugin_metadata(install_root, version="0.5.3")  # type: ignore[attr-defined]
+
 
 def test_install_script_detects_linux_glibc_target(tmp_path: Path) -> None:
     downloads_dir = tmp_path / "downloads"
