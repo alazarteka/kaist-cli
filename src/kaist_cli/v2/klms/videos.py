@@ -29,6 +29,7 @@ from .media_recency import observe_videos
 from .paths import KlmsPaths
 from .session import KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
 from .validate import looks_klms_error_html
+from .moodle_html import in_header_like_region
 
 MAX_VIDEO_HTTP_WORKERS = 4
 
@@ -106,20 +107,6 @@ def _extract_video_items_from_html(
 ) -> list[Video]:
     soup = BeautifulSoup(html, "html.parser")
     out: list[Video] = []
-
-    def in_header_like_region(element: Any) -> bool:
-        current = element
-        for _ in range(12):
-            if not current or not getattr(current, "attrs", None):
-                break
-            classes = " ".join(current.attrs.get("class", [])).lower()
-            if any(
-                marker in classes
-                for marker in ("ks-header", "all-menu", "tooltip-layer", "breadcrumb", "navbar", "footer", "menu")
-            ):
-                return True
-            current = current.parent
-        return False
 
     for anchor in soup.find_all("a", href=True):
         href = str(anchor.get("href") or "").strip()

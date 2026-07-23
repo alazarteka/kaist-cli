@@ -6,6 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 from ...core.state_store import read_json_file, update_json_file, write_json_file_atomic
+from ...core.timeutil import utc_now_iso
 from .paths import KlmsPaths
 
 AUTH_SESSION_VERSION = 1
@@ -17,10 +18,6 @@ def _default_session_payload() -> dict[str, Any]:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
-
-
-def utc_now_iso() -> str:
-    return _utc_now().isoformat().replace("+00:00", "Z")
 
 
 def session_expiry_iso(*, ttl_seconds: float) -> str:

@@ -5,7 +5,6 @@ import html as _html
 import re
 import sys
 from dataclasses import replace
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -13,6 +12,8 @@ from urllib.parse import parse_qs, urlparse
 from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 
 from ..contracts import CommandError, CommandResult
+from ...core.timeutil import cache_is_fresh_enough as _cache_is_fresh_enough, iso_from_epoch_seconds as _iso_from_epoch_seconds
+from .moodle_html import unwrap_moodle_ajax_payload as _unwrap_moodle_ajax_payload
 from .auth import AuthService, looks_logged_out_html, looks_login_url
 from .cache import load_cache_entry, load_cache_value, save_cache_value
 from .config import KlmsConfig, abs_url, load_config
@@ -477,27 +478,6 @@ def _synthesize_file_item_from_url(
     return item
 
 
-def _iso_from_epoch_seconds(value: float | int | None) -> str | None:
-    if not isinstance(value, (int, float)):
-        return None
-    try:
-        return datetime.fromtimestamp(float(value), tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    except Exception:
-        return None
-
-
-def _cache_is_fresh_enough(entry: dict[str, Any] | None, *, max_age_seconds: int = 3600) -> bool:
-    if not isinstance(entry, dict):
-        return False
-    age_seconds = entry.get("age_seconds")
-    if isinstance(age_seconds, (int, float)):
-        return float(age_seconds) <= float(max_age_seconds)
-    stored_at = entry.get("stored_at")
-    if isinstance(stored_at, (int, float)):
-        return (datetime.now(timezone.utc).timestamp() - float(stored_at)) <= float(max_age_seconds)
-    return False
-
-
 def _provider_warning(code: str, message: str, **extra: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {"code": code, "message": message}
     payload.update(extra)
@@ -512,25 +492,6 @@ def _file_provider_source(items: list[FileItem]) -> str:
     if has_api:
         return "api"
     return "html"
-
-
-def _unwrap_moodle_ajax_payload(text: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(text)
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "invalid", "message": f"Failed to parse Moodle AJAX JSON: {exc}"}
-    if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
-        return {"status": "invalid", "message": "Unexpected Moodle AJAX response shape."}
-    first = payload[0]
-    if bool(first.get("error")):
-        exception = first.get("exception") if isinstance(first.get("exception"), dict) else {}
-        return {
-            "status": "error",
-            "error_code": str(exception.get("errorcode") or first.get("errorcode") or "").strip() or None,
-            "message": str(exception.get("message") or first.get("message") or "Moodle AJAX returned an error payload.").strip(),
-            "exception": exception,
-        }
-    return {"status": "ok", "data": first.get("data")}
 
 
 def _extract_file_items_from_course_contents(

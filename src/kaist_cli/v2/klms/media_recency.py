@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timezone
 from typing import Any
 
 from ...core.state_store import read_json_file, update_json_file
+from ...core.timeutil import utc_now_iso
 from .models import FileItem, Video
 from .paths import KlmsPaths
 
@@ -13,10 +13,6 @@ MEDIA_RECENCY_STORE_VERSION = 1
 
 def _default_store() -> dict[str, Any]:
     return {"version": MEDIA_RECENCY_STORE_VERSION, "files": {}, "videos": {}}
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _bucket(store: dict[str, Any], key: str) -> dict[str, dict[str, Any]]:
@@ -103,7 +99,7 @@ def enrich_videos_with_recency(paths: KlmsPaths, items: list[Video]) -> list[Vid
 
 
 def observe_files(paths: KlmsPaths, items: list[FileItem], *, observed_at: str | None = None) -> list[FileItem]:
-    seen_at = observed_at or _utc_now_iso()
+    seen_at = observed_at or utc_now_iso()
 
     def updater(current: dict[str, Any]) -> dict[str, Any]:
         files = _bucket(current, "files")
@@ -128,7 +124,7 @@ def observe_files(paths: KlmsPaths, items: list[FileItem], *, observed_at: str |
 
 
 def observe_videos(paths: KlmsPaths, items: list[Video], *, observed_at: str | None = None) -> list[Video]:
-    seen_at = observed_at or _utc_now_iso()
+    seen_at = observed_at or utc_now_iso()
 
     def updater(current: dict[str, Any]) -> dict[str, Any]:
         videos = _bucket(current, "videos")

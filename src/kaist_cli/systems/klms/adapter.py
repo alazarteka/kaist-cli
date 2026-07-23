@@ -1,18 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import textwrap
 
+from ...core.help_format import HelpFormatter as _HelpFormatter
+from ...core.help_format import dedent as _dedent
 from ...core.contracts import SystemAdapter
 from ...v2.parser import register_klms_parser
-
-
-class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
-    pass
-
-
-def _dedent(text: str) -> str:
-    return textwrap.dedent(text).strip()
 
 
 class KlmsAdapter(SystemAdapter):

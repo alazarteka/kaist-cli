@@ -4,6 +4,8 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
+
+from .fsutil import remove_path
 from typing import Any
 
 from .distribution import SKILL_NAME, discover_distribution_info
@@ -77,12 +79,6 @@ def resolve_agent_install_spec(agent: str, *, custom_path: str | None = None) ->
     raise AgentCommandError("CONFIG_INVALID", 40, False, f"Unsupported agent target: {agent}", None)
 
 
-def _remove_path(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
-        path.unlink()
-        return
-    if path.is_dir():
-        shutil.rmtree(path)
 
 
 def _status_entry(spec: AgentInstallSpec, *, bundled_skill_path: Path) -> dict[str, Any]:
@@ -137,7 +133,7 @@ def _install_target(spec: AgentInstallSpec, *, copy: bool, force: bool) -> dict[
                 f"Target path already exists: {path}",
                 "Re-run with --force to replace it.",
             )
-        _remove_path(path)
+        remove_path(path)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     if copy:
@@ -159,7 +155,7 @@ def _uninstall_target(spec: AgentInstallSpec) -> dict[str, Any]:
     existed = path.exists() or path.is_symlink()
     previous = _status_entry(spec, bundled_skill_path=bundled_skill_path)
     if existed:
-        _remove_path(path)
+        remove_path(path)
     return {
         **previous,
         "action": "removed" if existed else "noop",

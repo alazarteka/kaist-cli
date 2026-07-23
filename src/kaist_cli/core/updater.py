@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .distribution import BundleManifest, DistributionInfo, RELEASE_REPO, discover_distribution_info, load_bundle_manifest
+from .fsutil import remove_path
 from .versioning import version_string
 
 
@@ -505,12 +506,6 @@ def _swap_symlink(link_path: Path, target_path: Path) -> None:
     os.replace(tmp_path, link_path)
 
 
-def _remove_path(path: Path) -> None:
-    if path.is_symlink() or path.is_file():
-        path.unlink()
-        return
-    if path.is_dir():
-        shutil.rmtree(path)
 
 
 def _prune_versions(ctx: ManagedInstallContext, keep_roots: set[Path]) -> list[str]:
@@ -567,7 +562,7 @@ def _sync_claude_plugin_metadata(install_root: Path, *, version: str) -> Path:
     plugin_root.mkdir(parents=True, exist_ok=True)
     skill_link.parent.mkdir(parents=True, exist_ok=True)
     if skill_link.exists() or skill_link.is_symlink():
-        _remove_path(skill_link)
+        remove_path(skill_link)
     skill_link.symlink_to(skill_target, target_is_directory=True)
 
     plugin_payload = {
@@ -705,9 +700,9 @@ def perform_self_update() -> dict[str, Any]:
             )
 
         if temp_version_dir.exists() or temp_version_dir.is_symlink():
-            _remove_path(temp_version_dir)
+            remove_path(temp_version_dir)
         if version_dir.exists() or version_dir.is_symlink():
-            _remove_path(version_dir)
+            remove_path(version_dir)
 
         _progress("Extracting update bundle...")
         manifest = _extract_bundle_root(archive_path, temp_version_dir)
@@ -719,7 +714,7 @@ def perform_self_update() -> dict[str, Any]:
     if previous_root is not None and previous_root != version_dir.resolve():
         _swap_symlink(ctx.previous_link, previous_root)
     elif ctx.previous_link.exists() or ctx.previous_link.is_symlink():
-        _remove_path(ctx.previous_link)
+        remove_path(ctx.previous_link)
 
     keep_roots = {version_dir}
     previous_kept = _resolved_symlink(ctx.previous_link)
