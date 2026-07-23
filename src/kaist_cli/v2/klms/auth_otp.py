@@ -444,9 +444,14 @@ class AuthOtpMixin:
             updated["finished_at"] = utc_now_iso()
             return updated
 
-        from .auth_session import update_auth_session
+        # Best-effort side effect: persistence failure must not mask the primary
+        # auth error or prevent the worker from replying to the client.
+        try:
+            from .auth_session import update_auth_session
 
-        update_auth_session(self._paths, updater=updater)
+            update_auth_session(self._paths, updater=updater)
+        except Exception:
+            pass
 
 
     def _require_active_auth_session(self, session_id: str) -> dict[str, Any]:
