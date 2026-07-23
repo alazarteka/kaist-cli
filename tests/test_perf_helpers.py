@@ -49,6 +49,14 @@ def test_cache_reuses_in_memory_snapshot_and_writes_compact_json(tmp_path: Path,
     assert load_cache_entry(paths, "notice-list::demo") is not None
     assert reads == []
 
+    # External rewrite must invalidate the snapshot.
+    payload["entries"]["notice-list::demo"]["expires_at"] = 0
+    paths.cache_path.write_text(json.dumps(payload), encoding="utf-8")
+    entry = load_cache_entry(paths, "notice-list::demo")
+    assert entry is not None
+    assert entry["stale"] is True
+    assert reads == [str(paths.cache_path)]
+
 
 class _FakeContext:
     def storage_state(self) -> dict:

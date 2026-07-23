@@ -10,6 +10,7 @@ from .paths import KlmsPaths, ensure_private_dirs
 _CACHE_LOCK = threading.RLock()
 _CACHE_SNAPSHOT: dict[str, Any] | None = None
 _CACHE_SNAPSHOT_PATH: str | None = None
+_CACHE_SNAPSHOT_FINGERPRINT: tuple[int, int] | None = None
 
 
 def _dump_cache_payload(payload: dict[str, Any]) -> str:
@@ -21,16 +22,30 @@ def _clone_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {"entries": dict(payload.get("entries") or {})}
 
 
+def _cache_fingerprint(paths: KlmsPaths) -> tuple[int, int] | None:
+    try:
+        stat = paths.cache_path.stat()
+    except FileNotFoundError:
+        return None
+    return (int(stat.st_mtime_ns), int(stat.st_size))
+
+
 def _set_snapshot(paths: KlmsPaths, payload: dict[str, Any]) -> None:
-    global _CACHE_SNAPSHOT, _CACHE_SNAPSHOT_PATH
+    global _CACHE_SNAPSHOT, _CACHE_SNAPSHOT_PATH, _CACHE_SNAPSHOT_FINGERPRINT
     _CACHE_SNAPSHOT = _clone_payload(payload)
     _CACHE_SNAPSHOT_PATH = str(paths.cache_path)
+    _CACHE_SNAPSHOT_FINGERPRINT = _cache_fingerprint(paths)
 
 
 def _load_cache_payload(paths: KlmsPaths) -> dict[str, Any]:
     with _CACHE_LOCK:
         path_key = str(paths.cache_path)
-        if _CACHE_SNAPSHOT is not None and _CACHE_SNAPSHOT_PATH == path_key:
+        fingerprint = _cache_fingerprint(paths)
+        if (
+            _CACHE_SNAPSHOT is not None
+            and _CACHE_SNAPSHOT_PATH == path_key
+            and _CACHE_SNAPSHOT_FINGERPRINT == fingerprint
+        ):
             return _clone_payload(_CACHE_SNAPSHOT)
 
         ensure_private_dirs(paths)
