@@ -24,3 +24,7 @@ kaist = "kaist_cli.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kaist_cli"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests"]
+testpaths = ["tests"]

@@ -15,7 +15,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    output_format = "json" if args.agent else args.format
+    output_format = "json" if args.agent or getattr(args, "json", False) else args.format
     json_mode = output_format == "json"
 
     try:

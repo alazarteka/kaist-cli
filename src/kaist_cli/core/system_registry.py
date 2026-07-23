@@ -35,5 +35,4 @@ def default_registry() -> SystemRegistry:
     registry.register(UpdateAdapter())
     registry.register(AgentAdapter())
     registry.register(KlmsAdapter())
-    # PortalAdapter disabled — scaffold only, no implemented functionality yet
     return registry
