@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlparse
 from bs4 import BeautifulSoup, Tag  # type: ignore[import-untyped]
 
 from ..contracts import CommandError, CommandResult
-from ...core.timeutil import iso_from_epoch_seconds as _iso_from_epoch_seconds
+from ...core.timeutil import cache_is_fresh_enough, iso_from_epoch_seconds as _iso_from_epoch_seconds
 from .moodle_html import unwrap_moodle_ajax_payload as _unwrap_moodle_ajax_payload
 from .auth import AuthService, looks_logged_out_html, looks_login_url
 from .cache import load_cache_entry, load_cache_value, save_cache_value
@@ -32,7 +32,7 @@ from .media_recency import enrich_files_with_recency, observe_files
 from .models import FileItem
 from .paths import KlmsPaths
 from .provider_state import CachedProviderSnapshot, ProviderLoad, load_cached_or_refresh, run_list_authenticated
-from .session import KlmsDownloadFallback, KlmsHttpSession, KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
+from .session import KlmsDownloadFallback, KlmsHttpSession, KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch, http_max_workers
 from .validate import looks_klms_error_html
 from .browser_types import BrowserContextLike
 
@@ -995,8 +995,11 @@ class FileService:
             return []
 
         cache_key = self._file_list_cache_key(config, list(course_map.keys()))
-        cached_rows = load_cache_value(self._paths, cache_key)
-        if isinstance(cached_rows, list):
+        cache_entry = load_cache_entry(self._paths, cache_key)
+        cached_rows = cache_entry.get("value") if isinstance(cache_entry, dict) else None
+        if isinstance(cached_rows, list) and (
+            not bool(cache_entry.get("stale")) or cache_is_fresh_enough(cache_entry)
+        ):
             cached_items = enrich_files_with_recency(
                 self._paths,
                 [_normalize_file_item_metadata(FileItem(**row)) for row in cached_rows if isinstance(row, dict)],
@@ -1066,11 +1069,12 @@ class FileService:
             for course_meta in course_map.values()
             if str(course_meta.get("course_id") or "").strip() not in api_covered_course_ids
         ]
-        for start in range(0, len(course_meta_list), MAX_FILE_HTTP_WORKERS):
+        workers = http_max_workers(MAX_FILE_HTTP_WORKERS)
+        for start in range(0, len(course_meta_list), workers):
             if deadline is not None and deadline.hard_expired():
                 raise TimeoutError("Interactive file refresh budget expired.")
 
-            batch = course_meta_list[start : start + MAX_FILE_HTTP_WORKERS]
+            batch = course_meta_list[start : start + workers]
             index_paths = []
             path_to_course: dict[str, _CourseMetadataRow] = {}
             for course_meta in batch:

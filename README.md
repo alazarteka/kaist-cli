@@ -15,6 +15,7 @@ Current KLMS surface:
 - Product spec: `docs/PRODUCT_SPEC.md`
 - KLMS migration notes: `docs/MIGRATION.md`
 - Release workflow: `docs/RELEASES.md`
+- CLI performance notes: `docs/PERFORMANCE.md`
 - Historical rewrite RFC: `docs/CLEAN_BREAK_RFC.md`
 
 ## Install
@@ -131,10 +132,19 @@ KLMS auth is persisted in:
 
 The CLI reuses a single authenticated browser context per command and caches slow HTML-backed providers aggressively.
 
+See `docs/PERFORMANCE.md` for where commands spend time and what still dominates wall clock.
+
 Operational controls:
-- `KAIST_KLMS_CONCURRENCY` for concurrent course/board HTML fetches
+- `KAIST_KLMS_CONCURRENCY` for concurrent course/board HTML fetches (default `4`, max `32`)
 - `KAIST_KLMS_BROWSER_CHANNEL` to prefer a system browser channel
 - `KAIST_KLMS_BROWSER_EXECUTABLE` to force a browser executable path
+
+Warm interactive commands after a cache prewarm:
+
+```bash
+kaist klms sync run
+kaist klms today
+```
 
 ## Release
 

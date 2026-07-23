@@ -32,12 +32,13 @@ from .file_metadata import normalize_filename
 from .models import Assignment
 from .paths import KlmsPaths
 from .provider_state import ProviderLoad, live_provider_load_from_result, run_list_authenticated
-from .session import KlmsSessionBootstrap, build_session_bootstrap
+from .session import KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
 from .validate import looks_klms_error_html
 from .browser_types import BrowserContextLike
 
 
 KAIST_LOCAL_TZ = timezone(timedelta(hours=9))
+MAX_ASSIGNMENT_HTTP_WORKERS = 4
 
 
 def _strip_html_text(raw: str | None) -> str | None:
@@ -822,17 +823,27 @@ class AssignmentService:
             include_past=include_past,
         )
         out: list[Assignment] = []
-        for course in course_ids:
-            if bootstrap is not None:
-                html = bootstrap.http.get_html(f"/mod/assign/index.php?id={course}", context=context).text
-            else:
+        if bootstrap is not None and course_ids:
+            path_by_course = {course: f"/mod/assign/index.php?id={course}" for course in course_ids}
+            responses = fetch_html_batch(
+                bootstrap.http,
+                list(path_by_course.values()),
+                max_workers=MAX_ASSIGNMENT_HTTP_WORKERS,
+            )
+            for course, path in path_by_course.items():
+                response = responses.get(path)
+                if response is None:
+                    continue
+                out.extend(_extract_assignments_from_index_html(response.text, base_url=config.base_url, course_id=course))
+        else:
+            for course in course_ids:
                 page = context.new_page()
                 try:
                     page.goto(abs_url(config.base_url, f"/mod/assign/index.php?id={course}"), wait_until="domcontentloaded", timeout=30_000)
                     html = page.content()
                 finally:
                     page.close()
-            out.extend(_extract_assignments_from_index_html(html, base_url=config.base_url, course_id=course))
+                out.extend(_extract_assignments_from_index_html(html, base_url=config.base_url, course_id=course))
 
         return _filter_assignments(
             out,

@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlparse
 from bs4 import BeautifulSoup, Tag  # type: ignore[import-untyped]
 
 from ..contracts import CommandError, CommandResult
-from ...core.timeutil import iso_from_epoch_seconds as _iso_from_epoch_seconds
+from ...core.timeutil import cache_is_fresh_enough, iso_from_epoch_seconds as _iso_from_epoch_seconds
 from .moodle_html import (
     discover_notice_board_ids_from_course_page as _discover_notice_board_ids_from_course_page,
     table_col_index,
@@ -1355,8 +1355,10 @@ class NoticeService:
             )
 
         cache_entry = self._load_notice_cache_entry(config=config, board_ids=board_ids, max_pages=max_pages)
-        cached_rows = cache_entry.get("value") if isinstance(cache_entry, dict) and not bool(cache_entry.get("stale")) else None
-        if isinstance(cached_rows, list):
+        cached_rows = cache_entry.get("value") if isinstance(cache_entry, dict) else None
+        if isinstance(cached_rows, list) and (
+            not bool(cache_entry.get("stale")) or cache_is_fresh_enough(cache_entry)
+        ):
             cached_items = [Notice(**row) for row in cached_rows if isinstance(row, dict)]
             return _finalize_notice_items(cached_items, since_iso=since_iso, limit=limit)
 

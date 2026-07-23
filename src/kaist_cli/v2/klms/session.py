@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import http.cookiejar
+import os
 import ssl
+import threading
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -24,6 +26,21 @@ DEFAULT_HEADERS = {
     "Pragma": "no-cache",
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 }
+
+DEFAULT_HTTP_WORKERS = 4
+_MAX_HTTP_WORKERS = 32
+
+
+def http_max_workers(default: int = DEFAULT_HTTP_WORKERS) -> int:
+    """Resolve HTTP fan-out width from KAIST_KLMS_CONCURRENCY when set."""
+    baseline = max(1, int(default))
+    raw = str(os.environ.get("KAIST_KLMS_CONCURRENCY") or "").strip()
+    if not raw:
+        return baseline
+    try:
+        return max(1, min(_MAX_HTTP_WORKERS, int(raw)))
+    except ValueError:
+        return baseline
 
 
 @dataclass(frozen=True)
@@ -95,6 +112,10 @@ class KlmsHttpSession:
         state = context.storage_state()
         cookies = state.get("cookies") if isinstance(state, dict) else []
         self._cookie_rows = [dict(row) for row in cookies if isinstance(row, dict)]
+        # Thread-local openers: cookie jars mutate on responses and must stay
+        # isolated under fetch_html_batch's ThreadPoolExecutor.
+        self._local = threading.local()
+        self._ssl_context = ssl.create_default_context(cafile=certifi.where())
 
     def _build_opener(self) -> urllib.request.OpenerDirector:
         cookie_jar = http.cookiejar.CookieJar()
@@ -103,12 +124,18 @@ class KlmsHttpSession:
             if cookie is not None:
                 cookie_jar.set_cookie(cookie)
 
-        ssl_context = ssl.create_default_context(cafile=certifi.where())
         opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(cookie_jar),
-            urllib.request.HTTPSHandler(context=ssl_context),
+            urllib.request.HTTPSHandler(context=self._ssl_context),
         )
         opener.addheaders = list(DEFAULT_HEADERS.items())
+        return opener
+
+    def _opener(self) -> urllib.request.OpenerDirector:
+        opener = getattr(self._local, "opener", None)
+        if opener is None:
+            opener = self._build_opener()
+            self._local.opener = opener
         return opener
 
     def get_html(
@@ -120,7 +147,7 @@ class KlmsHttpSession:
     ) -> KlmsHttpResponse:
         target_url = abs_url(self._base_url, url_or_path)
         try:
-            opener = self._build_opener()
+            opener = self._opener()
             request = urllib.request.Request(target_url, headers=DEFAULT_HEADERS)
             with opener.open(request, timeout=max(1.0, timeout_seconds)) as response:
                 raw = response.read()
@@ -155,7 +182,7 @@ class KlmsHttpSession:
         merged_headers = dict(DEFAULT_HEADERS)
         if headers:
             merged_headers.update(headers)
-        opener = self._build_opener()
+        opener = self._opener()
         request = urllib.request.Request(
             target_url,
             data=body.encode("utf-8"),
@@ -183,7 +210,7 @@ class KlmsHttpSession:
         timeout_seconds: float = 120.0,
     ) -> KlmsDownloadResponse:
         target_url = abs_url(self._base_url, url_or_path)
-        opener = self._build_opener()
+        opener = self._opener()
         request = urllib.request.Request(target_url, headers=DEFAULT_HEADERS)
         with opener.open(request, timeout=max(1.0, timeout_seconds)) as response:
             final_url = str(response.geturl() or target_url)
@@ -240,18 +267,20 @@ def fetch_html_batch(
     paths: list[str],
     *,
     deadline: RefreshDeadline | None = None,
-    max_workers: int = 4,
+    max_workers: int | None = None,
 ) -> dict[str, KlmsHttpResponse]:
     ordered = [str(path).strip() for path in paths if str(path).strip()]
     if not ordered:
         return {}
+
+    workers = http_max_workers(DEFAULT_HTTP_WORKERS if max_workers is None else max_workers)
 
     def worker(path: str) -> KlmsHttpResponse:
         timeout_seconds = deadline.request_timeout(20.0, use_soft=False) if deadline is not None else 20.0
         return http.get_html(path, timeout_seconds=timeout_seconds)
 
     results: dict[str, KlmsHttpResponse] = {}
-    executor = ThreadPoolExecutor(max_workers=max(1, min(int(max_workers), len(ordered))))
+    executor = ThreadPoolExecutor(max_workers=max(1, min(int(workers), len(ordered))))
     timed_out = False
     try:
         futures = {executor.submit(worker, path): path for path in ordered}
