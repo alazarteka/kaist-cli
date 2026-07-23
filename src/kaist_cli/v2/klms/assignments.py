@@ -31,7 +31,7 @@ from .discovery import load_json_summary
 from .file_metadata import normalize_filename
 from .models import Assignment
 from .paths import KlmsPaths
-from .provider_state import ProviderLoad
+from .provider_state import ProviderLoad, live_provider_load_from_result, run_list_authenticated
 from .session import KlmsSessionBootstrap, build_session_bootstrap
 from .validate import looks_klms_error_html
 
@@ -563,26 +563,15 @@ class AssignmentService:
         limit: int | None = None,
         include_past: bool = False,
     ) -> CommandResult:
-        config = load_config(self._paths)
-
-        def callback(context: Any, auth_mode: str) -> CommandResult:
-            return self.list_with_context(
-                context=context,
-                config=config,
-                auth_mode=auth_mode,
-                course_id=course_id,
-                course_query=course_query,
-                since_iso=since_iso,
-                limit=limit,
-                include_past=include_past,
-            )
-
-        return self._auth.run_authenticated(
-            config=config,
-            headless=True,
-            accept_downloads=False,
-            timeout_seconds=10.0,
-            callback=callback,
+        return run_list_authenticated(
+            self._auth,
+            paths=self._paths,
+            list_with_context=self.list_with_context,
+            course_id=course_id,
+            course_query=course_query,
+            since_iso=since_iso,
+            limit=limit,
+            include_past=include_past,
         )
 
     def load_for_dashboard(
@@ -598,23 +587,9 @@ class AssignmentService:
         deadline: RefreshDeadline | None = None,
     ) -> ProviderLoad:
         if deadline is not None and deadline.hard_expired():
-            return ProviderLoad(
-                items=[],
-                source="moodle_ajax",
-                capability="degraded",
-                freshness_mode="live",
-                cache_hit=False,
-                stale=False,
-                fetched_at=None,
-                expires_at=None,
-                refresh_attempted=False,
-                ok=False,
-                warnings=(
-                    {
-                        "code": "LIVE_REFRESH_TIMEOUT",
-                        "message": "Interactive refresh budget expired before the assignment refresh started.",
-                    },
-                ),
+            return live_provider_load_from_result(
+                CommandResult(data=[], source="moodle_ajax", capability="degraded"),
+                deadline=deadline,
             )
 
         result = self.list_with_context(
@@ -626,18 +601,10 @@ class AssignmentService:
             limit=limit,
             bootstrap=bootstrap,
         )
-        rows = [row for row in result.data if isinstance(row, dict)] if isinstance(result.data, list) else []
-        return ProviderLoad(
-            items=rows,
-            source=result.source,
-            capability=result.capability,
-            freshness_mode="live",
-            cache_hit=False,
-            stale=False,
+        return live_provider_load_from_result(
+            result,
+            deadline=None,
             fetched_at=_iso_now_utc(),
-            expires_at=None,
-            refresh_attempted=True,
-            ok=True,
         )
 
     def show(self, assignment_id: str, *, course_id_hint: str | None = None) -> CommandResult:

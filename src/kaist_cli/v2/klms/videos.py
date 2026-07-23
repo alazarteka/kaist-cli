@@ -14,19 +14,13 @@ from .courses import (
     _CourseMetadataMap,
     _CourseMetadataRow,
     _course_code_base,
-    _course_metadata_map,
-    _course_matches_query,
-    _empty_course_metadata_row,
-    _discover_courses_from_dashboard,
-    _is_noise_course,
-    _load_recent_courses_from_bootstrap,
-    _merge_course_metadata_rows,
+    course_map_for_request,
     _norm_text,
-    _select_dashboard_courses,
 )
 from .models import Video
 from .media_recency import observe_videos
 from .paths import KlmsPaths
+from .provider_state import run_list_authenticated
 from .session import KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
 from .validate import looks_klms_error_html
 from .moodle_html import in_header_like_region
@@ -55,13 +49,6 @@ def _simplify_video_title(text: str) -> str:
         if head.strip() and tail.strip():
             return tail.strip()
     return title
-
-
-def _course_map_from_dashboard(html: str, *, base_url: str, configured_ids: tuple[str, ...]) -> _CourseMetadataMap:
-    return _course_metadata_map(
-        _discover_courses_from_dashboard(html, base_url=base_url),
-        configured_ids=configured_ids,
-    )
 
 
 def _merge_videos(items: list[Video]) -> list[Video]:
@@ -241,25 +228,14 @@ class VideoService:
         limit: int | None = None,
         recent: bool = False,
     ) -> CommandResult:
-        config = load_config(self._paths)
-
-        def callback(context: Any, auth_mode: str) -> CommandResult:
-            return self.list_with_context(
-                context=context,
-                config=config,
-                auth_mode=auth_mode,
-                course_id=course_id,
-                course_query=course_query,
-                limit=limit,
-                recent=recent,
-            )
-
-        return self._auth.run_authenticated(
-            config=config,
-            headless=True,
-            accept_downloads=False,
-            timeout_seconds=10.0,
-            callback=callback,
+        return run_list_authenticated(
+            self._auth,
+            paths=self._paths,
+            list_with_context=self.list_with_context,
+            course_id=course_id,
+            course_query=course_query,
+            limit=limit,
+            recent=recent,
         )
 
     def show(self, video_id_or_url: str, *, course_id_hint: str | None = None) -> CommandResult:
@@ -411,35 +387,14 @@ class VideoService:
         course_id: str | None,
         course_query: str | None = None,
     ) -> _CourseMetadataMap:
-        course_map = _course_map_from_dashboard(bootstrap.dashboard_html, base_url=config.base_url, configured_ids=config.course_ids)
-        course_map = _merge_course_metadata_rows(
-            course_map,
-            _load_recent_courses_from_bootstrap(
-                self._paths,
-                bootstrap,
-                exclude_patterns=config.exclude_course_title_patterns,
-            ),
+        return course_map_for_request(
+            self._paths,
+            bootstrap,
+            config=config,
+            course_id=course_id,
+            course_query=course_query,
+            include_noise=True,
         )
-        if course_id:
-            target = str(course_id).strip()
-            course_meta = course_map.get(target) or _empty_course_metadata_row(target)
-            return {target: course_meta}
-        discovered = _select_dashboard_courses(
-            bootstrap.dashboard_html,
-            base_url=config.base_url,
-            exclude_patterns=config.exclude_course_title_patterns,
-            course_query=None,
-            include_past=False,
-            allow_termless_fallback=True,
-        )
-        selected_ids = {str(course.id).strip() for course in discovered if str(course.id).strip()}
-        return {
-            key: value
-            for key, value in course_map.items()
-            if key in selected_ids
-            if not _is_noise_course(str(value.get("course_title") or ""), config.exclude_course_title_patterns)
-            and _course_matches_query(value, course_query)
-        }
 
     def _resolve_target_video(
         self,

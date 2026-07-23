@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlparse
 from bs4 import BeautifulSoup  # type: ignore[import-untyped]
 
 from ..contracts import CommandError, CommandResult
-from ...core.timeutil import cache_is_fresh_enough as _cache_is_fresh_enough, iso_from_epoch_seconds as _iso_from_epoch_seconds
+from ...core.timeutil import iso_from_epoch_seconds as _iso_from_epoch_seconds
 from .moodle_html import (
     discover_notice_board_ids_from_course_page as _discover_notice_board_ids_from_course_page,
     table_col_index,
@@ -34,7 +34,13 @@ from .deadline import RefreshDeadline
 from .file_metadata import file_extension, guess_mime_type
 from .models import Notice
 from .paths import KlmsPaths
-from .provider_state import ProviderLoad
+from .provider_state import (
+    CachedProviderSnapshot,
+    ProviderLoad,
+    load_cached_or_refresh,
+    provider_warning as _provider_warning,
+    run_list_authenticated,
+)
 from .session import KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
 from .validate import looks_klms_error_html
 
@@ -604,12 +610,6 @@ def _matching_notice_count(items: list[Notice], *, since_iso: str | None) -> int
     return sum(1 for item in items if item.posted_iso and item.posted_iso >= floor)
 
 
-def _provider_warning(code: str, message: str, **extra: Any) -> dict[str, Any]:
-    payload: dict[str, Any] = {"code": code, "message": message}
-    payload.update(extra)
-    return payload
-
-
 def _notice_detail_target(notice: Notice, *, base_url: str) -> str | None:
     if notice.url:
         return str(notice.url)
@@ -918,58 +918,8 @@ class NoticeService:
         cached_rows = cache_entry.get("value") if isinstance(cache_entry, dict) else None
         cached_items = [Notice(**row) for row in cached_rows if isinstance(row, dict)] if isinstance(cached_rows, list) else []
         cached_filtered = _finalize_notice_items(cached_items, since_iso=since_iso, limit=limit)
-        cache_fresh_enough = _cache_is_fresh_enough(cache_entry)
-        if prefer_cache and cache_entry is not None and (not bool(cache_entry.get("stale")) or cache_fresh_enough):
-            return ProviderLoad(
-                items=[item.to_dict() for item in cached_filtered],
-                source="html",
-                capability="partial",
-                freshness_mode="cache",
-                cache_hit=True,
-                stale=bool(cache_entry.get("stale")),
-                fetched_at=_iso_from_epoch_seconds(cache_entry.get("stored_at")),
-                expires_at=_iso_from_epoch_seconds(cache_entry.get("expires_at")),
-                refresh_attempted=False,
-                ok=True,
-            )
 
-        if deadline is not None and deadline.hard_expired():
-            if cache_entry is not None and cached_filtered:
-                warnings: list[dict[str, Any]] = []
-                if not _cache_is_fresh_enough(cache_entry):
-                    warnings.append(_provider_warning("LIVE_REFRESH_TIMEOUT", "Interactive refresh budget expired before notice refresh completed."))
-                if bool(cache_entry.get("stale")):
-                    warnings.insert(0, _provider_warning("STALE_CACHE", "Returning stale notice cache because live refresh could not finish in time."))
-                return ProviderLoad(
-                    items=[item.to_dict() for item in cached_filtered],
-                    source="html",
-                    capability="partial",
-                    freshness_mode="cache",
-                    cache_hit=True,
-                    stale=bool(cache_entry.get("stale")),
-                    fetched_at=_iso_from_epoch_seconds(cache_entry.get("stored_at")),
-                    expires_at=_iso_from_epoch_seconds(cache_entry.get("expires_at")),
-                    refresh_attempted=True,
-                    ok=True,
-                    warnings=tuple(warnings),
-                )
-            return ProviderLoad(
-                items=[],
-                source="html",
-                capability="degraded",
-                freshness_mode="live",
-                cache_hit=False,
-                stale=False,
-                fetched_at=None,
-                expires_at=None,
-                refresh_attempted=False,
-                ok=False,
-                warnings=(
-                    _provider_warning("LIVE_REFRESH_TIMEOUT", "Interactive refresh budget expired before notice refresh started."),
-                ),
-            )
-
-        try:
+        def refresh() -> tuple[list[dict[str, Any]], Any, Any]:
             live_items = self._refresh_notice_items(
                 config=config,
                 auth_mode=auth_mode,
@@ -980,92 +930,27 @@ class NoticeService:
                 bootstrap=bootstrap,
                 deadline=deadline,
             )
-        except TimeoutError:
-            if cache_entry is not None and cached_filtered:
-                warnings: list[dict[str, Any]] = []
-                if not _cache_is_fresh_enough(cache_entry):
-                    warnings.append(_provider_warning("LIVE_REFRESH_TIMEOUT", "Notice refresh exceeded the interactive deadline."))
-                if bool(cache_entry.get("stale")):
-                    warnings.insert(0, _provider_warning("STALE_CACHE", "Returning stale notice cache because live refresh timed out."))
-                return ProviderLoad(
-                    items=[item.to_dict() for item in cached_filtered],
-                    source="html",
-                    capability="partial",
-                    freshness_mode="cache",
-                    cache_hit=True,
-                    stale=bool(cache_entry.get("stale")),
-                    fetched_at=_iso_from_epoch_seconds(cache_entry.get("stored_at")),
-                    expires_at=_iso_from_epoch_seconds(cache_entry.get("expires_at")),
-                    refresh_attempted=True,
-                    ok=True,
-                    warnings=tuple(warnings),
-                )
-            return ProviderLoad(
-                items=[],
-                source="html",
-                capability="degraded",
-                freshness_mode="live",
-                cache_hit=False,
-                stale=False,
-                fetched_at=None,
-                expires_at=None,
-                refresh_attempted=True,
-                ok=False,
-                warnings=(
-                    _provider_warning("LIVE_REFRESH_TIMEOUT", "Notice refresh exceeded the interactive deadline."),
-                ),
-            )
-        except CommandError:
-            raise
-        except Exception as exc:
-            if cache_entry is not None and cached_filtered:
-                warnings: list[dict[str, Any]] = []
-                if not _cache_is_fresh_enough(cache_entry):
-                    warnings.append(_provider_warning("LIVE_REFRESH_FAILED", "Notice refresh failed; returning cached notice data.", error=str(exc)))
-                if bool(cache_entry.get("stale")):
-                    warnings.insert(0, _provider_warning("STALE_CACHE", "Returning stale notice cache because live refresh failed."))
-                return ProviderLoad(
-                    items=[item.to_dict() for item in cached_filtered],
-                    source="html",
-                    capability="partial",
-                    freshness_mode="cache",
-                    cache_hit=True,
-                    stale=bool(cache_entry.get("stale")),
-                    fetched_at=_iso_from_epoch_seconds(cache_entry.get("stored_at")),
-                    expires_at=_iso_from_epoch_seconds(cache_entry.get("expires_at")),
-                    refresh_attempted=True,
-                    ok=True,
-                    warnings=tuple(warnings),
-                )
-            return ProviderLoad(
-                items=[],
-                source="html",
-                capability="degraded",
-                freshness_mode="live",
-                cache_hit=False,
-                stale=False,
-                fetched_at=None,
-                expires_at=None,
-                refresh_attempted=True,
-                ok=False,
-                warnings=(
-                    _provider_warning("LIVE_REFRESH_FAILED", "Notice refresh failed.", error=str(exc)),
-                ),
+            live_filtered = _finalize_notice_items(live_items, since_iso=since_iso, limit=limit)
+            return ([item.to_dict() for item in live_filtered], "html", "partial")
+
+        def fresh_timestamps() -> tuple[str | None, str | None]:
+            fresh_entry = load_cache_entry(self._paths, cache_key)
+            return (
+                _iso_from_epoch_seconds((fresh_entry or {}).get("stored_at")),
+                _iso_from_epoch_seconds((fresh_entry or {}).get("expires_at")),
             )
 
-        live_filtered = _finalize_notice_items(live_items, since_iso=since_iso, limit=limit)
-        fresh_entry = load_cache_entry(self._paths, cache_key)
-        return ProviderLoad(
-            items=[item.to_dict() for item in live_filtered],
-            source="html",
-            capability="partial",
-            freshness_mode="live",
-            cache_hit=False,
-            stale=False,
-            fetched_at=_iso_from_epoch_seconds((fresh_entry or {}).get("stored_at")),
-            expires_at=_iso_from_epoch_seconds((fresh_entry or {}).get("expires_at")),
-            refresh_attempted=True,
-            ok=True,
+        return load_cached_or_refresh(
+            prefer_cache=prefer_cache,
+            deadline=deadline,
+            snapshot=CachedProviderSnapshot(
+                items=[item.to_dict() for item in cached_filtered],
+                cache_entry=cache_entry,
+                source="html",
+            ),
+            refresh=refresh,
+            resource_label="notice",
+            fresh_timestamps=fresh_timestamps,
         )
 
     def refresh_cache_with_context(
@@ -1099,28 +984,17 @@ class NoticeService:
         since_iso: str | None = None,
         limit: int | None = None,
     ) -> CommandResult:
-        config = load_config(self._paths)
         max_pages = max(1, min(max_pages, 10))
-
-        def callback(context: Any, auth_mode: str) -> CommandResult:
-            return self.list_with_context(
-                context=context,
-                config=config,
-                auth_mode=auth_mode,
-                notice_board_id=notice_board_id,
-                course_id=course_id,
-                course_query=course_query,
-                max_pages=max_pages,
-                since_iso=since_iso,
-                limit=limit,
-            )
-
-        return self._auth.run_authenticated(
-            config=config,
-            headless=True,
-            accept_downloads=False,
-            timeout_seconds=10.0,
-            callback=callback,
+        return run_list_authenticated(
+            self._auth,
+            paths=self._paths,
+            list_with_context=self.list_with_context,
+            notice_board_id=notice_board_id,
+            course_id=course_id,
+            course_query=course_query,
+            max_pages=max_pages,
+            since_iso=since_iso,
+            limit=limit,
         )
 
     def show(
