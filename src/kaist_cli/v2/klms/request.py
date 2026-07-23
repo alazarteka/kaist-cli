@@ -108,8 +108,10 @@ class RequestService:
             if content_type and "json" in content_type.lower():
                 try:
                     payload["body_json"] = json.loads(body_text)
-                except Exception:
-                    pass
+                    payload["json_parse_ok"] = True
+                except Exception as exc:  # noqa: BLE001
+                    payload["json_parse_ok"] = False
+                    payload["parse_error"] = str(exc)
             return CommandResult(data=payload, source="browser", capability="full")
 
         return self._auth.run_authenticated(

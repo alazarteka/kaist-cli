@@ -636,7 +636,7 @@ def _page_has_authenticated_klms_session(page: Any, *, config: KlmsConfig) -> bo
         return False
     html = _safe_page_content(page)
     if html is None:
-        return True
+        return False
     return not looks_logged_out_html(html)
 
 
@@ -696,12 +696,7 @@ def storage_state_cookie_stats(paths: KlmsPaths) -> dict[str, Any] | None:
 
 
 def record_auth_verified(paths: KlmsPaths) -> None:
-    """Persist the moment a live dashboard check last confirmed an authenticated session.
-
-    This is the honest "we know you were logged in at X" signal — written only when
-    ``_context_dashboard_state`` actually reached an authenticated dashboard, never on
-    mere file activity.
-    """
+    """Write last_verified_at after a live dashboard check confirms an authenticated session."""
     ensure_private_dirs(paths)
     try:
         paths.auth_verified_path.write_text(
@@ -1056,12 +1051,7 @@ class AuthService:
 
     @staticmethod
     def _session_expiry(cookie_stats: dict[str, Any] | None) -> dict[str, Any]:
-        """Report when the saved session expires, grounded in real cookie data.
-
-        Uses only the persisted ``MoodleSession`` cookie. When that auth cookie has
-        no absolute expiry, we say so honestly rather than using an unrelated
-        persistent cookie as a proxy; the live dashboard check remains the real gate.
-        """
+        """Report MoodleSession cookie expiry; unknown when the cookie has no absolute expiry."""
         if not isinstance(cookie_stats, dict) or "read_error" in cookie_stats:
             return {
                 "source": "unknown",
@@ -1084,11 +1074,34 @@ class AuthService:
 
     def snapshot(self) -> dict[str, Any]:
         ensure_private_dirs(self._paths)
-        config = maybe_load_config(self._paths)
+        config_error: dict[str, Any] | None = None
+        try:
+            config = maybe_load_config(self._paths)
+        except CommandError as exc:
+            # Status/probe paths must surface invalid config without raising so
+            # callers can recommend `auth login` to rewrite the file.
+            if exc.code != "CONFIG_INVALID":
+                raise
+            config = None
+            config_error = {
+                "code": exc.code,
+                "message": exc.message,
+                "hint": exc.hint,
+            }
         mode = active_auth_mode(self._paths)
         staged_auth_session = self._session_snapshot()
         cookie_stats = storage_state_cookie_stats(self._paths)
-        return {
+        recommended = self._recommended_action(
+            config=config,
+            mode=mode,
+            staged_auth_session=staged_auth_session,
+        )
+        if config_error is not None:
+            recommended = (
+                "Run `kaist klms auth login --base-url https://klms.kaist.ac.kr` "
+                "to rewrite the invalid config."
+            )
+        payload: dict[str, Any] = {
             "configured": config is not None,
             "config_path": str(self._paths.config_path),
             "profile_path": str(self._paths.profile_dir),
@@ -1110,8 +1123,11 @@ class AuthService:
                 "url_needles": list(URL_LOGIN_NEEDLES),
                 "app_login_paths": list(APP_LOGIN_PATHS),
             },
-            "recommended_action": self._recommended_action(config=config, mode=mode, staged_auth_session=staged_auth_session),
+            "recommended_action": recommended,
         }
+        if config_error is not None:
+            payload["config_error"] = config_error
+        return payload
 
     def _session_snapshot(self) -> dict[str, Any] | None:
         payload = self._load_current_auth_session()
@@ -1150,13 +1166,26 @@ class AuthService:
         return CommandResult(data=snapshot, source="bootstrap", capability="partial")
 
     def _live_check(self, *, timeout_seconds: float = 20.0) -> dict[str, Any]:
-        """Confirm the saved session against a live KLMS dashboard fetch.
-
-        Returns an authenticated, unauthenticated, or unknown result rather than
-        raising, so ``auth status --verify`` always renders. A successful check also
-        refreshes ``last_verified_at`` via ``run_authenticated_with_state``.
-        """
-        config = maybe_load_config(self._paths)
+        """Live dashboard check for ``auth status --verify``; soft-fails to the caller."""
+        try:
+            config = maybe_load_config(self._paths)
+        except CommandError as exc:
+            note = (
+                "KLMS config is invalid; run `kaist klms auth login` to rewrite it."
+                if exc.code == "CONFIG_INVALID"
+                else None
+            )
+            payload: dict[str, Any] = {
+                "authenticated": None,
+                "code": exc.code,
+                "detail": exc.message,
+                "checked_at": utc_now_iso(),
+            }
+            if note is not None:
+                payload["note"] = note
+            if exc.retryable:
+                payload["retryable"] = True
+            return payload
         if config is None:
             return {
                 "authenticated": None,
@@ -1242,7 +1271,12 @@ class AuthService:
         username: str | None = None,
         require_email_otp_strategy: bool = True,
     ) -> tuple[KlmsConfig | None, str]:
-        config = maybe_load_config(self._paths)
+        try:
+            config = maybe_load_config(self._paths)
+        except CommandError as exc:
+            if exc.code != "CONFIG_INVALID":
+                raise
+            config = None
         resolved_username = str(username or "").strip() or (config.auth_username if config else None)
         if require_email_otp_strategy and (config is None or config.auth_strategy != "email_otp"):
             raise CommandError(
@@ -1353,7 +1387,20 @@ class AuthService:
         dashboard_path: str | None = None,
         username: str | None = None,
     ) -> tuple[KlmsConfig, str]:
-        existing = maybe_load_config(self._paths)
+        try:
+            existing = maybe_load_config(self._paths)
+        except CommandError as exc:
+            # Do not rewrite via save_config defaults (easy_login); email OTP
+            # recovery must go through setup-email-otp so strategy stays correct.
+            if exc.code != "CONFIG_INVALID":
+                raise
+            raise CommandError(
+                code="CONFIG_INVALID",
+                message=exc.message,
+                hint="Run `kaist klms auth setup-email-otp --username <KAIST_ID>` to rewrite the invalid config.",
+                exit_code=40,
+                retryable=False,
+            ) from exc
         resolved_username = str(username or "").strip() or (existing.auth_username if existing else None)
         config = save_config(
             self._paths,
@@ -1548,6 +1595,8 @@ class AuthService:
             updated["finished_at"] = utc_now_iso()
             return updated
 
+        # Best-effort side effect: persistence failure must not mask the primary
+        # auth error or prevent the worker from replying to the client.
         try:
             from .auth_session import update_auth_session
 
@@ -2619,7 +2668,13 @@ class AuthService:
         username: str | None = None,
         wait_seconds: float = EASY_LOGIN_DEFAULT_WAIT_SECONDS,
     ) -> CommandResult:
-        existing = maybe_load_config(self._paths)
+        try:
+            existing = maybe_load_config(self._paths)
+        except CommandError as exc:
+            # Corrupt config should fall through to login, which rewrites via save_config.
+            if exc.code != "CONFIG_INVALID":
+                raise
+            existing = None
         resolved_username = str(username or "").strip() or (existing.auth_username if existing else None)
         if existing is not None and existing.auth_strategy == "email_otp":
             return self.begin_refresh(

@@ -968,10 +968,6 @@ class FileService:
         if_exists: str,
         auth_mode: str,
     ) -> dict[str, Any]:
-        """Download prepared file items and retain their generic pull outcomes.
-
-        Callers own candidate discovery and any surface-specific result decoration.
-        """
         candidate_course_ids = {str(item.course_id).strip() for item in items if str(item.course_id or "").strip()}
         include_course_dirs = len(candidate_course_ids) != 1
         base_root = _resolve_destination_root(files_root=self._paths.files_root, subdir=subdir, dest=dest)

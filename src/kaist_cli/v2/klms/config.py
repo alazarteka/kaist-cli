@@ -56,14 +56,14 @@ def _normalize_auth_username(value: str | None) -> str | None:
 
 def _normalize_auth_strategy(value: str | None) -> AuthStrategy:
     text = str(value or "easy_login").strip().lower() or "easy_login"
-    if text not in {"easy_login", "email_otp"}:
-        raise CommandError(
-            code="CONFIG_INVALID",
-            message=f"Unsupported auth_strategy: {value}",
-            hint="Use `easy_login` or `email_otp`.",
-            exit_code=40,
-        )
-    return text  # type: ignore[return-value]
+    if text == "easy_login" or text == "email_otp":
+        return text
+    raise CommandError(
+        code="CONFIG_INVALID",
+        message=f"Unsupported auth_strategy: {value}",
+        hint="Use `easy_login` or `email_otp`.",
+        exit_code=40,
+    )
 
 
 def _normalize_otp_source(value: str | None) -> str | None:
@@ -128,8 +128,10 @@ def load_config(paths: KlmsPaths) -> KlmsConfig:
 def maybe_load_config(paths: KlmsPaths) -> KlmsConfig | None:
     try:
         return load_config(paths)
-    except CommandError:
-        return None
+    except CommandError as exc:
+        if exc.code == "CONFIG_MISSING":
+            return None
+        raise
 
 
 def save_config(
@@ -142,7 +144,13 @@ def save_config(
     otp_source: str | None = None,
 ) -> KlmsConfig:
     ensure_private_dirs(paths)
-    existing = maybe_load_config(paths)
+    try:
+        existing = maybe_load_config(paths)
+    except CommandError as exc:
+        # Allow login/setup flows to rewrite a corrupt or invalid config in place.
+        if exc.code != "CONFIG_INVALID":
+            raise
+        existing = None
     resolved_base_url = _normalize_base_url(base_url or (existing.base_url if existing else ""))
     resolved_dashboard_path = _normalize_dashboard_path(dashboard_path or (existing.dashboard_path if existing else "/my/"))
     resolved_auth_username = (

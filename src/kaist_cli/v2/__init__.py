@@ -1,2 +1,2 @@
-"""Clean-break rewrite scaffold for kaist-cli."""
+"""KLMS implementation package for kaist-cli."""
 

@@ -8,7 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
-from ..contracts import CommandResult
+from ..contracts import CommandError, CommandResult
 from .auth import APP_LOGIN_PATHS, AuthService, extract_sesskey, looks_logged_out_html, looks_login_url
 from .config import abs_url, maybe_load_config
 from .discovery import load_json_summary, load_recent_courses_args
@@ -361,7 +361,13 @@ class CapabilityProbeService:
 
     def probe(self, *, live: bool = False, timeout_seconds: float = 10.0) -> CommandResult:
         auth_snapshot = self._auth.snapshot()
-        config = maybe_load_config(self._paths)
+        try:
+            config = maybe_load_config(self._paths)
+        except CommandError as exc:
+            # Probe already soft-handles missing config; treat invalid the same.
+            if exc.code != "CONFIG_INVALID":
+                raise
+            config = None
         api_map = load_json_summary(str(self._paths.api_map_path))
         endpoint_discovery = load_json_summary(str(self._paths.endpoint_discovery_path))
 

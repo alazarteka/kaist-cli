@@ -254,15 +254,12 @@ def _content_length_from_response(response: Any) -> int | None:
     headers = getattr(response, "headers", None)
     if headers is None:
         return None
-    try:
-        content_length = headers.get("Content-Length")
-    except Exception:
-        content_length = None
+    content_length = headers.get("Content-Length")
     if content_length in {None, ""}:
         return None
     try:
         value = int(content_length)
-    except Exception:
+    except (TypeError, ValueError):
         return None
     return value if value > 0 else None
 
@@ -581,10 +578,15 @@ def _sync_claude_plugin_metadata(install_root: Path, *, version: str) -> Path:
     if source_plugin_manifest_path.exists():
         try:
             raw_plugin_payload = json.loads(source_plugin_manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            raw_plugin_payload = None
-        if isinstance(raw_plugin_payload, dict):
-            plugin_payload = raw_plugin_payload
+        except Exception as exc:
+            raise SelfUpdateError(
+                f"Invalid plugin manifest at {source_plugin_manifest_path}: {exc}"
+            ) from exc
+        if not isinstance(raw_plugin_payload, dict):
+            raise SelfUpdateError(
+                f"Plugin manifest at {source_plugin_manifest_path} must be a JSON object"
+            )
+        plugin_payload = raw_plugin_payload
     _write_json(plugin_manifest_path, plugin_payload)
 
     marketplace_payload = {
@@ -604,18 +606,21 @@ def _sync_claude_plugin_metadata(install_root: Path, *, version: str) -> Path:
     if source_marketplace_manifest_path.exists():
         try:
             raw_marketplace_payload = json.loads(source_marketplace_manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            raw_marketplace_payload = None
-        if isinstance(raw_marketplace_payload, dict):
-            marketplace_payload = raw_marketplace_payload
+        except Exception as exc:
+            raise SelfUpdateError(
+                f"Invalid marketplace manifest at {source_marketplace_manifest_path}: {exc}"
+            ) from exc
+        if not isinstance(raw_marketplace_payload, dict):
+            raise SelfUpdateError(
+                f"Marketplace manifest at {source_marketplace_manifest_path} must be a JSON object"
+            )
+        marketplace_payload = raw_marketplace_payload
     plugins = marketplace_payload.get("plugins")
     if not isinstance(plugins, list) or not plugins:
-        plugins = [{}]
-        marketplace_payload["plugins"] = plugins
+        raise SelfUpdateError("Marketplace manifest must include a non-empty plugins list")
     first = plugins[0]
     if not isinstance(first, dict):
-        first = {}
-        plugins[0] = first
+        raise SelfUpdateError("Marketplace plugins[0] must be an object")
     first["version"] = str(version)
     first["source"] = "./plugins/kaist-cli"
     _write_json(marketplace_manifest_path, marketplace_payload)

@@ -9,12 +9,7 @@ from typing import Any, Callable, Iterator
 
 @contextmanager
 def file_lock(lock_path: Path, *, blocking: bool = True) -> Iterator[None]:
-    """
-    Process-level advisory lock for file-backed state.
-
-    Uses flock on Unix. The lock file is separate from the data file to keep
-    read/write call sites straightforward.
-    """
+    """Process-level advisory flock; lock file is separate from the data file."""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = open(lock_path, "a+b")
     try:

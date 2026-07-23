@@ -673,6 +673,67 @@ def test_distribution_discovers_managed_onedir_bundle(tmp_path: Path) -> None:
     assert info.manifest.binary_relpath == "bin/kaist/kaist"
 
 
+def test_sync_claude_plugin_metadata_rejects_corrupt_manifests(tmp_path: Path) -> None:
+    install_root = tmp_path / "install-root"
+    skill_root = install_root / "current" / "skills" / "kaist-cli" / ".claude-plugin"
+    skill_root.mkdir(parents=True)
+    (install_root / "current" / "skills" / "kaist-cli" / "SKILL.md").write_text("# skill\n", encoding="utf-8")
+
+    (skill_root / "plugin.json").write_text("{not-json", encoding="utf-8")
+    (skill_root / "marketplace.json").write_text(
+        json.dumps(
+            {
+                "name": "kaist-cli",
+                "owner": {"name": "kaist-cli"},
+                "plugins": [{"name": "kaist-cli", "source": "."}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(updater.SelfUpdateError, match="Invalid plugin manifest"):
+        updater._sync_claude_plugin_metadata(install_root, version="0.5.3")  # type: ignore[attr-defined]
+
+    (skill_root / "plugin.json").write_text(json.dumps({"name": "kaist-cli"}), encoding="utf-8")
+    (skill_root / "marketplace.json").write_text("{not-json", encoding="utf-8")
+    with pytest.raises(updater.SelfUpdateError, match="Invalid marketplace manifest"):
+        updater._sync_claude_plugin_metadata(install_root, version="0.5.3")  # type: ignore[attr-defined]
+
+    (skill_root / "marketplace.json").write_text(
+        json.dumps({"name": "kaist-cli", "owner": {"name": "kaist-cli"}, "plugins": []}),
+        encoding="utf-8",
+    )
+    with pytest.raises(updater.SelfUpdateError, match="non-empty plugins list"):
+        updater._sync_claude_plugin_metadata(install_root, version="0.5.3")  # type: ignore[attr-defined]
+
+    (skill_root / "plugin.json").write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+    (skill_root / "marketplace.json").write_text(
+        json.dumps(
+            {
+                "name": "kaist-cli",
+                "owner": {"name": "kaist-cli"},
+                "plugins": [{"name": "kaist-cli", "source": "."}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(updater.SelfUpdateError, match="must be a JSON object"):
+        updater._sync_claude_plugin_metadata(install_root, version="0.5.3")  # type: ignore[attr-defined]
+
+    (skill_root / "plugin.json").write_text(json.dumps({"name": "kaist-cli"}), encoding="utf-8")
+    (skill_root / "marketplace.json").write_text(
+        json.dumps(
+            {
+                "name": "kaist-cli",
+                "owner": {"name": "kaist-cli"},
+                "plugins": ["not-an-object"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(updater.SelfUpdateError, match="plugins\\[0\\] must be an object"):
+        updater._sync_claude_plugin_metadata(install_root, version="0.5.3")  # type: ignore[attr-defined]
+
+
 def test_install_script_detects_linux_glibc_target(tmp_path: Path) -> None:
     downloads_dir = tmp_path / "downloads"
     _prepare_release_dir(downloads_dir, "v0.1.4", target="linux-x86_64-gnu", bundle_mode="onedir")
