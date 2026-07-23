@@ -244,18 +244,27 @@ def _load_recent_courses_from_bootstrap(
         return []
 
 
-def _course_map_from_dashboard(html: str, *, base_url: str, configured_ids: tuple[str, ...]) -> _CourseMetadataMap:
-    return _course_metadata_map(
-        _select_dashboard_courses(
+def _course_map_from_dashboard(
+    html: str,
+    *,
+    base_url: str,
+    configured_ids: tuple[str, ...],
+    include_noise: bool = False,
+) -> _CourseMetadataMap:
+    if include_noise:
+        # Videos historically keep noise courses in the metadata map so an
+        # explicit course_id lookup still gets dashboard title/code.
+        discovered = _discover_courses_from_dashboard(html, base_url=base_url)
+    else:
+        discovered = _select_dashboard_courses(
             html,
             base_url=base_url,
             exclude_patterns=(),
             course_query=None,
             include_past=True,
             allow_termless_fallback=True,
-        ),
-        configured_ids=configured_ids,
-    )
+        )
+    return _course_metadata_map(discovered, configured_ids=configured_ids)
 
 
 def course_map_for_request(
@@ -265,11 +274,13 @@ def course_map_for_request(
     config: KlmsConfig,
     course_id: str | None,
     course_query: str | None = None,
+    include_noise: bool = False,
 ) -> _CourseMetadataMap:
     course_map = _course_map_from_dashboard(
         bootstrap.dashboard_html,
         base_url=config.base_url,
         configured_ids=config.course_ids,
+        include_noise=include_noise,
     )
     course_map = _merge_course_metadata_rows(
         course_map,

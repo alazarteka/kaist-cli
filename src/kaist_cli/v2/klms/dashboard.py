@@ -371,7 +371,7 @@ class DashboardService:
         def build_result(context: Any, auth_mode: str, bootstrap: Any) -> CommandResult:
             warnings: list[dict[str, Any]] = []
             provider_status: dict[str, Any] = {}
-            loads = self._collect_parallel_loads(
+            loads = self._run_components_parallel(
                 [
                     (
                         "assignments",
@@ -466,7 +466,7 @@ class DashboardService:
         def build_result(context: Any, auth_mode: str, bootstrap: Any) -> CommandResult:
             warnings: list[dict[str, Any]] = []
             provider_status: dict[str, Any] = {}
-            loads = self._collect_parallel_loads(
+            loads = self._run_components_parallel(
                 [
                     (
                         "assignments",
@@ -585,7 +585,7 @@ class DashboardService:
             warnings.extend(assignments_load.provider_warnings("assignments"))
             provider_status["assignments"] = assignments_load.provider_status()
 
-            loads = self._collect_parallel_loads(
+            loads = self._run_components_parallel(
                 [
                     (
                         "notices",
@@ -750,16 +750,6 @@ class DashboardService:
                 ),
             )
         return result
-
-    @classmethod
-    def _collect_parallel_loads(
-        cls,
-        components: list[tuple[str, Callable[[], ProviderLoad]]],
-        *,
-        warnings: list[dict[str, Any]],
-        provider_status: dict[str, Any],
-    ) -> dict[str, ProviderLoad]:
-        return cls._run_components_parallel(components, warnings=warnings, provider_status=provider_status)
 
     @classmethod
     def _run_components_parallel(

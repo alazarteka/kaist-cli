@@ -393,6 +393,7 @@ class VideoService:
             config=config,
             course_id=course_id,
             course_query=course_query,
+            include_noise=True,
         )
 
     def _resolve_target_video(
