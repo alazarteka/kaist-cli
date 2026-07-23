@@ -35,7 +35,7 @@ def test_legacy_klms_module_is_removed() -> None:
 
 
 def test_v2_auth_module_does_not_import_playwright_at_module_load() -> None:
-    path = ROOT / "src" / "kaist_cli" / "v2" / "klms" / "auth.py"
+    path = ROOT / "src" / "kaist_cli" / "v2" / "klms" / "auth_browser.py"
     text = path.read_text(encoding="utf-8")
     module_header = text.split("def install_browser", maxsplit=1)[0]
     assert "from playwright.async_api import async_playwright" not in module_header
