@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import argparse
 
-from ...cli.help_format import HelpFormatter as _HelpFormatter
-from ...cli.help_format import dedent as _dedent
+from ...core.help_format import HelpFormatter as _HelpFormatter
+from ...core.help_format import dedent as _dedent
 from ...core.contracts import SystemAdapter
 from ...v2.parser import register_klms_parser
 

@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
-from ...cli.help_format import HelpFormatter as _HelpFormatter
-from ...cli.help_format import dedent as _dedent
+from ...core.help_format import HelpFormatter as _HelpFormatter
+from ...core.help_format import dedent as _dedent
 from ...core.contracts import SystemAdapter
 from . import auth, services
 

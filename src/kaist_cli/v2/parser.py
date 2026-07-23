@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from typing import Any, Callable
 
-from ..cli.help_format import HelpFormatter as _HelpFormatter
+from ..core.help_format import HelpFormatter as _HelpFormatter
 
 
 Handler = Callable[[argparse.Namespace], Any]

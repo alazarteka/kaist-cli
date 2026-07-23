@@ -1,12 +1,7 @@
+"""Compatibility re-export; prefer ``kaist_cli.core.help_format``."""
+
 from __future__ import annotations
 
-import argparse
-import textwrap
+from ..core.help_format import HelpFormatter, dedent
 
-
-class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
-    pass
-
-
-def dedent(text: str) -> str:
-    return textwrap.dedent(text).strip()
+__all__ = ["HelpFormatter", "dedent"]
