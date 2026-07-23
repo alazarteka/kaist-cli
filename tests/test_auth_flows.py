@@ -40,7 +40,7 @@ from kaist_cli.v2.klms.auth import _EasyLoginSignals, _extract_easy_login_error_
 from kaist_cli.v2.klms.assignments import AssignmentService, _extract_assignment_detail_from_html, _extract_assignment_rows_from_calendar_data, _filter_assignments
 from kaist_cli.v2.klms.courses import CourseService, _course_is_current_term, _course_matches_query, _course_metadata_map, _discover_courses_from_dashboard, _parse_recent_courses_payload
 from kaist_cli.v2.klms.capture import _courseboard_runtime_capture_summary, _extract_courseboard_js_hints
-from kaist_cli.v2.klms.config import load_config
+from kaist_cli.v2.klms.config import KlmsConfig, load_config, maybe_load_config, save_config
 from kaist_cli.v2.klms.dashboard import DashboardService, _build_inbox_items, _decorate_today_assignments, _filter_inbox_assignments, _filter_inbox_files, _select_materials, _select_recent_notices
 from kaist_cli.v2.klms.discovery import load_recent_courses_args, map_discovery_report
 from kaist_cli.v2.klms.files import FileService, _extract_file_items_from_course_contents, _extract_file_items_from_html, _normalize_file_item_metadata, _pull_subdir_for_item, _sanitize_relpath, _synthesize_file_item_from_url, _unwrap_moodle_ajax_payload
@@ -1919,3 +1919,237 @@ def test_install_browser_reports_linux_dependency_hint(tmp_path: Path, monkeypat
     assert error.code == "BROWSER_INSTALL_FAILED"
     assert "linux browser/system dependencies" in (error.hint or "").lower()
 
+
+def test_page_has_authenticated_session_false_when_content_unreadable() -> None:
+    config = KlmsConfig(
+        base_url="https://klms.kaist.ac.kr",
+        dashboard_path="/my/",
+        auth_username=None,
+        auth_strategy="easy_login",
+        otp_source=None,
+        course_ids=(),
+        notice_board_ids=(),
+        exclude_course_title_patterns=(),
+    )
+
+    class BrokenPage:
+        url = "https://klms.kaist.ac.kr/my/"
+
+        def content(self) -> str:
+            raise RuntimeError("page closed")
+
+    assert auth_module._page_has_authenticated_klms_session(BrokenPage(), config=config) is False
+
+
+def test_maybe_load_config_raises_on_invalid_config(tmp_path: Path) -> None:
+    monkey_home = tmp_path / "kaist-home"
+    config_path = monkey_home / "private" / "klms" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        'base_url = "https://klms.kaist.ac.kr"\nauth_strategy = "not-a-strategy"\n',
+        encoding="utf-8",
+    )
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(monkey_home)
+    try:
+        paths = resolve_paths()
+        with pytest.raises(CommandError) as exc_info:
+            maybe_load_config(paths)
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+    assert exc_info.value.code == "CONFIG_INVALID"
+
+
+def test_save_config_rewrites_invalid_existing_config(tmp_path: Path) -> None:
+    monkey_home = tmp_path / "kaist-home"
+    config_path = monkey_home / "private" / "klms" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("this is not valid toml [[[", encoding="utf-8")
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(monkey_home)
+    try:
+        paths = resolve_paths()
+        saved = save_config(paths, base_url="https://klms.kaist.ac.kr", auth_username="student123")
+        reloaded = load_config(paths)
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+    assert saved.base_url == "https://klms.kaist.ac.kr"
+    assert reloaded.auth_username == "student123"
+    assert reloaded.auth_strategy == "easy_login"
+
+
+def test_live_check_reports_invalid_config_as_unknown(tmp_path: Path) -> None:
+    monkey_home = tmp_path / "kaist-home"
+    config_path = monkey_home / "private" / "klms" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        'base_url = "https://klms.kaist.ac.kr"\nauth_strategy = "bogus"\n',
+        encoding="utf-8",
+    )
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(monkey_home)
+    try:
+        auth = AuthService(resolve_paths())
+        result = auth.status(verify=True).data["live_check"]
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+    assert result["authenticated"] is None
+    assert result["code"] == "CONFIG_INVALID"
+
+
+def test_persist_worker_failure_swallows_persistence_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    auth = AuthService(resolve_paths())
+
+    def boom_update_auth_session(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise OSError("disk full")
+
+    monkeypatch.setattr("kaist_cli.v2.klms.auth_session.update_auth_session", boom_update_auth_session)
+    auth._persist_worker_failure(
+        "sess-1",
+        CommandError(code="AUTH_FAILED", message="otp rejected", exit_code=10),
+    )
+
+
+def test_request_get_surfaces_json_parse_failure(tmp_path: Path) -> None:
+    class FakePage:
+        url = "https://klms.kaist.ac.kr/lib/ajax/service.php"
+
+        def evaluate(self, script: str, payload: dict[str, str]) -> dict[str, object]:
+            return {
+                "ok": True,
+                "status": 200,
+                "url": payload["url"],
+                "contentType": "application/json",
+                "text": "{not-json",
+            }
+
+        def close(self) -> None:
+            return None
+
+    class FakeContext:
+        def new_page(self) -> FakePage:
+            return FakePage()
+
+    class FakeAuth:
+        def run_authenticated(self, *, config, headless, accept_downloads, timeout_seconds, callback):  # type: ignore[no-untyped-def]
+            return callback(FakeContext(), "storage_state")
+
+    _write_config(tmp_path)
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        service = RequestService(paths, FakeAuth())  # type: ignore[arg-type]
+        result = service.get("/lib/ajax/service.php")
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert result.data["json_parse_ok"] is False
+    assert "parse_error" in result.data
+    assert "body_json" not in result.data
+
+
+def test_auth_status_surfaces_invalid_config_without_raising(tmp_path: Path) -> None:
+    monkey_home = tmp_path / "kaist-home"
+    config_path = monkey_home / "private" / "klms" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        'base_url = "https://klms.kaist.ac.kr"\nauth_strategy = "bogus"\n',
+        encoding="utf-8",
+    )
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(monkey_home)
+    try:
+        auth = AuthService(resolve_paths())
+        offline = auth.status(verify=False).data
+        verified = auth.status(verify=True).data
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert offline["configured"] is False
+    assert offline["config"] is None
+    assert offline["config_error"]["code"] == "CONFIG_INVALID"
+    assert "rewrite the invalid config" in offline["recommended_action"]
+
+    live_check = verified["live_check"]
+    assert live_check["authenticated"] is None
+    assert live_check["code"] == "CONFIG_INVALID"
+    assert verified["config_error"]["code"] == "CONFIG_INVALID"
+
+
+def test_auth_refresh_rewrites_invalid_config_via_login(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkey_home = tmp_path / "kaist-home"
+    config_path = monkey_home / "private" / "klms" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("this is not valid toml [[[", encoding="utf-8")
+    monkeypatch.setenv("KAIST_CLI_HOME", str(monkey_home))
+    auth = AuthService(resolve_paths())
+
+    def fake_login(**kwargs):  # type: ignore[no-untyped-def]
+        saved = save_config(
+            auth._paths,
+            base_url=kwargs.get("base_url") or "https://klms.kaist.ac.kr",
+            dashboard_path=kwargs.get("dashboard_path"),
+            auth_username=kwargs.get("username") or "student123",
+        )
+        return CommandResult(
+            data={"ok": True, "auth_username": saved.auth_username, "auth_strategy": saved.auth_strategy},
+            source="bootstrap",
+            capability="partial",
+        )
+
+    monkeypatch.setattr(auth, "login", fake_login)
+    result = auth.refresh(base_url="https://klms.kaist.ac.kr", username="student123")
+    reloaded = load_config(auth._paths)
+    assert result.data["ok"] is True
+    assert reloaded.auth_username == "student123"
+    assert reloaded.auth_strategy == "easy_login"
+
+
+def test_require_email_otp_config_raises_clearly_on_invalid_config(tmp_path: Path) -> None:
+    monkey_home = tmp_path / "kaist-home"
+    config_path = monkey_home / "private" / "klms" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    corrupt = 'base_url = "https://klms.kaist.ac.kr"\nauth_strategy = "bogus"\n'
+    config_path.write_text(corrupt, encoding="utf-8")
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(monkey_home)
+    try:
+        auth = AuthService(resolve_paths())
+        with pytest.raises(CommandError) as exc_info:
+            auth._require_email_otp_config(
+                base_url="https://klms.kaist.ac.kr",
+                username="student123",
+            )
+        assert config_path.read_text(encoding="utf-8") == corrupt
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert exc_info.value.code == "CONFIG_INVALID"
+    assert "setup-email-otp" in (exc_info.value.hint or "")

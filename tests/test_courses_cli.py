@@ -38,9 +38,9 @@ from kaist_cli.v2.klms.auth_session import clear_auth_session, load_auth_session
 from kaist_cli.v2.klms.auth import AuthService
 from kaist_cli.v2.klms.auth import _EasyLoginSignals, _extract_easy_login_error_message, _extract_easy_login_number, _extract_sso_login_view_url, _request_email_otp_delivery, _should_update_easy_login_number, _submit_password_login, looks_login_url
 from kaist_cli.v2.klms.assignments import AssignmentService, _extract_assignment_detail_from_html, _extract_assignment_rows_from_calendar_data, _filter_assignments
-from kaist_cli.v2.klms.courses import CourseService, _course_is_current_term, _course_matches_query, _course_metadata_map, _discover_courses_from_dashboard, _parse_recent_courses_payload
+from kaist_cli.v2.klms.courses import CourseService, _course_is_current_term, _course_matches_query, _course_metadata_map, _discover_courses_from_dashboard, _load_recent_courses_from_bootstrap, _parse_recent_courses_payload
 from kaist_cli.v2.klms.capture import _courseboard_runtime_capture_summary, _extract_courseboard_js_hints
-from kaist_cli.v2.klms.config import load_config
+from kaist_cli.v2.klms.config import KlmsConfig, load_config
 from kaist_cli.v2.klms.dashboard import DashboardService, _build_inbox_items, _decorate_today_assignments, _filter_inbox_assignments, _filter_inbox_files, _select_materials, _select_recent_notices
 from kaist_cli.v2.klms.discovery import load_recent_courses_args, map_discovery_report
 from kaist_cli.v2.klms.files import FileService, _extract_file_items_from_course_contents, _extract_file_items_from_html, _normalize_file_item_metadata, _pull_subdir_for_item, _sanitize_relpath, _synthesize_file_item_from_url, _unwrap_moodle_ajax_payload
@@ -50,7 +50,7 @@ from kaist_cli.v2.klms.notices import NoticeService, _discover_notice_board_ids_
 from kaist_cli.v2.klms.paths import resolve_paths
 from kaist_cli.v2.klms.provider_state import ProviderLoad
 from kaist_cli.v2.klms.request import RequestService
-from kaist_cli.v2.klms.session import KlmsDownloadFallback
+from kaist_cli.v2.klms.session import KlmsDownloadFallback, KlmsHttpResponse, KlmsSessionBootstrap
 from kaist_cli.v2.klms.videos import VideoService, _extract_video_items_from_html, _parse_video_detail_from_html, _parse_video_viewer_from_html
 
 
@@ -253,3 +253,38 @@ def test_course_resolve_returns_matching_aliases(tmp_path: Path, monkeypatch) ->
     assert result.data["count"] == 1
     assert "운영체제" in result.data["items"][0]["matched_aliases"]
 
+
+def test_load_recent_courses_from_bootstrap_soft_fails_on_command_error(tmp_path: Path) -> None:
+    class BoomHttp:
+        def post_text(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            return KlmsHttpResponse(url="https://klms.kaist.ac.kr/x", text="not-json", via="http")
+
+    config = KlmsConfig(
+        base_url="https://klms.kaist.ac.kr",
+        dashboard_path="/my/",
+        auth_username=None,
+        auth_strategy="easy_login",
+        otp_source=None,
+        course_ids=(),
+        notice_board_ids=(),
+        exclude_course_title_patterns=(),
+    )
+    bootstrap = KlmsSessionBootstrap(
+        config=config,
+        auth_mode="storage_state",
+        dashboard_url="https://klms.kaist.ac.kr/my/",
+        dashboard_html="<html></html>",
+        dashboard_sesskey="abc123",
+        http=BoomHttp(),  # type: ignore[arg-type]
+    )
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        courses = _load_recent_courses_from_bootstrap(paths, bootstrap, exclude_patterns=())
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+    assert courses == []
