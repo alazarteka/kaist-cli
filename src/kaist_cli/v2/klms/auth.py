@@ -756,7 +756,11 @@ class AuthService(AuthOtpMixin, AuthEasyLoginMixin):
         )
 
     def _context_has_authenticated_page(self, context: BrowserContextLike, *, config: KlmsConfig) -> bool:
-        return any(_page_has_authenticated_klms_session(page, config=config) for page in context.pages)
+        # Test doubles and partial contexts may omit pages; Playwright contexts always provide it.
+        pages = getattr(context, "pages", None)
+        if not isinstance(pages, list):
+            return False
+        return any(_page_has_authenticated_klms_session(page, config=config) for page in pages)
 
     def login(
         self,
