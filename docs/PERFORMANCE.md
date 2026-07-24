@@ -37,13 +37,13 @@ Investigation notes for where `kaist` spends wall time, why, and what we optimiz
 - Honor `KAIST_KLMS_CONCURRENCY` in `fetch_html_batch` and course-batch loops.
 - Keep an in-process cache snapshot so parallel providers do not re-read `cache.json` on every lookup; write compact JSON.
 - Upgrade shared `run_list_authenticated` to pass auth dashboard state into list commands so bootstrap skips a second dashboard GET.
-- Parallelize assignment HTML fallback across courses.
-- Parallelize `sync run` notice and file refreshes.
-- Allow standalone notice/file lists to reuse soft-stale cache within ~1 hour via shared `cache_is_fresh_enough`.
+- Parallelize assignment HTML fallback across courses. HTTP fan-out stays parallel; Playwright browser fallback runs serially on the caller thread when a path fails or returns a login page.
 
 ## Intentionally not changed
 
 - `week` still runs assignments first under a dedicated budget, then notices/files in parallel. Parallelizing all three can starve notice/file work inside the week envelope.
+- `sync run` keeps notice then file refresh serial. Parallelizing them would share one Playwright context across threads when either provider falls back to browser pages.
+- Standalone `notices list` / `files list` still require hard-fresh cache. Soft-stale reuse (`cache_is_fresh_enough`, ~1 hour) stays limited to dashboard `prefer_cache` paths so explicit list commands do not quietly return expired data.
 
 ## Still open (higher leverage, larger change)
 

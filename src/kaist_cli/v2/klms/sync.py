@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
@@ -12,7 +11,6 @@ from .config import load_config
 from .files import FileService
 from .notices import NoticeService
 from .paths import KlmsPaths
-from .provider_state import ProviderLoad
 from .session import build_session_bootstrap
 from .browser_types import BrowserContextLike
 
@@ -150,41 +148,25 @@ class SyncService:
                 dashboard_url=str(dashboard_state.get("final_url") or ""),
                 dashboard_html=str(dashboard_state.get("html") or ""),
             )
-            notices_duration_ms = 0
-            files_duration_ms = 0
-
-            def refresh_notices() -> ProviderLoad:
-                nonlocal notices_duration_ms
-                started = time.perf_counter()
-                try:
-                    return self._notices.refresh_cache_with_context(
-                        context=context,
-                        config=config,
-                        auth_mode=auth_mode,
-                        max_pages=1,
-                        bootstrap=bootstrap,
-                    )
-                finally:
-                    notices_duration_ms = int((time.perf_counter() - started) * 1000)
-
-            def refresh_files() -> ProviderLoad:
-                nonlocal files_duration_ms
-                started = time.perf_counter()
-                try:
-                    return self._files.refresh_cache_with_context(
-                        context=context,
-                        config=config,
-                        auth_mode=auth_mode,
-                        bootstrap=bootstrap,
-                    )
-                finally:
-                    files_duration_ms = int((time.perf_counter() - started) * 1000)
-
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                notice_future = executor.submit(refresh_notices)
-                files_future = executor.submit(refresh_files)
-                notices = notice_future.result()
-                files = files_future.result()
+            # Keep notice/file refresh serial: both may fall back to Playwright
+            # pages on the shared browser context, which is not thread-safe.
+            notices_started = time.perf_counter()
+            notices = self._notices.refresh_cache_with_context(
+                context=context,
+                config=config,
+                auth_mode=auth_mode,
+                max_pages=1,
+                bootstrap=bootstrap,
+            )
+            notices_duration_ms = int((time.perf_counter() - notices_started) * 1000)
+            files_started = time.perf_counter()
+            files = self._files.refresh_cache_with_context(
+                context=context,
+                config=config,
+                auth_mode=auth_mode,
+                bootstrap=bootstrap,
+            )
+            files_duration_ms = int((time.perf_counter() - files_started) * 1000)
             warnings = notices.provider_warnings("notices") + files.provider_warnings("files")
             payload = _status_from_entries(list_cache_entries(self._paths, prefixes=SYNC_CACHE_PREFIXES))
             payload["providers"]["notices"] = _provider_summary("notices", notices.provider_status(), duration_ms=notices_duration_ms)

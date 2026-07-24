@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from kaist_cli.v2.klms.cache import load_cache_entry, save_cache_value
 from kaist_cli.v2.klms.paths import resolve_paths
-from kaist_cli.v2.klms.session import KlmsHttpSession, http_max_workers
+from kaist_cli.v2.klms.session import KlmsHttpResponse, KlmsHttpSession, fetch_html_batch, http_max_workers
 
 
 def test_http_max_workers_defaults_and_env(monkeypatch) -> None:
@@ -81,3 +84,49 @@ def test_http_session_reuses_thread_local_opener() -> None:
     assert first is second
     rebuilt = session._build_opener()
     assert rebuilt is not first
+
+
+def test_fetch_html_batch_retries_failed_paths_with_browser_context(monkeypatch) -> None:
+    session = KlmsHttpSession(_FakeContext(), base_url="https://klms.kaist.ac.kr")
+    context = _FakeContext()
+    calls: list[tuple[str, bool]] = []
+
+    def fake_get_html(
+        url_or_path: str,
+        *,
+        context: Any | None = None,
+        timeout_seconds: float = 20.0,  # noqa: ARG001
+    ) -> KlmsHttpResponse:
+        calls.append((url_or_path, context is not None))
+        if context is None and url_or_path.endswith("id=2"):
+            raise TimeoutError("http boom")
+        via = "browser" if context is not None else "http"
+        return KlmsHttpResponse(url=f"https://klms.kaist.ac.kr{url_or_path}", text=f"ok:{url_or_path}", via=via)
+
+    monkeypatch.setattr(session, "get_html", fake_get_html)
+    results = fetch_html_batch(
+        session,
+        ["/mod/assign/index.php?id=1", "/mod/assign/index.php?id=2"],
+        max_workers=2,
+        context=context,
+    )
+    assert set(results) == {"/mod/assign/index.php?id=1", "/mod/assign/index.php?id=2"}
+    assert results["/mod/assign/index.php?id=2"].via == "browser"
+    assert ("/mod/assign/index.php?id=2", False) in calls
+    assert ("/mod/assign/index.php?id=2", True) in calls
+
+
+def test_fetch_html_batch_without_context_still_raises_on_http_failure(monkeypatch) -> None:
+    session = KlmsHttpSession(_FakeContext(), base_url="https://klms.kaist.ac.kr")
+
+    def fake_get_html(
+        url_or_path: str,
+        *,
+        context: Any | None = None,  # noqa: ARG001
+        timeout_seconds: float = 20.0,  # noqa: ARG001
+    ) -> KlmsHttpResponse:
+        raise RuntimeError(f"http boom:{url_or_path}")
+
+    monkeypatch.setattr(session, "get_html", fake_get_html)
+    with pytest.raises(RuntimeError, match="http boom"):
+        fetch_html_batch(session, ["/mod/assign/index.php?id=1"], max_workers=1)

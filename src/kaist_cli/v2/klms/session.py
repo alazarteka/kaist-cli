@@ -268,6 +268,7 @@ def fetch_html_batch(
     *,
     deadline: RefreshDeadline | None = None,
     max_workers: int | None = None,
+    context: BrowserContextLike | None = None,
 ) -> dict[str, KlmsHttpResponse]:
     ordered = [str(path).strip() for path in paths if str(path).strip()]
     if not ordered:
@@ -277,9 +278,12 @@ def fetch_html_batch(
 
     def worker(path: str) -> KlmsHttpResponse:
         timeout_seconds = deadline.request_timeout(20.0, use_soft=False) if deadline is not None else 20.0
+        # HTTP-only in the pool: Playwright fallback must stay on the caller thread.
         return http.get_html(path, timeout_seconds=timeout_seconds)
 
     results: dict[str, KlmsHttpResponse] = {}
+    failed_paths: list[str] = []
+    first_error: Exception | None = None
     executor = ThreadPoolExecutor(max_workers=max(1, min(int(workers), len(ordered))))
     timed_out = False
     try:
@@ -288,7 +292,12 @@ def fetch_html_batch(
         done, not_done = wait(set(futures.keys()), timeout=timeout_seconds)
         for future in done:
             path = futures[future]
-            results[path] = future.result()
+            try:
+                results[path] = future.result()
+            except Exception as exc:
+                failed_paths.append(path)
+                if first_error is None:
+                    first_error = exc
         if not_done:
             timed_out = True
             for future in not_done:
@@ -296,6 +305,19 @@ def fetch_html_batch(
             raise TimeoutError("Interactive refresh budget expired while waiting for batched HTTP fetches.")
     finally:
         executor.shutdown(wait=not timed_out, cancel_futures=timed_out)
+
+    if context is not None:
+        retry_paths = list(dict.fromkeys(failed_paths))
+        for path, response in list(results.items()):
+            if looks_login_url(response.url) or looks_logged_out_html(response.text):
+                if path not in retry_paths:
+                    retry_paths.append(path)
+        for path in retry_paths:
+            timeout_seconds = deadline.request_timeout(20.0, use_soft=False) if deadline is not None else 20.0
+            results[path] = http.get_html(path, context=context, timeout_seconds=timeout_seconds)
+    elif first_error is not None:
+        raise first_error
+
     return results
 
 

@@ -829,6 +829,7 @@ class AssignmentService:
                 bootstrap.http,
                 list(path_by_course.values()),
                 max_workers=MAX_ASSIGNMENT_HTTP_WORKERS,
+                context=context,
             )
             for course, path in path_by_course.items():
                 response = responses.get(path)
