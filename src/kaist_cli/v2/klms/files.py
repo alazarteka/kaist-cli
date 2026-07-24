@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlparse
 from bs4 import BeautifulSoup, Tag  # type: ignore[import-untyped]
 
 from ..contracts import CommandError, CommandResult
-from ...core.timeutil import cache_is_fresh_enough, iso_from_epoch_seconds as _iso_from_epoch_seconds
+from ...core.timeutil import iso_from_epoch_seconds as _iso_from_epoch_seconds
 from .moodle_html import unwrap_moodle_ajax_payload as _unwrap_moodle_ajax_payload
 from .auth import AuthService, looks_logged_out_html, looks_login_url
 from .cache import load_cache_entry, load_cache_value, save_cache_value
@@ -995,11 +995,10 @@ class FileService:
             return []
 
         cache_key = self._file_list_cache_key(config, list(course_map.keys()))
-        cache_entry = load_cache_entry(self._paths, cache_key)
-        cached_rows = cache_entry.get("value") if isinstance(cache_entry, dict) else None
-        if isinstance(cached_rows, list) and (
-            not bool(cache_entry.get("stale")) or cache_is_fresh_enough(cache_entry)
-        ):
+        # Standalone `files list` only reuses hard-fresh cache. Soft-stale reuse is
+        # reserved for dashboard prefer_cache paths via load_cached_or_refresh.
+        cached_rows = load_cache_value(self._paths, cache_key)
+        if isinstance(cached_rows, list):
             cached_items = enrich_files_with_recency(
                 self._paths,
                 [_normalize_file_item_metadata(FileItem(**row)) for row in cached_rows if isinstance(row, dict)],
