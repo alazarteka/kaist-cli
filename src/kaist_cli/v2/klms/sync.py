@@ -148,6 +148,8 @@ class SyncService:
                 dashboard_url=str(dashboard_state.get("final_url") or ""),
                 dashboard_html=str(dashboard_state.get("html") or ""),
             )
+            # Keep notice/file refresh serial: both may fall back to Playwright
+            # pages on the shared browser context, which is not thread-safe.
             notices_started = time.perf_counter()
             notices = self._notices.refresh_cache_with_context(
                 context=context,

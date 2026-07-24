@@ -21,7 +21,7 @@ from .models import Video
 from .media_recency import observe_videos
 from .paths import KlmsPaths
 from .provider_state import run_list_authenticated
-from .session import KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
+from .session import KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch, http_max_workers
 from .validate import looks_klms_error_html
 from .moodle_html import in_header_like_region
 from .browser_types import BrowserContextLike
@@ -286,8 +286,9 @@ class VideoService:
 
         items: list[Video] = []
         course_meta_list = list(course_map.values())
-        for start in range(0, len(course_meta_list), MAX_VIDEO_HTTP_WORKERS):
-            batch = course_meta_list[start : start + MAX_VIDEO_HTTP_WORKERS]
+        workers = http_max_workers(MAX_VIDEO_HTTP_WORKERS)
+        for start in range(0, len(course_meta_list), workers):
+            batch = course_meta_list[start : start + workers]
             course_paths: list[str] = []
             path_to_course: dict[str, _CourseMetadataRow] = {}
             for course_meta in batch:

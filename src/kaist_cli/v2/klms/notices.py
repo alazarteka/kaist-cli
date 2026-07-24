@@ -1355,6 +1355,8 @@ class NoticeService:
             )
 
         cache_entry = self._load_notice_cache_entry(config=config, board_ids=board_ids, max_pages=max_pages)
+        # Standalone `notices list` only reuses hard-fresh cache. Soft-stale reuse is
+        # reserved for dashboard prefer_cache paths via load_cached_or_refresh.
         cached_rows = cache_entry.get("value") if isinstance(cache_entry, dict) and not bool(cache_entry.get("stale")) else None
         if isinstance(cached_rows, list):
             cached_items = [Notice(**row) for row in cached_rows if isinstance(row, dict)]

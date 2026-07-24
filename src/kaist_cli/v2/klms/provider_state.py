@@ -252,18 +252,29 @@ def run_list_authenticated(
     **list_kwargs: Any,
 ) -> CommandResult:
     from .config import load_config
+    from .session import build_session_bootstrap
 
     config = load_config(paths)
 
-    def callback(context: BrowserContextLike, auth_mode: str) -> CommandResult:
+    def callback(context: BrowserContextLike, auth_mode: str, dashboard_state: dict[str, Any]) -> CommandResult:
+        bootstrap = build_session_bootstrap(
+            paths,
+            context=context,
+            config=config,
+            auth_mode=auth_mode,
+            timeout_seconds=timeout_seconds,
+            dashboard_url=str(dashboard_state.get("final_url") or ""),
+            dashboard_html=str(dashboard_state.get("html") or ""),
+        )
         return list_with_context(
             context=context,
             config=config,
             auth_mode=auth_mode,
+            bootstrap=bootstrap,
             **list_kwargs,
         )
 
-    return auth.run_authenticated(
+    return auth.run_authenticated_with_state(
         config=config,
         headless=True,
         accept_downloads=False,

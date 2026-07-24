@@ -568,6 +568,8 @@ class DashboardService:
         def build_result(context: BrowserContextLike, auth_mode: str, bootstrap: KlmsSessionBootstrap) -> CommandResult:
             warnings: list[dict[str, Any]] = []
             provider_status: dict[str, Any] = {}
+            # Assignments run first under a dedicated budget so notice/file fan-out
+            # still has room inside the week command envelope.
             assignments_load = self._run_component(
                 "assignments",
                 lambda: self._assignments.load_for_dashboard(
