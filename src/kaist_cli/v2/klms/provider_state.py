@@ -89,6 +89,23 @@ class CachedProviderSnapshot:
     cache_warning: dict[str, Any] | None = None
 
 
+def select_cached_provider_snapshot(
+    candidates: tuple[CachedProviderSnapshot, ...],
+    *,
+    prefer_cache: bool,
+) -> tuple[CachedProviderSnapshot, bool]:
+    """Choose a fresh preferred snapshot or the best available fallback."""
+    if not candidates:
+        raise ValueError("At least one cache candidate is required.")
+    available = [candidate for candidate in candidates if candidate.cache_entry is not None]
+    if prefer_cache:
+        for candidate in available:
+            entry = candidate.cache_entry
+            if entry is not None and (not bool(entry.get("stale")) or cache_is_fresh_enough(entry)):
+                return candidate, True
+    return (available[0] if available else candidates[0]), False
+
+
 def _resource_title(resource_label: str) -> str:
     return str(resource_label).strip().capitalize()
 
@@ -147,14 +164,12 @@ def load_cached_or_refresh(
 
     if deadline is not None and deadline.hard_expired():
         if cache_entry is not None:
-            warnings: list[dict[str, Any]] = []
-            if not cache_is_fresh_enough(cache_entry):
-                warnings.append(
-                    provider_warning(
-                        "LIVE_REFRESH_TIMEOUT",
-                        f"Interactive refresh budget expired before {resource} refresh completed.",
-                    )
+            warnings: list[dict[str, Any]] = [
+                provider_warning(
+                    "LIVE_REFRESH_TIMEOUT",
+                    f"Interactive refresh budget expired before {resource} refresh started.",
                 )
+            ]
             if bool(cache_entry.get("stale")):
                 warnings.insert(
                     0,
@@ -163,7 +178,7 @@ def load_cached_or_refresh(
                         f"Returning stale {resource} cache because live refresh could not finish in time.",
                     ),
                 )
-            return _cached_load(refresh_attempted=True, warnings=warnings)
+            return _cached_load(refresh_attempted=False, warnings=warnings)
         return _empty_fail(
             refresh_attempted=False,
             warnings=(
@@ -178,14 +193,12 @@ def load_cached_or_refresh(
         live_items, live_source, live_capability = refresh()
     except TimeoutError:
         if cache_entry is not None:
-            warnings = []
-            if not cache_is_fresh_enough(cache_entry):
-                warnings.append(
-                    provider_warning(
-                        "LIVE_REFRESH_TIMEOUT",
-                        f"{resource_title} refresh exceeded the interactive deadline.",
-                    )
+            warnings = [
+                provider_warning(
+                    "LIVE_REFRESH_TIMEOUT",
+                    f"{resource_title} refresh exceeded the interactive deadline.",
                 )
+            ]
             if bool(cache_entry.get("stale")):
                 warnings.insert(
                     0,
@@ -208,15 +221,13 @@ def load_cached_or_refresh(
         raise
     except Exception as exc:
         if cache_entry is not None:
-            warnings = []
-            if not cache_is_fresh_enough(cache_entry):
-                warnings.append(
-                    provider_warning(
-                        "LIVE_REFRESH_FAILED",
-                        f"{resource_title} refresh failed; returning cached {resource} data.",
-                        error=str(exc),
-                    )
+            warnings = [
+                provider_warning(
+                    "LIVE_REFRESH_FAILED",
+                    f"{resource_title} refresh failed; returning cached {resource} data.",
+                    error=str(exc),
                 )
+            ]
             if bool(cache_entry.get("stale")):
                 warnings.insert(
                     0,

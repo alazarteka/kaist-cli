@@ -42,9 +42,19 @@ def read_json_file(path: Path, *, default: dict[str, Any]) -> dict[str, Any]:
     return data if isinstance(data, dict) else default
 
 
-def write_json_file_atomic(path: Path, data: dict[str, Any], *, chmod_mode: int | None = None) -> None:
+def write_json_file_atomic(
+    path: Path,
+    data: dict[str, Any],
+    *,
+    chmod_mode: int | None = None,
+    compact: bool = False,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    text = (
+        json.dumps(data, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        if compact
+        else json.dumps(data, ensure_ascii=False, indent=2)
+    ) + "\n"
     tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     tmp_path.write_text(text, encoding="utf-8")
     if chmod_mode is not None:

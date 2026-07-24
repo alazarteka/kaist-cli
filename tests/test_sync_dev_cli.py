@@ -59,6 +59,7 @@ from kaist_cli.v2.klms.paths import resolve_paths
 from kaist_cli.v2.klms.provider_state import ProviderLoad
 from kaist_cli.v2.klms.request import RequestService
 from kaist_cli.v2.klms.session import KlmsDownloadFallback
+from kaist_cli.v2.klms.sync import SyncService
 from kaist_cli.v2.klms.videos import VideoService, _extract_video_items_from_html, _parse_video_detail_from_html, _parse_video_viewer_from_html
 
 
@@ -638,14 +639,53 @@ def test_map_discovery_report_classifies_courseboard_ajax_endpoint() -> None:
     assert endpoint["recommended_for_cli"] is True
 
 
-def test_sync_status_reports_cache_entries(tmp_path: Path) -> None:
+def test_sync_reset_clears_v2_klms_cache_entries(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        paths = resolve_paths()
+        save_cache_value(paths, "notice-board-ids::test", ["board"], ttl_seconds=60)
+        save_cache_value(paths, "notice-board-map::test", {"course": ["board-v1"]}, ttl_seconds=60)
+        save_cache_value(paths, "notice-board-map-v2::test", {"course": ["board"]}, ttl_seconds=60)
+        save_cache_value(paths, "notice-board-map-v3::test", {"course": ["board-v3"]}, ttl_seconds=60)
+        save_cache_value(paths, "notice-list::test", [{"id": "n1"}], ttl_seconds=60)
+        save_cache_value(paths, "notice-list-v2::test", [{"id": "n2"}], ttl_seconds=60)
+        save_cache_value(paths, "notice-list-v3::test", [{"id": "n3"}], ttl_seconds=60)
+        save_cache_value(paths, "notice-list-snapshot-v1::test", {"items": [{"id": "n4"}]}, ttl_seconds=60)
+        save_cache_value(paths, "file-list::test", [{"id": "f1"}], ttl_seconds=60)
+        save_cache_value(paths, "file-list-v2::test", [{"id": "f2"}], ttl_seconds=60)
+        save_cache_value(paths, "file-list-snapshot-v1::test", [{"id": "f3"}], ttl_seconds=60)
+        save_cache_value(paths, "file-content-api-status::test", {"available": True}, ttl_seconds=60)
+        save_cache_value(paths, "other::keep", {"id": "keep"}, ttl_seconds=60)
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    cp = run_cli(tmp_path, "--json", "klms", "sync", "reset")
+    assert cp.returncode == 0, cp.stderr
+    payload = json.loads(cp.stdout)
+    assert payload["ok"] is True
+    assert payload["data"]["removed_entries"] == 12
+    assert payload["data"]["providers"]["notices"]["entry_count"] == 0
+    assert payload["data"]["providers"]["files"]["entry_count"] == 0
+    assert load_cache_value(paths, "other::keep") == {"id": "keep"}
+
+def test_sync_status_ignores_legacy_board_map_and_list_entries(tmp_path: Path) -> None:
     old_home = os.environ.get("KAIST_CLI_HOME")
     os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
     try:
         paths = resolve_paths()
         save_cache_value(paths, "notice-board-ids::test", ["1"], ttl_seconds=60)
+        save_cache_value(paths, "notice-board-map-v2::test", {"course": ["board-v2"]}, ttl_seconds=60)
+        save_cache_value(paths, "notice-board-map-v3::test", {"course-a": ["board-1", "board-2"], "course-b": ["board-2"]}, ttl_seconds=60)
         save_cache_value(paths, "notice-list::test", [{"id": "n1"}], ttl_seconds=60)
+        save_cache_value(paths, "notice-list-v2::test", [{"id": "n2"}], ttl_seconds=60)
+        save_cache_value(paths, "notice-list-v3::test", [{"id": "n3"}], ttl_seconds=60)
         save_cache_value(paths, "file-list::test", [{"id": "f1"}], ttl_seconds=60)
+        save_cache_value(paths, "file-list-v2::test", [{"id": "f2"}], ttl_seconds=60)
+        save_cache_value(paths, "file-content-api-status::test", {"available": True}, ttl_seconds=60)
     finally:
         if old_home is None:
             os.environ.pop("KAIST_CLI_HOME", None)
@@ -657,27 +697,80 @@ def test_sync_status_reports_cache_entries(tmp_path: Path) -> None:
     payload = json.loads(cp.stdout)
     assert payload["ok"] is True
     assert payload["data"]["providers"]["notice_board_ids"]["entry_count"] == 1
+    assert payload["data"]["providers"]["notice_board_ids"]["item_count"] == 2
     assert payload["data"]["providers"]["notices"]["entry_count"] == 1
     assert payload["data"]["providers"]["files"]["entry_count"] == 1
+    assert payload["data"]["providers"]["files"]["item_count"] == 1
 
-
-def test_sync_reset_clears_v2_klms_cache_entries(tmp_path: Path) -> None:
+def test_sync_status_labels_bounded_snapshot_entries(tmp_path: Path) -> None:
     old_home = os.environ.get("KAIST_CLI_HOME")
     os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
     try:
+        _write_config(tmp_path)
         paths = resolve_paths()
-        save_cache_value(paths, "notice-list::test", [{"id": "n1"}], ttl_seconds=60)
-        save_cache_value(paths, "file-list::test", [{"id": "f1"}], ttl_seconds=60)
+        config = load_config(paths)
+        service = FileService(paths, AuthService(paths))
+        save_cache_value(
+            paths,
+            service._file_list_snapshot_cache_key(config, ["180871"], 6),
+            [{"id": "f1"}],
+            ttl_seconds=60,
+        )
     finally:
         if old_home is None:
             os.environ.pop("KAIST_CLI_HOME", None)
         else:
             os.environ["KAIST_CLI_HOME"] = old_home
 
-    cp = run_cli(tmp_path, "--json", "klms", "sync", "reset")
-    assert cp.returncode == 0, cp.stderr
-    payload = json.loads(cp.stdout)
-    assert payload["ok"] is True
-    assert payload["data"]["removed_entries"] == 2
-    assert payload["data"]["providers"]["notices"]["entry_count"] == 0
-    assert payload["data"]["providers"]["files"]["entry_count"] == 0
+    status = SyncService(paths, AuthService(paths), NoticeService(paths, AuthService(paths)), FileService(paths, AuthService(paths))).status()
+
+    assert status.data["providers"]["files"]["status"] == "bounded_cache"
+    assert status.data["providers"]["files"]["bounded_cache"] is True
+    assert status.data["providers"]["files"]["item_count"] == 1
+
+def test_sync_run_reports_cache_fallback_as_degraded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    paths = resolve_paths()
+
+    class FakeAuth:
+        def run_authenticated_with_state(self, *, config, headless, accept_downloads, timeout_seconds, callback):  # type: ignore[no-untyped-def]  # noqa: ARG002
+            return callback(object(), "profile", {"final_url": "https://klms.kaist.ac.kr/my/", "html": "<html></html>"})
+
+    class FakeNotices:
+        def refresh_cache_with_context(self, **kwargs):  # type: ignore[no-untyped-def]  # noqa: ARG002
+            return ProviderLoad(
+                items=[],
+                source="html",
+                capability="partial",
+                freshness_mode="cache",
+                cache_hit=True,
+                stale=False,
+                fetched_at="2026-03-15T00:00:00Z",
+                expires_at="2026-03-15T00:05:00Z",
+                refresh_attempted=True,
+                warnings=({"code": "LIVE_REFRESH_FAILED", "message": "Notice refresh failed; returning cached notice data."},),
+            )
+
+    class FakeFiles:
+        def refresh_cache_with_context(self, **kwargs):  # type: ignore[no-untyped-def]  # noqa: ARG002
+            return ProviderLoad(
+                items=[],
+                source="html",
+                capability="partial",
+                freshness_mode="live",
+                cache_hit=False,
+                stale=False,
+                fetched_at=None,
+                expires_at=None,
+                refresh_attempted=True,
+            )
+
+    monkeypatch.setattr("kaist_cli.v2.klms.sync.build_session_bootstrap", lambda *args, **kwargs: object())
+    result = SyncService(paths, FakeAuth(), FakeNotices(), FakeFiles()).run()  # type: ignore[arg-type]
+
+    assert result.capability == "degraded"
+    assert result.data["providers"]["notices"]["status"] == "fallback"
+    assert result.data["warnings"] == [
+        {"provider": "notices", "code": "LIVE_REFRESH_FAILED", "message": "Notice refresh failed; returning cached notice data."},
+    ]

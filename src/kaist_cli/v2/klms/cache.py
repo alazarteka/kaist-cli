@@ -92,7 +92,7 @@ def _update_cache_entries(paths: KlmsPaths, *, updater: Callable[[dict[str, Any]
             entries = normalized["entries"]
             updater(entries)
             stored = {"version": CACHE_VERSION, "entries": entries}
-            write_json_file_atomic(paths.cache_path, stored, chmod_mode=0o600)
+            write_json_file_atomic(paths.cache_path, stored, chmod_mode=0o600, compact=True)
             _set_snapshot(paths, stored)
 
 

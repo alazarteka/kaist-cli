@@ -14,8 +14,21 @@ from .paths import KlmsPaths
 from .session import build_session_bootstrap
 from .browser_types import BrowserContextLike
 
-SYNC_CACHE_PREFIXES = (
+SYNC_STATUS_CACHE_PREFIXES = (
+    "notice-board-map-v3::",
+    "notice-list-v3::",
+    "notice-list-snapshot-v1::",
+    "file-list-v2::",
+    "file-list-snapshot-v1::",
+)
+
+# Pre-v3 board/list cache namespaces may contain incomplete data.  They are
+# resettable but intentionally excluded from status and run summaries so they
+# cannot be mistaken for active provider state.
+SYNC_RESET_CACHE_PREFIXES = (
+    *SYNC_STATUS_CACHE_PREFIXES,
     "notice-board-ids::",
+    "notice-board-map::",
     "notice-board-map-v2::",
     "notice-list::",
     "notice-list-v2::",
@@ -24,11 +37,23 @@ SYNC_CACHE_PREFIXES = (
 )
 
 
-def _entry_item_count(entry: dict[str, Any]) -> int | None:
+def _entry_item_count(entry: dict[str, Any], *, group: str) -> int | None:
     value = entry.get("value")
     if isinstance(value, list):
         return len(value)
     if isinstance(value, dict):
+        items = value.get("items")
+        if isinstance(items, list):
+            return len(items)
+        if group == "notice_board_ids":
+            board_ids = {
+                str(board_id).strip()
+                for rows in value.values()
+                if isinstance(rows, list)
+                for board_id in rows
+                if str(board_id).strip()
+            }
+            return len(board_ids)
         return len(value)
     return None
 
@@ -40,19 +65,17 @@ def _epoch_to_iso(value: Any) -> str | None:
 
 
 def _cache_group_name(key: str) -> str:
-    if key.startswith("notice-board-ids::"):
+    if key.startswith("notice-board-map-v3::"):
         return "notice_board_ids"
-    if key.startswith("notice-board-map-v2::"):
-        return "notice_board_ids"
-    if key.startswith("notice-list::"):
+    if key.startswith(("notice-list-v3::", "notice-list-snapshot-v1::")):
         return "notices"
-    if key.startswith("notice-list-v2::"):
-        return "notices"
-    if key.startswith("file-list::"):
-        return "files"
-    if key.startswith("file-content-api-status::"):
+    if key.startswith(("file-list-v2::", "file-list-snapshot-v1::")):
         return "files"
     return "other"
+
+
+def _is_bounded_snapshot_key(key: str) -> bool:
+    return key.startswith(("notice-list-snapshot-v1::", "file-list-snapshot-v1::"))
 
 
 def _status_from_entries(entries: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -65,7 +88,7 @@ def _status_from_entries(entries: dict[str, dict[str, Any]]) -> dict[str, Any]:
         group = _cache_group_name(key)
         if group not in groups:
             continue
-        groups[group].append({"key": key, **entry})
+        groups[group].append({"key": key, "bounded_cache": _is_bounded_snapshot_key(key), **entry})
 
     providers: dict[str, Any] = {}
     for group, items in groups.items():
@@ -82,20 +105,23 @@ def _status_from_entries(entries: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 "expires_at": None,
                 "cache_hit": False,
                 "stale": False,
+                "bounded_cache": False,
                 "entry_count": 0,
             }
             continue
         stale = bool(latest.get("stale"))
+        bounded_cache = bool(latest.get("bounded_cache"))
         providers[group] = {
             "provider": group,
-            "status": "cache_hit" if not stale else "stale",
-            "item_count": _entry_item_count(latest),
+            "status": "bounded_cache" if bounded_cache and not stale else "stale_bounded_cache" if bounded_cache else "cache_hit" if not stale else "stale",
+            "item_count": _entry_item_count(latest, group=group),
             "duration_ms": None,
             "warnings": [],
             "fetched_at": _epoch_to_iso(latest.get("stored_at")),
             "expires_at": _epoch_to_iso(latest.get("expires_at")),
             "cache_hit": not stale,
             "stale": stale,
+            "bounded_cache": bounded_cache,
             "entry_count": len(items),
             "age_seconds": latest.get("age_seconds"),
             "ttl_remaining_seconds": latest.get("ttl_remaining_seconds"),
@@ -168,7 +194,7 @@ class SyncService:
             )
             files_duration_ms = int((time.perf_counter() - files_started) * 1000)
             warnings = notices.provider_warnings("notices") + files.provider_warnings("files")
-            payload = _status_from_entries(list_cache_entries(self._paths, prefixes=SYNC_CACHE_PREFIXES))
+            payload = _status_from_entries(list_cache_entries(self._paths, prefixes=SYNC_STATUS_CACHE_PREFIXES))
             payload["providers"]["notices"] = _provider_summary("notices", notices.provider_status(), duration_ms=notices_duration_ms)
             payload["providers"]["files"] = _provider_summary("files", files.provider_status(), duration_ms=files_duration_ms)
             payload["warnings"] = warnings
@@ -187,11 +213,11 @@ class SyncService:
         )
 
     def status(self) -> CommandResult:
-        payload = _status_from_entries(list_cache_entries(self._paths, prefixes=SYNC_CACHE_PREFIXES))
+        payload = _status_from_entries(list_cache_entries(self._paths, prefixes=SYNC_STATUS_CACHE_PREFIXES))
         return CommandResult(data=payload, source="cache", capability="partial")
 
     def reset(self) -> CommandResult:
-        removed = clear_cache_entries(self._paths, prefixes=SYNC_CACHE_PREFIXES)
-        payload = _status_from_entries(list_cache_entries(self._paths, prefixes=SYNC_CACHE_PREFIXES))
+        removed = clear_cache_entries(self._paths, prefixes=SYNC_RESET_CACHE_PREFIXES)
+        payload = _status_from_entries(list_cache_entries(self._paths, prefixes=SYNC_STATUS_CACHE_PREFIXES))
         payload["removed_entries"] = removed
         return CommandResult(data=payload, source="cache", capability="partial")

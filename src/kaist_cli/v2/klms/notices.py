@@ -9,10 +9,7 @@ from urllib.parse import parse_qs, urlparse
 from bs4 import BeautifulSoup, Tag  # type: ignore[import-untyped]
 
 from ..contracts import CommandError, CommandResult
-from ...core.timeutil import (
-    cache_is_fresh_enough as _cache_is_fresh_enough,
-    iso_from_epoch_seconds as _iso_from_epoch_seconds,
-)
+from ...core.timeutil import iso_from_epoch_seconds as _iso_from_epoch_seconds
 from .moodle_html import (
     discover_notice_board_ids_from_course_page as _discover_notice_board_ids_from_course_page,
     table_col_index,
@@ -38,9 +35,12 @@ from .file_metadata import file_extension, guess_mime_type
 from .models import Notice
 from .paths import KlmsPaths
 from .provider_state import (
+    CachedProviderSnapshot,
     ProviderLoad,
+    load_cached_or_refresh,
     provider_warning as _provider_warning,
     run_list_authenticated,
+    select_cached_provider_snapshot,
 )
 from .session import KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch
 from .validate import looks_klms_error_html
@@ -984,95 +984,28 @@ class NoticeService:
         snapshot_items = [Notice(**row) for row in snapshot_rows if isinstance(row, dict)] if snapshot_has_list else []
         snapshot_filtered = _finalize_notice_items(snapshot_items, since_iso=since_iso, limit=limit)
 
-        def cached_load(
-            entry: dict[str, Any],
-            items: list[Notice],
-            *,
-            bounded: bool,
-            refresh_attempted: bool,
-            warnings: tuple[dict[str, Any], ...] = (),
-        ) -> ProviderLoad:
-            return ProviderLoad(
-                items=[item.to_dict() for item in items],
-                source="html",
-                capability="partial",
-                freshness_mode="bounded_cache" if bounded else "cache",
-                cache_hit=True,
-                stale=bool(entry.get("stale")),
-                fetched_at=_iso_from_epoch_seconds(entry.get("stored_at")),
-                expires_at=_iso_from_epoch_seconds(entry.get("expires_at")),
-                refresh_attempted=refresh_attempted,
-                ok=True,
-                warnings=warnings,
-                bounded_cache=bounded,
-            )
-
-        def fallback_warnings(code: str, message: str, *, error: str | None = None, bounded: bool, entry: dict[str, Any]) -> tuple[dict[str, Any], ...]:
-            warnings: list[dict[str, Any]] = []
-            if bool(entry.get("stale")):
-                warnings.append(_provider_warning("STALE_CACHE", "Returning stale notice cache because live refresh could not finish."))
-            if bounded:
-                warnings.append(
-                    _provider_warning(
-                        "BOUNDED_CACHE",
-                        "Returning a bounded notice snapshot; it may omit notices outside the requested limit.",
-                    )
-                )
-            extra = {"error": error} if error is not None else {}
-            warnings.append(_provider_warning(code, message, **extra))
-            return tuple(warnings)
-
-        cache_candidates = (
-            (cache_entry, cached_filtered, False) if cache_has_list else None,
-            (snapshot_entry, snapshot_filtered, True) if snapshot_has_list else None,
+        bounded_warning = _provider_warning(
+            "BOUNDED_CACHE",
+            "Returning a bounded notice snapshot; it may omit notices outside the requested limit.",
         )
-        if prefer_cache:
-            for candidate in cache_candidates:
-                if candidate is None:
-                    continue
-                entry, items, bounded = candidate
-                if not bool(entry.get("stale")) or _cache_is_fresh_enough(entry):
-                    warnings = (
-                        (_provider_warning("BOUNDED_CACHE", "Returning a bounded notice snapshot; it may omit notices outside the requested limit."),)
-                        if bounded
-                        else ()
-                    )
-                    return cached_load(entry, items, bounded=bounded, refresh_attempted=False, warnings=warnings)
+        canonical_snapshot = CachedProviderSnapshot(
+            items=[item.to_dict() for item in cached_filtered],
+            cache_entry=cache_entry if cache_has_list else None,
+            source="html",
+        )
+        bounded_snapshot = CachedProviderSnapshot(
+            items=[item.to_dict() for item in snapshot_filtered],
+            cache_entry=snapshot_entry if snapshot_has_list else None,
+            source="html",
+            bounded_cache=True,
+            cache_warning=bounded_warning,
+        )
+        selected_snapshot, use_preferred_cache = select_cached_provider_snapshot(
+            (canonical_snapshot, bounded_snapshot),
+            prefer_cache=prefer_cache,
+        )
 
-        fallback_candidate = next((candidate for candidate in cache_candidates if candidate is not None), None)
-
-        if deadline is not None and deadline.hard_expired():
-            if fallback_candidate is not None:
-                entry, items, bounded = fallback_candidate
-                return cached_load(
-                    entry,
-                    items,
-                    bounded=bounded,
-                    refresh_attempted=False,
-                    warnings=fallback_warnings(
-                        "LIVE_REFRESH_TIMEOUT",
-                        "Interactive refresh budget expired before notice refresh started.",
-                        bounded=bounded,
-                        entry=entry,
-                    ),
-                )
-            return ProviderLoad(
-                items=[],
-                source="html",
-                capability="degraded",
-                freshness_mode="live",
-                cache_hit=False,
-                stale=False,
-                fetched_at=None,
-                expires_at=None,
-                refresh_attempted=False,
-                ok=False,
-                warnings=(
-                    _provider_warning("LIVE_REFRESH_TIMEOUT", "Interactive refresh budget expired before notice refresh started."),
-                ),
-            )
-
-        try:
+        def refresh() -> tuple[list[dict[str, Any]], Any, Any]:
             live_items = self._refresh_notice_items(
                 config=config,
                 auth_mode=auth_mode,
@@ -1083,89 +1016,29 @@ class NoticeService:
                 bootstrap=bootstrap,
                 deadline=deadline,
             )
-        except TimeoutError:
-            if fallback_candidate is not None:
-                entry, items, bounded = fallback_candidate
-                return cached_load(
-                    entry,
-                    items,
-                    bounded=bounded,
-                    refresh_attempted=True,
-                    warnings=fallback_warnings(
-                        "LIVE_REFRESH_TIMEOUT",
-                        "Notice refresh exceeded the interactive deadline.",
-                        bounded=bounded,
-                        entry=entry,
-                    ),
-                )
-            return ProviderLoad(
-                items=[],
-                source="html",
-                capability="degraded",
-                freshness_mode="live",
-                cache_hit=False,
-                stale=False,
-                fetched_at=None,
-                expires_at=None,
-                refresh_attempted=True,
-                ok=False,
-                warnings=(
-                    _provider_warning("LIVE_REFRESH_TIMEOUT", "Notice refresh exceeded the interactive deadline."),
-                ),
+            live_filtered = _finalize_notice_items(live_items, since_iso=since_iso, limit=limit)
+            return ([item.to_dict() for item in live_filtered], "html", "partial")
+
+        def fresh_timestamps() -> tuple[str | None, str | None]:
+            fresh_entry = load_cache_entry(self._paths, cache_key) or self._load_notice_snapshot_entry(
+                config=config,
+                board_ids=board_ids,
+                max_pages=max_pages,
+                since_iso=since_iso,
+                limit=limit,
             )
-        except CommandError:
-            raise
-        except Exception as exc:
-            if fallback_candidate is not None:
-                entry, items, bounded = fallback_candidate
-                return cached_load(
-                    entry,
-                    items,
-                    bounded=bounded,
-                    refresh_attempted=True,
-                    warnings=fallback_warnings(
-                        "LIVE_REFRESH_FAILED",
-                        "Notice refresh failed; returning cached notice data.",
-                        error=str(exc),
-                        bounded=bounded,
-                        entry=entry,
-                    ),
-                )
-            return ProviderLoad(
-                items=[],
-                source="html",
-                capability="degraded",
-                freshness_mode="live",
-                cache_hit=False,
-                stale=False,
-                fetched_at=None,
-                expires_at=None,
-                refresh_attempted=True,
-                ok=False,
-                warnings=(
-                    _provider_warning("LIVE_REFRESH_FAILED", "Notice refresh failed.", error=str(exc)),
-                ),
+            return (
+                _iso_from_epoch_seconds((fresh_entry or {}).get("stored_at")),
+                _iso_from_epoch_seconds((fresh_entry or {}).get("expires_at")),
             )
 
-        live_filtered = _finalize_notice_items(live_items, since_iso=since_iso, limit=limit)
-        fresh_entry = load_cache_entry(self._paths, cache_key) or self._load_notice_snapshot_entry(
-            config=config,
-            board_ids=board_ids,
-            max_pages=max_pages,
-            since_iso=since_iso,
-            limit=limit,
-        )
-        return ProviderLoad(
-            items=[item.to_dict() for item in live_filtered],
-            source="html",
-            capability="partial",
-            freshness_mode="live",
-            cache_hit=False,
-            stale=False,
-            fetched_at=_iso_from_epoch_seconds((fresh_entry or {}).get("stored_at")),
-            expires_at=_iso_from_epoch_seconds((fresh_entry or {}).get("expires_at")),
-            refresh_attempted=True,
-            ok=True,
+        return load_cached_or_refresh(
+            prefer_cache=use_preferred_cache,
+            deadline=deadline,
+            snapshot=selected_snapshot,
+            refresh=refresh,
+            resource_label="notice",
+            fresh_timestamps=fresh_timestamps,
         )
 
     def refresh_cache_with_context(

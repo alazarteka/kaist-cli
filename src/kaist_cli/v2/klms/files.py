@@ -15,7 +15,7 @@ from ..contracts import CommandError, CommandResult
 from ...core.timeutil import iso_from_epoch_seconds as _iso_from_epoch_seconds
 from .moodle_html import unwrap_moodle_ajax_payload as _unwrap_moodle_ajax_payload
 from .auth import AuthService, looks_logged_out_html, looks_login_url
-from .cache import load_cache_entry, load_cache_value, save_cache_value
+from .cache import list_cache_entries, load_cache_entry, load_cache_value, save_cache_value
 from .config import KlmsConfig, abs_url, load_config
 from .courses import (
     _CourseMetadataMap,
@@ -31,7 +31,14 @@ from .file_metadata import file_extension, guess_mime_type, normalize_filename
 from .media_recency import enrich_files_with_recency, observe_files
 from .models import FileItem
 from .paths import KlmsPaths
-from .provider_state import CachedProviderSnapshot, ProviderLoad, load_cached_or_refresh, run_list_authenticated
+from .provider_state import (
+    CachedProviderSnapshot,
+    ProviderLoad,
+    load_cached_or_refresh,
+    provider_warning as _provider_warning,
+    run_list_authenticated,
+    select_cached_provider_snapshot,
+)
 from .session import KlmsDownloadFallback, KlmsHttpSession, KlmsSessionBootstrap, build_session_bootstrap, fetch_html_batch, http_max_workers
 from .validate import looks_klms_error_html
 from .browser_types import BrowserContextLike
@@ -568,11 +575,52 @@ class FileService:
     def _file_list_cache_key(config: KlmsConfig, course_ids: list[str]) -> str:
         return "::".join(
             [
-                "file-list",
+                "file-list-v2",
                 config.base_url.rstrip("/"),
                 ",".join(course_ids),
             ]
         )
+
+    @staticmethod
+    def _file_list_snapshot_cache_key(config: KlmsConfig, course_ids: list[str], limit: int) -> str:
+        return "::".join(
+            [
+                "file-list-snapshot-v1",
+                config.base_url.rstrip("/"),
+                str(max(0, int(limit))),
+                ",".join(course_ids),
+            ]
+        )
+
+    def _load_file_snapshot_entry(
+        self,
+        *,
+        config: KlmsConfig,
+        course_ids: list[str],
+        limit: int | None,
+    ) -> dict[str, Any] | None:
+        if limit is None:
+            return None
+        prefix = f"file-list-snapshot-v1::{config.base_url.rstrip('/')}::"
+        suffix = f"::{','.join(course_ids)}"
+        matches: list[tuple[bool, int, float, dict[str, Any]]] = []
+        for key, entry in list_cache_entries(self._paths, prefixes=(prefix,)).items():
+            if not str(key).endswith(suffix):
+                continue
+            parts = str(key).split("::", 3)
+            if len(parts) != 4:
+                continue
+            try:
+                coverage_limit = int(parts[2])
+            except ValueError:
+                continue
+            if coverage_limit < limit or not isinstance(entry.get("value"), list):
+                continue
+            matches.append((bool(entry.get("stale")), coverage_limit, -float(entry.get("stored_at") or 0.0), entry))
+        if not matches:
+            return None
+        matches.sort(key=lambda item: (item[0], item[1], item[2]))
+        return matches[0][3]
 
     @staticmethod
     def _content_api_status_cache_key(config: KlmsConfig) -> str:
@@ -626,16 +674,49 @@ class FileService:
             auth_mode=auth_mode,
         )
         course_map = self._course_map_for_request(bootstrap=bootstrap, config=config, course_id=course_id, course_query=course_query)
-        cache_key = self._file_list_cache_key(config, list(course_map.keys()))
+        course_ids = list(course_map.keys())
+        cache_key = self._file_list_cache_key(config, course_ids)
         cache_entry = load_cache_entry(self._paths, cache_key)
         cached_rows = cache_entry.get("value") if isinstance(cache_entry, dict) else None
+        cache_has_list = isinstance(cached_rows, list)
         cached_items = enrich_files_with_recency(
             self._paths,
-            [_normalize_file_item_metadata(FileItem(**row)) for row in cached_rows if isinstance(row, dict)] if isinstance(cached_rows, list) else [],
+            [_normalize_file_item_metadata(FileItem(**row)) for row in cached_rows if isinstance(row, dict)] if cache_has_list else [],
         )
         cached_items.sort(key=lambda item: (item.course_title or "", item.kind, item.title.lower()))
         cached_limited = cached_items[: max(0, limit)] if limit is not None else cached_items
         cached_source = _file_provider_source(cached_limited)
+        snapshot_entry = self._load_file_snapshot_entry(config=config, course_ids=course_ids, limit=limit)
+        snapshot_rows = snapshot_entry.get("value") if isinstance(snapshot_entry, dict) else None
+        snapshot_has_list = isinstance(snapshot_rows, list)
+        snapshot_items = enrich_files_with_recency(
+            self._paths,
+            [_normalize_file_item_metadata(FileItem(**row)) for row in snapshot_rows if isinstance(row, dict)] if snapshot_has_list else [],
+        )
+        snapshot_items.sort(key=lambda item: (item.course_title or "", item.kind, item.title.lower()))
+        snapshot_limited = snapshot_items[: max(0, limit)] if limit is not None else snapshot_items
+        snapshot_source = _file_provider_source(snapshot_limited)
+
+        bounded_warning = _provider_warning(
+            "BOUNDED_CACHE",
+            "Returning a bounded file snapshot; it may omit items outside the requested limit.",
+        )
+        canonical_snapshot = CachedProviderSnapshot(
+            items=[item.to_dict() for item in cached_limited],
+            cache_entry=cache_entry if cache_has_list else None,
+            source=cached_source,  # type: ignore[arg-type]
+        )
+        bounded_snapshot = CachedProviderSnapshot(
+            items=[item.to_dict() for item in snapshot_limited],
+            cache_entry=snapshot_entry if snapshot_has_list else None,
+            source=snapshot_source,  # type: ignore[arg-type]
+            bounded_cache=True,
+            cache_warning=bounded_warning,
+        )
+        selected_snapshot, use_preferred_cache = select_cached_provider_snapshot(
+            (canonical_snapshot, bounded_snapshot),
+            prefer_cache=prefer_cache,
+        )
 
         def refresh() -> tuple[list[dict[str, Any]], Any, Any]:
             live_items = self._refresh_file_items(
@@ -653,20 +734,20 @@ class FileService:
             )
 
         def fresh_timestamps() -> tuple[str | None, str | None]:
-            fresh_entry = load_cache_entry(self._paths, cache_key)
+            fresh_entry = load_cache_entry(self._paths, cache_key) or self._load_file_snapshot_entry(
+                config=config,
+                course_ids=course_ids,
+                limit=limit,
+            )
             return (
                 _iso_from_epoch_seconds((fresh_entry or {}).get("stored_at")),
                 _iso_from_epoch_seconds((fresh_entry or {}).get("expires_at")),
             )
 
         return load_cached_or_refresh(
-            prefer_cache=prefer_cache,
+            prefer_cache=use_preferred_cache,
             deadline=deadline,
-            snapshot=CachedProviderSnapshot(
-                items=[item.to_dict() for item in cached_limited],
-                cache_entry=cache_entry,
-                source=cached_source,  # type: ignore[arg-type]
-            ),
+            snapshot=selected_snapshot,
             refresh=refresh,
             resource_label="file",
             fresh_timestamps=fresh_timestamps,
@@ -1046,6 +1127,27 @@ class FileService:
         bootstrap: KlmsSessionBootstrap,
         deadline: RefreshDeadline | None,
     ) -> list[FileItem]:
+        # The canonical key describes every selected course.  A bounded refresh may
+        # stop after only part of that scope, so it must never replace that entry.
+        cacheable = limit is None
+        snapshotable = True
+
+        def persist_refresh_cache(observed: list[FileItem]) -> None:
+            if cacheable:
+                save_cache_value(
+                    self._paths,
+                    self._file_list_cache_key(config, list(course_map.keys())),
+                    [item.to_dict() for item in observed],
+                    ttl_seconds=FILE_LIST_TTL_SECONDS,
+                )
+            elif snapshotable and limit is not None:
+                save_cache_value(
+                    self._paths,
+                    self._file_list_snapshot_cache_key(config, list(course_map.keys()), limit),
+                    [item.to_dict() for item in observed],
+                    ttl_seconds=FILE_LIST_TTL_SECONDS,
+                )
+
         items: list[FileItem] = []
         api_items, api_covered_course_ids = self._refresh_file_items_api(
             config=config,
@@ -1060,7 +1162,7 @@ class FileService:
             deduped = _merge_file_items(items)
             deduped.sort(key=lambda item: (item.course_title or "", item.kind, item.title.lower()))
             observed = observe_files(self._paths, deduped)
-            save_cache_value(self._paths, self._file_list_cache_key(config, list(course_map.keys())), [item.to_dict() for item in observed], ttl_seconds=FILE_LIST_TTL_SECONDS)
+            persist_refresh_cache(observed)
             return observed
 
         course_meta_list = [
@@ -1093,6 +1195,8 @@ class FileService:
             for path in index_paths:
                 response = index_responses.get(path)
                 if response is None:
+                    cacheable = False
+                    snapshotable = False
                     continue
                 if looks_login_url(response.url) or looks_logged_out_html(response.text):
                     raise CommandError(
@@ -1142,6 +1246,8 @@ class FileService:
             for path in course_paths:
                 response = course_responses.get(path)
                 if response is None:
+                    cacheable = False
+                    snapshotable = False
                     continue
                 if looks_login_url(response.url) or looks_logged_out_html(response.text):
                     raise CommandError(
@@ -1174,7 +1280,7 @@ class FileService:
         deduped = _merge_file_items(items)
         deduped.sort(key=lambda item: (item.course_title or "", item.kind, item.title.lower()))
         observed = observe_files(self._paths, deduped)
-        save_cache_value(self._paths, self._file_list_cache_key(config, list(course_map.keys())), [item.to_dict() for item in observed], ttl_seconds=FILE_LIST_TTL_SECONDS)
+        persist_refresh_cache(observed)
         return observed
 
     def _refresh_file_items_api(

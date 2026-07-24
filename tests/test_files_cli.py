@@ -983,3 +983,233 @@ def test_file_dashboard_load_uses_recent_stale_cache_without_live_refresh(tmp_pa
     assert result.refresh_attempted is False
     assert result.warnings == ()
 
+@pytest.mark.parametrize(
+    ("cached_rows", "expected_count"),
+    [
+        ([], 0),
+        (
+            [
+                {
+                    "id": "991",
+                    "title": "Week 1 Slides",
+                    "url": "https://klms.kaist.ac.kr/mod/resource/view.php?id=991",
+                    "download_url": "https://klms.kaist.ac.kr/pluginfile.php/123/week1.pdf?forcedownload=1",
+                    "filename": "week1.pdf",
+                    "kind": "file",
+                    "downloadable": True,
+                    "course_id": "180871",
+                    "course_title": "Introduction to Algorithms",
+                    "course_code": "CS.30000_2026_1",
+                    "course_code_base": "CS.30000",
+                    "source": "html:course-view",
+                    "confidence": 0.7,
+                }
+            ],
+            1,
+        ),
+    ],
+)
+def test_file_dashboard_live_failure_falls_back_to_fresh_list_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cached_rows: list[dict[str, object]], expected_count: int) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    paths = resolve_paths()
+    config = load_config(paths)
+    service = FileService(paths, AuthService(paths))
+    bootstrap = SimpleNamespace(dashboard_html='<a href="/course/view.php?id=180871">Introduction to Algorithms(CS.30000_2026_1)</a>')
+    save_cache_value(paths, service._file_list_cache_key(config, ["180871"]), cached_rows, ttl_seconds=60)
+    monkeypatch.setattr(service, "_refresh_file_items", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("network down")))
+
+    result = service.load_for_dashboard(
+        context=object(),
+        config=config,
+        auth_mode="profile",
+        bootstrap=bootstrap,
+        prefer_cache=False,
+    )
+
+    assert len(result.items) == expected_count
+    assert result.cache_hit is True
+    assert result.refresh_attempted is True
+    assert result.ok is True
+    assert [warning["code"] for warning in result.warnings] == ["LIVE_REFRESH_FAILED"]
+    assert result.provider_status()["status"] == "fallback"
+
+def test_file_dashboard_uses_compatible_bounded_snapshot_after_live_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    paths = resolve_paths()
+    config = load_config(paths)
+    service = FileService(paths, AuthService(paths))
+    course_map = {
+        "180871": {
+            "course_id": "180871",
+            "course_title": "Introduction to Algorithms",
+            "course_code": "CS.30000_2026_1",
+        }
+    }
+    item = FileItem(
+        id="991",
+        title="Week 1 Slides",
+        url="https://klms.kaist.ac.kr/mod/resource/view.php?id=991",
+        download_url="https://klms.kaist.ac.kr/pluginfile.php/123/week1.pdf?forcedownload=1",
+        filename="week1.pdf",
+        kind="file",
+        downloadable=True,
+        course_id="180871",
+        course_title="Introduction to Algorithms",
+        course_code="CS.30000_2026_1",
+        course_code_base="CS.30000",
+        source="api:core_course_get_contents",
+        confidence=0.9,
+        auth_mode="profile",
+    )
+    monkeypatch.setattr(service, "_refresh_file_items_api", lambda **kwargs: ([item], {"180871"}))
+
+    service._refresh_file_items(
+        config=config,
+        auth_mode="profile",
+        course_map=course_map,
+        limit=1,
+        bootstrap=SimpleNamespace(),
+        deadline=None,
+    )
+
+    assert load_cache_entry(paths, service._file_list_cache_key(config, ["180871"])) is None
+    assert service._load_file_snapshot_entry(config=config, course_ids=["180871"], limit=1) is not None
+    bootstrap = SimpleNamespace(dashboard_html='<a href="/course/view.php?id=180871">Introduction to Algorithms(CS.30000_2026_1)</a>')
+    monkeypatch.setattr(service, "_refresh_file_items", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("network down")))
+
+    result = service.load_for_dashboard(
+        context=object(),
+        config=config,
+        auth_mode="profile",
+        bootstrap=bootstrap,
+        limit=1,
+        prefer_cache=False,
+    )
+
+    assert [row["id"] for row in result.items] == ["991"]
+    assert result.bounded_cache is True
+    assert result.provider_status()["status"] == "bounded_fallback"
+    assert [warning["code"] for warning in result.warnings] == ["BOUNDED_CACHE", "LIVE_REFRESH_FAILED"]
+
+    incompatible = service.load_for_dashboard(
+        context=object(),
+        config=config,
+        auth_mode="profile",
+        bootstrap=bootstrap,
+        limit=2,
+        prefer_cache=False,
+    )
+
+    assert incompatible.ok is False
+    assert incompatible.bounded_cache is False
+    assert [warning["code"] for warning in incompatible.warnings] == ["LIVE_REFRESH_FAILED"]
+
+def test_file_dashboard_preexpired_deadline_returns_fresh_empty_cache_without_attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    paths = resolve_paths()
+    config = load_config(paths)
+    service = FileService(paths, AuthService(paths))
+    bootstrap = SimpleNamespace(dashboard_html='<a href="/course/view.php?id=180871">Introduction to Algorithms(CS.30000_2026_1)</a>')
+    save_cache_value(paths, service._file_list_cache_key(config, ["180871"]), [], ttl_seconds=60)
+    monkeypatch.setattr(service, "_refresh_file_items", lambda **kwargs: (_ for _ in ()).throw(AssertionError("refresh should not start")))
+
+    result = service.load_for_dashboard(
+        context=object(),
+        config=config,
+        auth_mode="profile",
+        bootstrap=bootstrap,
+        deadline=SimpleNamespace(hard_expired=lambda: True),
+        prefer_cache=False,
+    )
+
+    assert result.items == []
+    assert result.cache_hit is True
+    assert result.refresh_attempted is False
+    assert [warning["code"] for warning in result.warnings] == ["LIVE_REFRESH_TIMEOUT"]
+    assert result.provider_status()["status"] == "cache_hit"
+
+def test_limited_file_refresh_cannot_overwrite_canonical_cache_and_unbounded_refresh_can_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    paths = resolve_paths()
+    config = load_config(paths)
+    service = FileService(paths, AuthService(paths))
+    course_map = {
+        "180871": {
+            "course_id": "180871",
+            "course_title": "Introduction to Algorithms",
+            "course_code": "CS.30000_2026_1",
+        }
+    }
+    cache_key = service._file_list_cache_key(config, ["180871"])
+    original = [{"id": "cached"}]
+    save_cache_value(paths, cache_key, original, ttl_seconds=60)
+    live_item = FileItem(
+        id="991",
+        title="Week 1 Slides",
+        url="https://klms.kaist.ac.kr/mod/resource/view.php?id=991",
+        download_url="https://klms.kaist.ac.kr/pluginfile.php/123/week1.pdf?forcedownload=1",
+        filename="week1.pdf",
+        kind="file",
+        downloadable=True,
+        course_id="180871",
+        course_title="Introduction to Algorithms",
+        course_code="CS.30000_2026_1",
+        course_code_base="CS.30000",
+        source="api:core_course_get_contents",
+        confidence=0.9,
+        auth_mode="profile",
+    )
+    monkeypatch.setattr(service, "_refresh_file_items_api", lambda **kwargs: ([live_item], {"180871"}))
+
+    limited = service._refresh_file_items(
+        config=config,
+        auth_mode="profile",
+        course_map=course_map,
+        limit=1,
+        bootstrap=SimpleNamespace(),
+        deadline=None,
+    )
+
+    assert [item.id for item in limited] == ["991"]
+    assert load_cache_value(paths, cache_key) == original
+
+    complete = service._refresh_file_items(
+        config=config,
+        auth_mode="profile",
+        course_map=course_map,
+        limit=None,
+        bootstrap=SimpleNamespace(),
+        deadline=None,
+    )
+
+    assert [item.id for item in complete] == ["991"]
+    cached_rows = load_cache_value(paths, cache_key)
+    assert isinstance(cached_rows, list)
+    assert [row["id"] for row in cached_rows] == ["991"]
+
+def test_file_refresh_with_missing_provider_response_does_not_seed_canonical_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KAIST_CLI_HOME", str(tmp_path / "kaist-home"))
+    _write_config(tmp_path)
+    paths = resolve_paths()
+    config = load_config(paths)
+    service = FileService(paths, AuthService(paths))
+    course_map = {"180871": {"course_id": "180871", "course_title": "Introduction to Algorithms", "course_code": "CS.30000_2026_1"}}
+    cache_key = service._file_list_cache_key(config, ["180871"])
+    monkeypatch.setattr(service, "_refresh_file_items_api", lambda **kwargs: ([], set()))
+    monkeypatch.setattr("kaist_cli.v2.klms.files.fetch_html_batch", lambda *args, **kwargs: {})
+
+    items = service._refresh_file_items(
+        config=config,
+        auth_mode="profile",
+        course_map=course_map,
+        limit=None,
+        bootstrap=SimpleNamespace(http=object()),
+        deadline=None,
+    )
+
+    assert items == []
+    assert load_cache_entry(paths, cache_key) is None
