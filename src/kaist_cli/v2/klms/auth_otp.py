@@ -49,6 +49,33 @@ EMAIL_OTP_WORKER_POLL_SECONDS = 0.25
 
 AUTH_SESSION_STARTING_GRACE_SECONDS = 30.0
 
+
+def resolve_otp_input(*, otp: str | None, otp_stdin: bool = False, no_input: bool = False) -> str:
+    """Resolve an OTP without making automation depend on an interactive prompt."""
+
+    if otp is not None:
+        return otp
+    if otp_stdin:
+        value = sys.stdin.readline()
+        if not value:
+            raise CommandError(
+                code="CONFIG_INVALID",
+                message="No OTP was provided on stdin.",
+                hint="Pipe one OTP line with `--otp-stdin`, or use `--no-input` to fail explicitly.",
+                exit_code=40,
+                retryable=False,
+            )
+        return value.strip()
+    if no_input or not sys.stdin or not sys.stdin.isatty():
+        raise CommandError(
+            code="CONFIG_INVALID",
+            message="An OTP is required, but interactive input is unavailable.",
+            hint="Pipe one OTP line with `--otp-stdin`, pass the deprecated `--otp CODE`, or run interactively without `--no-input`.",
+            exit_code=40,
+            retryable=False,
+        )
+    return getpass.getpass("KAIST email OTP: ")
+
 def _pid_is_running(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -552,7 +579,7 @@ class AuthOtpMixin:
                 raise CommandError(
                     code="AUTH_OTP_INVALID",
                     message=f"KAIST rejected the email OTP code ({error_message}).",
-                    hint="Check the newest KAIST email OTP and rerun `kaist klms auth complete-refresh <SESSION_ID> --otp CODE`.",
+                    hint="Check the newest KAIST email OTP and rerun `kaist klms auth complete-refresh <SESSION_ID> --otp-stdin`.",
                     exit_code=10,
                     retryable=True,
                 )
@@ -564,7 +591,7 @@ class AuthOtpMixin:
         raise CommandError(
             code="AUTH_OTP_TIMEOUT",
             message="Timed out waiting for KLMS session completion after submitting the email OTP.",
-            hint="Retry `kaist klms auth complete-refresh <SESSION_ID> --otp CODE`, or begin a fresh staged refresh.",
+            hint="Retry `kaist klms auth complete-refresh <SESSION_ID> --otp-stdin`, or begin a fresh staged refresh.",
             exit_code=10,
             retryable=True,
         )
@@ -580,7 +607,7 @@ class AuthOtpMixin:
             raise CommandError(
                 code="AUTH_FAILED",
                 message="KAIST returned a non-JSON response while validating the email OTP.",
-                hint="Retry `kaist klms auth complete-refresh <SESSION_ID> --otp CODE`, or begin a fresh staged refresh.",
+                hint="Retry `kaist klms auth complete-refresh <SESSION_ID> --otp-stdin`, or begin a fresh staged refresh.",
                 exit_code=10,
                 retryable=True,
             )
@@ -591,7 +618,7 @@ class AuthOtpMixin:
             raise CommandError(
                 code="AUTH_OTP_INVALID",
                 message="KAIST rejected the email OTP code (인증 번호가 올바르지않습니다.).",
-                hint="Check the newest KAIST email OTP and rerun `kaist klms auth complete-refresh <SESSION_ID> --otp CODE`.",
+                hint="Check the newest KAIST email OTP and rerun `kaist klms auth complete-refresh <SESSION_ID> --otp-stdin`.",
                 exit_code=10,
                 retryable=True,
             )
@@ -623,7 +650,7 @@ class AuthOtpMixin:
         raise CommandError(
             code="AUTH_FAILED",
             message=f"KAIST returned an unexpected email OTP validation response ({detail}).",
-            hint="Retry `kaist klms auth complete-refresh <SESSION_ID> --otp CODE`, or begin a fresh staged refresh.",
+            hint="Retry `kaist klms auth complete-refresh <SESSION_ID> --otp-stdin`, or begin a fresh staged refresh.",
             exit_code=10,
             retryable=True,
         )
@@ -664,7 +691,7 @@ class AuthOtpMixin:
         raise CommandError(
             code="AUTH_TIMEOUT",
             message="Timed out waiting for KAIST device registration to complete after email OTP validation.",
-            hint="Retry `kaist klms auth complete-refresh <SESSION_ID> --otp CODE`, or begin a fresh staged refresh.",
+            hint="Retry `kaist klms auth complete-refresh <SESSION_ID> --otp-stdin`, or begin a fresh staged refresh.",
             exit_code=10,
             retryable=True,
         )
@@ -915,4 +942,3 @@ class AuthOtpMixin:
             )
             self._persist_worker_failure(session_id, wrapped)
             return CommandResult(data={"ok": False}, source="browser", capability="partial")
-

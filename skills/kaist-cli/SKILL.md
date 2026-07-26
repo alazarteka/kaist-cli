@@ -37,6 +37,13 @@ Every `--agent` response follows this shape:
 
 Key envelope fields are `ok`, `schema`, `meta`, and `data`.
 
+The JSON stream is stable: dispatched operational errors are also emitted on
+stdout with a nonzero exit status. `--agent` parse failures (missing operands,
+invalid choices, or invalid numeric values) return one `kaist.cli.parse.v1`
+error envelope and exit `2`; human-mode parser errors remain normal argparse
+stderr output. Use `kaist --version` for a fast version check, or
+`kaist version --json` when a JSON version envelope is more convenient.
+
 On failure, `ok` is `false` and `error` replaces `data`:
 
 ```json
@@ -121,7 +128,7 @@ During `auth refresh`:
 - do not wait for the command to finish before relaying the number
 - if the configured strategy is `email_otp` and refresh returns a staged session, first try to fetch the OTP from the user's connected Gmail when that connector is available
 - when checking Gmail, prefer the newest KAIST auth email from the last few minutes with tight sender/subject filters; do not guess from unrelated mail
-- if a fresh Gmail OTP is found, submit it yourself with `kaist klms auth complete-refresh SESSION_ID --otp CODE`
+- if a fresh Gmail OTP is found, submit it through stdin with `printf '%s\n' "$CODE" | kaist klms auth complete-refresh SESSION_ID --otp-stdin`; the legacy `--otp CODE` form remains compatible but is visible in process arguments
 - if Gmail is not connected, unavailable, or the newest OTP mail is ambiguous, immediately ask the user for the newest email code
 - after the user approves and refresh succeeds, continue the original KLMS task automatically
 
@@ -239,6 +246,8 @@ kaist --agent klms request get /lib/ajax/service.php --full-body
 
 ```bash
 kaist --agent version              # installed version
+kaist --version                    # fast plain version
+kaist version --json               # version envelope; output flags may follow `version`
 kaist update --check               # check for updates
 kaist update                       # self-update
 kaist --agent agent status         # inspect Codex/Claude/Gemini skill installs
@@ -246,6 +255,7 @@ kaist agent install codex          # install into $CODEX_HOME/skills
 kaist agent install claude         # install into ~/.claude/skills
 kaist agent install gemini         # install into ~/.gemini/skills
 kaist agent install custom --path ~/agent-skills
+kaist agent uninstall custom --path ~/agent-skills --dry-run
 kaist --agent klms sync reset      # clear cache without touching auth
 ```
 

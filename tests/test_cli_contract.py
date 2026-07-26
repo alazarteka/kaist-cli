@@ -7,6 +7,10 @@ import sys
 import fcntl
 from pathlib import Path
 
+import pytest
+
+from kaist_cli.cli.output import emit_text
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -179,6 +183,79 @@ def test_version_command_schema(tmp_path: Path) -> None:
     assert payload["data"]["bundled_skill_path"] == str(ROOT / "skills" / "kaist-cli")
     assert payload["data"]["self_update_supported"] is False
     assert payload["data"]["release_repo"] == "alazarteka/kaist-cli"
+
+
+def test_version_supports_global_json_flag_after_command(tmp_path: Path) -> None:
+    cp = run_cli(tmp_path, "version", "--json")
+    assert cp.returncode == 0, cp.stderr
+    payload = json.loads(cp.stdout)
+    assert payload["ok"] is True
+    assert payload["schema"] == "kaist.cli.version.v1"
+
+
+def test_version_flag_is_supported(tmp_path: Path) -> None:
+    cp = run_cli(tmp_path, "--version")
+    assert cp.returncode == 0
+    assert cp.stdout.strip() == "kaist 0.5.3"
+
+
+def test_agent_parser_failures_are_one_json_envelope(tmp_path: Path) -> None:
+    for args in (
+        ("--agent", "klms", "files", "get"),
+        ("--agent", "klms", "today", "--limit", "0"),
+    ):
+        cp = run_cli(tmp_path, *args)
+        assert cp.returncode == 2
+        payload = json.loads(cp.stdout)
+        assert payload["ok"] is False
+        assert payload["schema"] == "kaist.cli.parse.v1"
+        assert payload["error"]["code"] == "CONFIG_INVALID"
+        assert cp.stderr == ""
+
+
+def test_complete_refresh_no_input_fails_without_prompt(tmp_path: Path) -> None:
+    cp = run_cli(tmp_path, "--agent", "klms", "auth", "complete-refresh", "session-id", "--no-input")
+    assert cp.returncode == 40
+    payload = json.loads(cp.stdout)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "CONFIG_INVALID"
+    assert "OTP" in payload["error"]["message"]
+
+
+def test_complete_refresh_accepts_stdin_channel_without_echoing_code(tmp_path: Path) -> None:
+    env = os.environ.copy()
+    env["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    env["PYTHONPATH"] = str(ROOT / "src")
+    cp = subprocess.run(
+        [sys.executable, "-m", "kaist_cli.main", "--agent", "klms", "auth", "complete-refresh", "session-id", "--otp-stdin"],
+        cwd=ROOT,
+        env=env,
+        input="123456\n",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert cp.returncode == 10
+    payload = json.loads(cp.stdout)
+    assert payload["ok"] is False
+    assert "123456" not in cp.stdout
+
+
+def test_human_rendering_sanitizes_terminal_controls_but_keeps_unicode(capsys: pytest.CaptureFixture[str]) -> None:
+    emit_text(
+        {
+            "title": "강의\x1b]52;c;secret\x07\rspoof\nnext\u202e.txt",
+            "warning": "안전한 안내",
+        }
+    )
+    output = capsys.readouterr().out
+    assert "강의" in output
+    assert "안전한 안내" in output
+    assert "secret" not in output
+    assert "spoof" in output
+    assert "\x1b" not in output
+    assert "\r" not in output
+    assert "\nnext" not in output
 
 
 def test_help_mentions_bundled_skill_path(tmp_path: Path) -> None:

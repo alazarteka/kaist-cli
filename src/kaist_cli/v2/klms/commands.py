@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 
 from ..contracts import CommandResult
+from .auth_otp import resolve_otp_input
 from .container import KlmsFacade
 
 
@@ -49,7 +50,12 @@ def dispatch(args: argparse.Namespace, facade: KlmsFacade) -> CommandResult:
             wait_seconds=args.wait_seconds,
         )
     if args.group == "auth" and args.action == "complete-refresh":
-        return facade.auth_complete_refresh(args.session_id, otp=args.otp, wait_seconds=args.wait_seconds)
+        otp = resolve_otp_input(
+            otp=getattr(args, "otp", None),
+            otp_stdin=bool(getattr(args, "otp_stdin", False)),
+            no_input=bool(getattr(args, "no_input", False)),
+        )
+        return facade.auth_complete_refresh(args.session_id, otp=otp, wait_seconds=args.wait_seconds)
     if args.group == "auth" and args.action == "cancel-refresh":
         return facade.auth_cancel_refresh(args.session_id)
     if args.group == "auth" and args.action == "_worker-run":

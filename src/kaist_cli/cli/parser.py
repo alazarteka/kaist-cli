@@ -5,9 +5,32 @@ import argparse
 from ..core.distribution import discover_distribution_info
 from ..core.system_registry import default_registry
 from ..core.help_format import HelpFormatter, dedent as _dedent
+from ..core.versioning import version_string
 
 
-def build_parser() -> argparse.ArgumentParser:
+class CliParseError(ValueError):
+    """An argparse validation error that can be rendered in agent mode."""
+
+
+class _CliArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args, agent_mode: bool = False, **kwargs):
+        self.agent_mode = agent_mode
+        super().__init__(*args, **kwargs)
+
+    def add_subparsers(self, **kwargs):  # type: ignore[no-untyped-def]
+        kwargs.setdefault(
+            "parser_class",
+            lambda *args, **parser_kwargs: type(self)(*args, agent_mode=self.agent_mode, **parser_kwargs),
+        )
+        return super().add_subparsers(**kwargs)
+
+    def error(self, message: str) -> None:
+        if self.agent_mode:
+            raise CliParseError(message)
+        super().error(message)
+
+
+def build_parser(*, agent_mode: bool = False) -> argparse.ArgumentParser:
     distribution = discover_distribution_info()
     epilog = None
     if distribution.bundled_skill_path is not None:
@@ -20,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
               Agents can install this skill directly from that path or use the install helper above.
             """
         )
-    parser = argparse.ArgumentParser(
+    parser = _CliArgumentParser(
         prog="kaist",
         description=_dedent(
             """
@@ -43,7 +66,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=epilog,
         formatter_class=HelpFormatter,
+        agent_mode=agent_mode,
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {version_string()}", help="Show the CLI version and exit.")
     parser.add_argument("--debug", action="store_true", help="Print traceback on failures.")
     parser.add_argument(
         "--format",

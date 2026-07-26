@@ -4,6 +4,7 @@ import json
 import html as _html
 import re
 import sys
+import unicodedata
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from bs4 import BeautifulSoup, Tag  # type: ignore[import-untyped]
 
 from ..contracts import CommandError, CommandResult
 from ...core.timeutil import iso_from_epoch_seconds as _iso_from_epoch_seconds
+from ...core.terminal import sanitize_terminal_text
 from .moodle_html import unwrap_moodle_ajax_payload as _unwrap_moodle_ajax_payload
 from .auth import AuthService, looks_logged_out_html, looks_login_url
 from .cache import list_cache_entries, load_cache_entry, load_cache_value, save_cache_value
@@ -59,13 +61,13 @@ FILE_AJAX_HEADERS = {
 
 def _emit_pull_progress(index: int, total: int, title: str, *, status: str | None = None, detail: str | None = None) -> None:
     prefix = f"[{index}/{total}]"
-    safe_title = " ".join(str(title or "unnamed item").split()) or "unnamed item"
+    safe_title = sanitize_terminal_text(" ".join(str(title or "unnamed item").split())) or "unnamed item"
     if status is None:
         message = f"{prefix} downloading {safe_title} ..."
     else:
         message = f"{prefix} {status} {safe_title}"
         if detail:
-            message += f" ({detail})"
+            message += f" ({sanitize_terminal_text(detail)})"
     print(message, file=sys.stderr, flush=True)
 
 
@@ -158,10 +160,78 @@ def _resolve_destination_root(*, files_root: Path, subdir: str | None, dest: str
         if not str(target).strip():
             raise CommandError(code="CONFIG_INVALID", message="--dest must not be empty.", exit_code=40)
         target.mkdir(parents=True, exist_ok=True)
-        return target
+        return target.resolve()
     target = files_root / _sanitize_relpath(subdir) if subdir else files_root
     target.mkdir(parents=True, exist_ok=True)
-    return target
+    return target.resolve()
+
+
+def _filename_from_remote(value: str | None) -> str | None:
+    """Extract a safe basename from a remote or metadata-provided filename."""
+
+    text = str(value or "")
+    if not text or any(_is_filename_control(char) for char in text):
+        return None
+    basename = text.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if basename in {"", ".", ".."}:
+        return None
+    return basename
+
+
+def _validate_filename_override(value: str) -> str:
+    """Validate an explicit --filename without silently changing its meaning."""
+
+    text = str(value or "")
+    if not text or text in {".", ".."} or any(char in text for char in ("/", "\\")):
+        raise CommandError(
+            code="CONFIG_INVALID",
+            message="--filename must be a single safe filename, not a path.",
+            hint="Use a basename such as `lecture-notes.pdf`; directory placement belongs in `--dest` or `--subdir`.",
+            exit_code=40,
+        )
+    if Path(text).is_absolute() or re.match(r"^[A-Za-z]:", text):
+        raise CommandError(
+            code="CONFIG_INVALID",
+            message="--filename must be relative to the selected output directory.",
+            hint="Use a basename such as `lecture-notes.pdf`; directory placement belongs in `--dest` or `--subdir`.",
+            exit_code=40,
+        )
+    if any(_is_filename_control(char) for char in text):
+        raise CommandError(
+            code="CONFIG_INVALID",
+            message="--filename contains terminal or filesystem control characters.",
+            hint="Use a printable filename without path separators or control characters.",
+            exit_code=40,
+        )
+    return text
+
+
+def _is_filename_control(char: str) -> bool:
+    return unicodedata.category(char) in {"Cc", "Cf"}
+
+
+def _safe_download_path(out_dir: Path, filename: str) -> Path:
+    root = out_dir.resolve()
+    candidate = out_dir / filename
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise CommandError(
+            code="CONFIG_INVALID",
+            message="The download path would escape the selected output directory.",
+            hint="Choose a regular destination directory and a basename-only filename.",
+            exit_code=40,
+        ) from exc
+    return candidate
+
+
+def _safe_remote_download_name(*candidates: str | None, fallback: str) -> str:
+    for candidate in candidates:
+        safe = _filename_from_remote(candidate)
+        if safe:
+            return safe
+    return fallback
 
 
 def _slug_component(text: str) -> str:
@@ -1568,8 +1638,17 @@ class FileService:
 
         out_dir = _resolve_destination_root(files_root=self._paths.files_root, subdir=subdir, dest=dest)
 
-        final_name = str(filename_override or item.filename or _filename_from_url(download_url) or f"download-{item.id or 'file'}").strip()
-        out_path = out_dir / final_name
+        explicit_name = _validate_filename_override(filename_override) if filename_override is not None else None
+        fallback_name = _safe_remote_download_name(
+            f"download-{item.id}" if item.id else None,
+            fallback="download-file",
+        )
+        final_name = explicit_name or _safe_remote_download_name(
+            item.filename,
+            _filename_from_url(download_url),
+            fallback=fallback_name,
+        )
+        out_path = _safe_download_path(out_dir, final_name)
         if out_path.exists() and if_exists == "skip":
             return {
                 "skipped": True,
@@ -1623,8 +1702,13 @@ class FileService:
             page.close()
 
         suggested_name = str(download.suggested_filename or "").strip() or None
-        browser_name = str(filename_override or suggested_name or item.filename or _filename_from_url(download_url) or f"download-{item.id or 'file'}").strip()
-        browser_path = out_dir / browser_name
+        browser_name = explicit_name or _safe_remote_download_name(
+            suggested_name,
+            item.filename,
+            _filename_from_url(download_url),
+            fallback=fallback_name,
+        )
+        browser_path = _safe_download_path(out_dir, browser_name)
         if browser_path.exists() and if_exists == "skip":
             return {
                 "skipped": True,

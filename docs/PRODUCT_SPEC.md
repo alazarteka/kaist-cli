@@ -68,6 +68,17 @@ Errors use:
 }
 ```
 
+The stream and exit contract is intentional: dispatched JSON operational
+errors are emitted on stdout with a nonzero exit status for compatibility with
+existing agent callers. `--agent` parser/validation failures use the same
+stdout JSON channel with schema `kaist.cli.parse.v1` and exit status `2`.
+Human-mode argparse errors remain conventional stderr diagnostics. JSON output
+never includes progress or warnings outside its envelope.
+
+`--version` is a fast discovery path; `kaist version --json` and
+`kaist version --format json` are additive placements for the version output
+flags.
+
 ## Capability Model
 
 Provider/source reporting should stay explicit:

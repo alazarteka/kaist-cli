@@ -71,6 +71,31 @@ def test_uninstall_agent_removes_target(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert not Path(payload["target_path"]).exists()
 
 
+def test_uninstall_agent_refuses_unrelated_directory(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+    target = tmp_path / "codex-home" / "skills" / "kaist-cli"
+    target.mkdir(parents=True)
+    (target / "user-data.txt").write_text("keep", encoding="utf-8")
+
+    with pytest.raises(agents.AgentCommandError, match="unverified"):
+        agents.uninstall_agent("codex")
+
+    assert (target / "user-data.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_install_copy_writes_marker_and_uninstall_removes_only_owned_copy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+
+    installed = agents.install_agent("codex", copy=True)
+    target = Path(installed["target_path"])
+    assert installed["ownership"] == "managed-copy"
+    assert (target / agents.INSTALL_MARKER_NAME).exists()
+
+    removed = agents.uninstall_agent("codex")
+    assert removed["removed"] is True
+    assert not target.exists()
+
+
 def test_install_agent_requires_force_for_existing_target(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
     target = tmp_path / "codex-home" / "skills" / "kaist-cli"

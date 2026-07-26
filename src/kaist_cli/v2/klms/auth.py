@@ -159,7 +159,7 @@ class AuthService(AuthOtpMixin, AuthEasyLoginMixin):
             stage = str(staged_auth_session.get("stage") or "").strip()
             session_id = str(staged_auth_session.get("session_id") or "").strip()
             if stage == "waiting_for_email_otp" and session_id:
-                return f"Run `kaist klms auth complete-refresh {session_id} --otp CODE`, or `kaist klms auth cancel-refresh {session_id}` to abort."
+                return f"Run `kaist klms auth complete-refresh {session_id} --otp-stdin`, or `kaist klms auth cancel-refresh {session_id}` to abort."
             if stage == "failed":
                 return "Run `kaist klms auth begin-refresh` again to create a fresh email OTP session."
         if config is None:
@@ -582,7 +582,7 @@ class AuthService(AuthOtpMixin, AuthEasyLoginMixin):
             raise CommandError(
                 code="CONFIG_INVALID",
                 message="OTP code must contain digits.",
-                hint="Pass the code from the KAIST email with `--otp CODE`.",
+                hint="Pass the code with `--otp-stdin`, or use the deprecated `--otp CODE` compatibility flag.",
                 exit_code=40,
                 retryable=False,
             )

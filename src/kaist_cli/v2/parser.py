@@ -4,6 +4,7 @@ import argparse
 from typing import Any, Callable
 
 from ..core.help_format import HelpFormatter as _HelpFormatter
+from ..cli.validation import nonnegative_int, positive_float, positive_int
 
 
 Handler = Callable[[argparse.Namespace], Any]
@@ -50,7 +51,7 @@ def register_klms_parser(
     auth_login.add_argument("--base-url", metavar="URL", help="Persist this KLMS base URL before opening the browser.")
     auth_login.add_argument("--dashboard-path", metavar="PATH", help="Optional dashboard path override, default /my/.")
     auth_login.add_argument("--username", metavar="ID", help="Use the non-interactive KAIST SSO Easy Login push flow with this KAIST account ID instead of the manual browser flow.")
-    auth_login.add_argument("--wait-seconds", type=float, default=180.0, metavar="N", help="Maximum time to wait for KAIST Easy Login approval.")
+    auth_login.add_argument("--wait-seconds", type=positive_float, default=180.0, metavar="SECONDS", help="Maximum wait; must be greater than 0 seconds.")
     _set_defaults(auth_login, schema_name=f"{schema_prefix}.auth.login.v1", command_path="klms auth login", handler=handler)
 
     auth_install = auth_sub.add_parser(
@@ -89,7 +90,7 @@ def register_klms_parser(
     auth_refresh.add_argument("--base-url", metavar="URL", help="Optional base URL override before refreshing auth.")
     auth_refresh.add_argument("--dashboard-path", metavar="PATH", help="Optional dashboard path override, default /my/.")
     auth_refresh.add_argument("--username", metavar="ID", help="Use the non-interactive KAIST SSO Easy Login push flow with this KAIST account ID instead of the manual browser flow.")
-    auth_refresh.add_argument("--wait-seconds", type=float, default=180.0, metavar="N", help="Maximum time to wait for KAIST Easy Login approval.")
+    auth_refresh.add_argument("--wait-seconds", type=positive_float, default=180.0, metavar="SECONDS", help="Maximum wait; must be greater than 0 seconds.")
     _set_defaults(
         auth_refresh,
         schema_name=f"{schema_prefix}.auth.refresh.v1",
@@ -154,7 +155,7 @@ def register_klms_parser(
     auth_begin_refresh.add_argument("--base-url", metavar="URL", help="Optional base URL override before starting the staged refresh.")
     auth_begin_refresh.add_argument("--dashboard-path", metavar="PATH", help="Optional dashboard path override, default /my/.")
     auth_begin_refresh.add_argument("--username", metavar="ID", help="Optional KAIST account ID override.")
-    auth_begin_refresh.add_argument("--wait-seconds", type=float, default=180.0, metavar="N", help="Maximum time to wait for the email OTP challenge page.")
+    auth_begin_refresh.add_argument("--wait-seconds", type=positive_float, default=180.0, metavar="SECONDS", help="Maximum wait; must be greater than 0 seconds.")
     _set_defaults(
         auth_begin_refresh,
         schema_name=f"{schema_prefix}.auth.begin_refresh.v1",
@@ -169,8 +170,15 @@ def register_klms_parser(
         formatter_class=_HelpFormatter,
     )
     auth_complete_refresh.add_argument("session_id", metavar="SESSION_ID", help="Auth session ID returned by `begin-refresh`.")
-    auth_complete_refresh.add_argument("--otp", metavar="CODE", required=True, help="OTP code received from KAIST email.")
-    auth_complete_refresh.add_argument("--wait-seconds", type=float, default=180.0, metavar="N", help="Maximum time to wait for KLMS session completion after OTP submit.")
+    otp_inputs = auth_complete_refresh.add_mutually_exclusive_group()
+    otp_inputs.add_argument(
+        "--otp",
+        metavar="CODE",
+        help="Deprecated compatibility input; exposes the OTP in shell history/process listings. Prefer --otp-stdin or the hidden interactive prompt.",
+    )
+    otp_inputs.add_argument("--otp-stdin", action="store_true", help="Read one OTP line from stdin without exposing it in argv.")
+    otp_inputs.add_argument("--no-input", action="store_true", help="Never prompt; fail quickly if no OTP input was supplied.")
+    auth_complete_refresh.add_argument("--wait-seconds", type=positive_float, default=180.0, metavar="SECONDS", help="Maximum wait; must be greater than 0 seconds.")
     _set_defaults(
         auth_complete_refresh,
         schema_name=f"{schema_prefix}.auth.complete_refresh.v1",
@@ -220,10 +228,10 @@ def register_klms_parser(
         description="Show an urgency-focused daily view of near-term assignments, recent notices, and useful materials.",
         formatter_class=_HelpFormatter,
     )
-    today.add_argument("--limit", type=int, default=5, metavar="N", help="Maximum items per section.")
-    today.add_argument("--window-days", type=int, default=7, metavar="N", help="Assignment due-soon window in days.")
-    today.add_argument("--notice-days", type=int, default=3, metavar="N", help="Recent-notice window in days.")
-    today.add_argument("--max-notice-pages", type=int, default=1, metavar="N", help="Maximum notice pages per board.")
+    today.add_argument("--limit", type=positive_int, default=5, metavar="N", help="Maximum items per section; must be greater than 0.")
+    today.add_argument("--window-days", type=positive_int, default=7, metavar="N", help="Assignment due-soon window in days; must be greater than 0.")
+    today.add_argument("--notice-days", type=positive_int, default=3, metavar="N", help="Recent-notice window in days; must be greater than 0.")
+    today.add_argument("--max-notice-pages", type=positive_int, default=1, metavar="N", help="Maximum notice pages per board; must be greater than 0.")
     _set_defaults(today, schema_name=f"{schema_prefix}.today.v1", command_path="klms today", handler=handler)
 
     week = klms_sub.add_parser(
@@ -232,8 +240,8 @@ def register_klms_parser(
         description="Show this week’s assignments, notices, and new materials in one weekly summary view.",
         formatter_class=_HelpFormatter,
     )
-    week.add_argument("--limit", type=int, default=8, metavar="N", help="Maximum items per section.")
-    week.add_argument("--max-notice-pages", type=int, default=2, metavar="N", help="Maximum notice pages per board.")
+    week.add_argument("--limit", type=positive_int, default=8, metavar="N", help="Maximum items per section; must be greater than 0.")
+    week.add_argument("--max-notice-pages", type=positive_int, default=2, metavar="N", help="Maximum notice pages per board; must be greater than 0.")
     _set_defaults(week, schema_name=f"{schema_prefix}.week.v1", command_path="klms week", handler=handler)
 
     inbox = klms_sub.add_parser(
@@ -242,8 +250,8 @@ def register_klms_parser(
         description="Show a broader chronological KLMS feed merged across assignments, notices, and materials.",
         formatter_class=_HelpFormatter,
     )
-    inbox.add_argument("--limit", type=int, default=30, metavar="N", help="Maximum number of inbox items to return.")
-    inbox.add_argument("--max-notice-pages", type=int, default=1, metavar="N", help="Maximum notice pages per board.")
+    inbox.add_argument("--limit", type=positive_int, default=30, metavar="N", help="Maximum number of inbox items to return; must be greater than 0.")
+    inbox.add_argument("--max-notice-pages", type=positive_int, default=1, metavar="N", help="Maximum notice pages per board; must be greater than 0.")
     inbox.add_argument("--since", dest="since_iso", metavar="ISO", help="Filter time-bearing items by ISO timestamp.")
     _set_defaults(inbox, schema_name=f"{schema_prefix}.inbox.v1", command_path="klms inbox", handler=handler)
 
@@ -282,13 +290,13 @@ def register_klms_parser(
     courses_list.add_argument("--include-all", action="store_true", help="Include noisy dashboard cards and non-course items that are hidden by default.")
     courses_list.add_argument("--include-past", action="store_true", help="Include past-term courses instead of defaulting to the current term.")
     courses_list.add_argument("--course", metavar="QUERY", help="Filter by course code or title substring.")
-    courses_list.add_argument("--limit", type=int, metavar="N", help="Maximum number of courses to return.")
+    courses_list.add_argument("--limit", type=positive_int, metavar="N", help="Maximum number of courses to return; must be greater than 0.")
     _set_defaults(courses_list, schema_name=f"{schema_prefix}.courses.list.v1", command_path="klms courses list", handler=handler)
     courses_resolve = courses_sub.add_parser("resolve", help="Resolve a course query to concrete course IDs and matching aliases.", formatter_class=_HelpFormatter)
     courses_resolve.add_argument("query", metavar="QUERY", help="Course ID, code, Korean title, or English title.")
     courses_resolve.add_argument("--include-all", action="store_true", help="Include noisy dashboard cards and non-course items that are hidden by default.")
     courses_resolve.add_argument("--include-past", action="store_true", help="Include past-term courses instead of defaulting to the current term.")
-    courses_resolve.add_argument("--limit", type=int, default=10, metavar="N", help="Maximum number of matching courses to return.")
+    courses_resolve.add_argument("--limit", type=positive_int, default=10, metavar="N", help="Maximum number of matching courses to return; must be greater than 0.")
     _set_defaults(courses_resolve, schema_name=f"{schema_prefix}.courses.resolve.v1", command_path="klms courses resolve", handler=handler)
     courses_show = courses_sub.add_parser("show", help="Show course metadata and details for one course ID.", formatter_class=_HelpFormatter)
     courses_show.add_argument("course_id", metavar="ID", help="Course ID.")
@@ -301,7 +309,7 @@ def register_klms_parser(
     assignments_list.add_argument("--course", metavar="QUERY", help="Filter by course code or title substring.")
     assignments_list.add_argument("--include-past", action="store_true", help="Include past-term assignments instead of defaulting to current-term courses.")
     assignments_list.add_argument("--since", dest="since_iso", metavar="ISO", help="Only include assignments with due_iso >= ISO.")
-    assignments_list.add_argument("--limit", type=int, metavar="N", help="Maximum number of assignments to return.")
+    assignments_list.add_argument("--limit", type=positive_int, metavar="N", help="Maximum number of assignments to return; must be greater than 0.")
     _set_defaults(
         assignments_list,
         schema_name=f"{schema_prefix}.assignments.list.v1",
@@ -324,9 +332,9 @@ def register_klms_parser(
     notices_list.add_argument("--notice-board-id", metavar="ID", help="Filter to one notice board ID.")
     notices_list.add_argument("--course-id", metavar="ID", help="Filter to boards belonging to one course ID.")
     notices_list.add_argument("--course", metavar="QUERY", help="Filter to boards belonging to matching course code or title text.")
-    notices_list.add_argument("--max-pages", type=int, default=1, metavar="N", help="Maximum pages per board.")
+    notices_list.add_argument("--max-pages", type=positive_int, default=1, metavar="N", help="Maximum pages per board; must be greater than 0.")
     notices_list.add_argument("--since", dest="since_iso", metavar="ISO", help="Only include notices with posted_iso >= ISO.")
-    notices_list.add_argument("--limit", type=int, metavar="N", help="Maximum number of notices to return.")
+    notices_list.add_argument("--limit", type=positive_int, metavar="N", help="Maximum number of notices to return; must be greater than 0.")
     _set_defaults(
         notices_list,
         schema_name=f"{schema_prefix}.notices.list.v1",
@@ -338,7 +346,7 @@ def register_klms_parser(
     notices_show.add_argument("--notice-board-id", metavar="ID", help="Optional board scope that speeds lookup if you already know the board.")
     notices_show.add_argument("--course-id", metavar="ID", help="Optional course ID scope used while discovering the notice board.")
     notices_show.add_argument("--course", metavar="QUERY", help="Optional course code/title filter used while discovering the notice board.")
-    notices_show.add_argument("--max-pages", type=int, default=3, metavar="N", help="Maximum pages per board to scan.")
+    notices_show.add_argument("--max-pages", type=positive_int, default=3, metavar="N", help="Maximum pages per board to scan; must be greater than 0.")
     notices_show.add_argument("--include-html", action="store_true", help="Include parsed notice body HTML in output.")
     _set_defaults(
         notices_show,
@@ -356,7 +364,7 @@ def register_klms_parser(
     notices_attachments_pull.add_argument("--course-id", metavar="ID", help="Filter to boards belonging to one course ID.")
     notices_attachments_pull.add_argument("--course", metavar="QUERY", help="Filter to boards belonging to matching course code or title text.")
     notices_attachments_pull.add_argument("--since", dest="since_iso", metavar="ISO", help="Only scan notices with posted_iso >= ISO.")
-    notices_attachments_pull.add_argument("--limit", type=int, metavar="N", help="Maximum number of notices to scan for attachments.")
+    notices_attachments_pull.add_argument("--limit", type=positive_int, metavar="N", help="Maximum number of notices to scan for attachments; must be greater than 0.")
     notices_attachments_pull.add_argument("--subdir", metavar="DIR", help="Relative destination under the v2 files root.")
     notices_attachments_pull.add_argument("--dest", metavar="PATH", help="Write into this directory instead of the managed files root.")
     notices_attachments_pull.add_argument("--if-exists", choices=["skip", "overwrite"], default="skip", help="Behavior when the destination exists.")
@@ -372,7 +380,7 @@ def register_klms_parser(
     files_list = files_sub.add_parser("list", help="List current-term file and material entries from KLMS course surfaces.", formatter_class=_HelpFormatter)
     files_list.add_argument("--course-id", metavar="ID", help="Filter to one course ID.")
     files_list.add_argument("--course", metavar="QUERY", help="Filter by course code or title substring.")
-    files_list.add_argument("--limit", type=int, metavar="N", help="Maximum number of file/material entries to return.")
+    files_list.add_argument("--limit", type=positive_int, metavar="N", help="Maximum number of file/material entries to return; must be greater than 0.")
     _set_defaults(files_list, schema_name=f"{schema_prefix}.files.list.v1", command_path="klms files list", handler=handler)
     files_get = files_sub.add_parser("get", help="Resolve one file/material to metadata without downloading content.", formatter_class=_HelpFormatter)
     files_get.add_argument("file_id", metavar="ID", help="File ID or URL.")
@@ -392,7 +400,7 @@ def register_klms_parser(
     files_pull = files_sub.add_parser("pull", help="Bulk-download downloadable file/material entries into a local mirror.", formatter_class=_HelpFormatter)
     files_pull.add_argument("--course-id", metavar="ID", help="Filter to one course ID.")
     files_pull.add_argument("--course", metavar="QUERY", help="Filter by course code or title substring.")
-    files_pull.add_argument("--limit", type=int, metavar="N", help="Maximum number of downloadable items to pull.")
+    files_pull.add_argument("--limit", type=positive_int, metavar="N", help="Maximum number of downloadable items to pull; must be greater than 0.")
     files_pull.add_argument("--subdir", metavar="DIR", help="Relative destination under the v2 files root.")
     files_pull.add_argument("--dest", metavar="PATH", help="Write into this directory instead of the managed files root.")
     files_pull.add_argument("--if-exists", choices=["skip", "overwrite"], default="skip", help="Behavior when the destination exists.")
@@ -404,7 +412,7 @@ def register_klms_parser(
     videos_list.add_argument("--course-id", metavar="ID", help="Filter to one course ID.")
     videos_list.add_argument("--course", metavar="QUERY", help="Filter by course code or title substring.")
     videos_list.add_argument("--recent", action="store_true", help="Prefer recently surfaced videos instead of course-page order.")
-    videos_list.add_argument("--limit", type=int, metavar="N", help="Maximum number of videos to return.")
+    videos_list.add_argument("--limit", type=positive_int, metavar="N", help="Maximum number of videos to return; must be greater than 0.")
     _set_defaults(videos_list, schema_name=f"{schema_prefix}.videos.list.v1", command_path="klms videos list", handler=handler)
     videos_show = videos_sub.add_parser("show", help="Show one video detail page, viewer link, and resolved stream URL when available.", formatter_class=_HelpFormatter)
     videos_show.add_argument("video_id", metavar="ID", help="Video ID or URL.")
@@ -415,7 +423,7 @@ def register_klms_parser(
     request_sub = request.add_subparsers(dest="action", required=True, metavar="ACTION")
     request_get = request_sub.add_parser("get", help="Run an authenticated GET against a KLMS path or URL and return stable JSON.", formatter_class=_HelpFormatter)
     request_get.add_argument("target", metavar="TARGET", help="KLMS path like `/course/view.php?id=12345` or a full URL under the configured base URL.")
-    request_get.add_argument("--preview-chars", type=int, default=4000, metavar="N", help="Maximum body characters to include before truncating.")
+    request_get.add_argument("--preview-chars", type=positive_int, default=4000, metavar="N", help="Maximum body characters to include before truncating; must be greater than 0.")
     request_get.add_argument("--full-body", action="store_true", help="Include the full response body instead of truncating to a preview.")
     _set_defaults(request_get, schema_name=f"{schema_prefix}.request.get.v1", command_path="klms request get", handler=handler)
 
@@ -425,15 +433,15 @@ def register_klms_parser(
     _set_defaults(dev_plan, schema_name=f"{schema_prefix}.dev.plan.v1", command_path="klms dev plan", handler=handler)
     dev_probe = dev_sub.add_parser("probe", help="Show provider probing strategy", formatter_class=_HelpFormatter)
     dev_probe.add_argument("--live", action="store_true", help="Perform live endpoint validation using current auth state.")
-    dev_probe.add_argument("--timeout", type=float, default=10.0, metavar="SECONDS", help="Per-request timeout for live validation.")
+    dev_probe.add_argument("--timeout", type=positive_float, default=10.0, metavar="SECONDS", help="Per-request timeout; must be greater than 0 seconds.")
     _set_defaults(dev_probe, schema_name=f"{schema_prefix}.dev.probe.v1", command_path="klms dev probe", handler=handler)
     dev_discover = dev_sub.add_parser("discover", help="Capture KLMS XHR/fetch endpoints from key surfaces", formatter_class=_HelpFormatter)
-    dev_discover.add_argument("--courses", type=int, default=2, metavar="N", help="Maximum number of course dashboards to traverse.")
-    dev_discover.add_argument("--boards", type=int, default=2, metavar="N", help="Maximum number of notice boards to traverse.")
-    dev_discover.add_argument("--links", type=int, default=2, metavar="N", help="Maximum number of detail links to follow per surface type.")
+    dev_discover.add_argument("--courses", type=positive_int, default=2, metavar="N", help="Maximum course dashboards to traverse; must be greater than 0.")
+    dev_discover.add_argument("--boards", type=positive_int, default=2, metavar="N", help="Maximum notice boards to traverse; must be greater than 0.")
+    dev_discover.add_argument("--links", type=positive_int, default=2, metavar="N", help="Maximum detail links per surface type; must be greater than 0.")
     dev_discover.add_argument(
         "--manual-courseboard-seconds",
-        type=int,
+        type=nonnegative_int,
         default=0,
         metavar="N",
         help="Open the first discovered notice board in a visible browser and record runtime courseboard activity for N seconds while you click around.",

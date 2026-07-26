@@ -44,6 +44,7 @@ Optional agent skill install helpers:
 - `kaist agent install gemini`
 - `kaist agent install custom --path /target/dir`
 - `kaist agent status`
+- `kaist agent uninstall TARGET` removes only a managed symlink or marked copy. Use `--dry-run` to preview; legacy copies require `--confirm /exact/target/path`.
 
 Linux note:
 - published standalone bundles support `x86_64` glibc hosts only
@@ -75,6 +76,8 @@ uv run kaist klms auth store-email-otp-secret --username KAIST_ID
 uv run kaist klms auth refresh
 ```
 
+For staged email-OTP completion, prefer `kaist klms auth complete-refresh SESSION_ID --otp-stdin` (one code line on stdin). An interactive terminal may use the hidden prompt; `--no-input` fails quickly when no code is available. The legacy `--otp CODE` flag remains for compatibility but exposes the code in shell history and process listings.
+
 ## KLMS Commands
 
 Stable workflows:
@@ -94,6 +97,7 @@ Stable workflows:
 
 Other systems:
 - `kaist version`
+- `kaist --version` (also `kaist version --json` or `kaist version --format json`)
 - `kaist update --check`
 - `kaist update`
 - `kaist agent install|status|uninstall`
@@ -109,6 +113,10 @@ Behavior:
 - `--format json` is good for scripts.
 - `--agent` is a global flag and returns strict JSON envelopes with stable schema names such as `kaist.klms.today.v1`.
 - use it like `kaist --agent klms today` or `kaist --agent version`
+
+Structured output is a compatibility contract. Successful results and dispatched operational errors are JSON on stdout; operational errors keep a nonzero exit status. Do not move those errors to stderr in automation. Invalid `--agent` command lines (including missing operands, invalid choices, and numeric validation failures) return one `kaist.cli.parse.v1` JSON error envelope on stdout with exit status 2 and no traceback/plaintext mixed into stdout. Human-mode argparse errors remain conventional.
+
+Numeric limits, page counts, windows, discovery counts, timeouts, and preview sizes must be greater than zero when supplied. Download `--filename` values are basename-only and cannot contain path separators or controls; remote suggested names are reduced safely to a basename. Use `--dest` or `--subdir` for placement.
 
 Common non-zero exit codes:
 - `10` auth errors
