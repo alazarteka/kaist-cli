@@ -43,7 +43,7 @@ from kaist_cli.v2.klms.capture import _courseboard_runtime_capture_summary, _ext
 from kaist_cli.v2.klms.config import load_config
 from kaist_cli.v2.klms.dashboard import DashboardService, _build_inbox_items, _decorate_today_assignments, _filter_inbox_assignments, _filter_inbox_files, _select_materials, _select_recent_notices
 from kaist_cli.v2.klms.discovery import load_recent_courses_args, map_discovery_report
-from kaist_cli.v2.klms.files import FileService, _extract_file_items_from_course_contents, _extract_file_items_from_html, _normalize_file_item_metadata, _pull_subdir_for_item, _sanitize_relpath, _synthesize_file_item_from_url, _unwrap_moodle_ajax_payload
+from kaist_cli.v2.klms.files import FileService, _extract_file_items_from_course_contents, _extract_file_items_from_html, _filename_from_remote, _normalize_file_item_metadata, _pull_subdir_for_item, _sanitize_relpath, _synthesize_file_item_from_url, _unwrap_moodle_ajax_payload, _validate_filename_override
 from kaist_cli.v2.klms.media_recency import load_media_recency, observe_files, observe_videos
 from kaist_cli.v2.klms.models import Assignment, Course, FileItem, Notice, Video
 from kaist_cli.v2.klms.notices import NoticeService, _discover_notice_board_ids_from_course_page, _extract_course_ids_from_dashboard, _parse_notice_detail_from_html, _parse_notice_items_from_soup
@@ -565,7 +565,7 @@ def test_download_resolved_item_falls_back_to_browser_when_http_returns_html(tmp
                 raise KlmsDownloadFallback("html response")
 
         class FakeDownload:
-            suggested_filename = "week1-from-browser.pdf"
+            suggested_filename = "../../browser-suggested.pdf"
 
             def save_as(self, path: str) -> None:
                 Path(path).write_bytes(b"%PDF-browser")
@@ -614,6 +614,64 @@ def test_download_resolved_item_falls_back_to_browser_when_http_returns_html(tmp
 
     assert result["transport"] == "browser"
     assert Path(result["path"]).read_bytes() == b"%PDF-browser"
+    assert Path(result["path"]).parent == paths.files_root / "pull-browser"
+    assert result["filename"] == "browser-suggested.pdf"
+
+
+@pytest.mark.parametrize("unsafe", ["../escape.pdf", "/tmp/escape.pdf", "nested/escape.pdf", "nested\\escape.pdf", "bad\nname.pdf", ".", ".."])
+def test_explicit_filename_boundary_rejects_unsafe_paths(unsafe: str) -> None:
+    with pytest.raises(CommandError) as exc_info:
+        _validate_filename_override(unsafe)
+    assert exc_info.value.code == "CONFIG_INVALID"
+
+
+def test_remote_filename_boundary_keeps_unicode_basename() -> None:
+    assert _filename_from_remote("../../자료/강의자료.pdf") == "강의자료.pdf"
+
+
+def test_download_rejects_unsafe_explicit_filename_before_transport(tmp_path: Path) -> None:
+    old_home = os.environ.get("KAIST_CLI_HOME")
+    os.environ["KAIST_CLI_HOME"] = str(tmp_path / "kaist-home")
+    try:
+        _write_config(tmp_path)
+        paths = resolve_paths()
+        config = load_config(paths)
+        service = FileService(paths, AuthService(paths))
+        item = FileItem(
+            id="991",
+            title="Week 1 Slides",
+            url="https://klms.kaist.ac.kr/pluginfile.php/123/week1.pdf?forcedownload=1",
+            download_url="https://klms.kaist.ac.kr/pluginfile.php/123/week1.pdf?forcedownload=1",
+            filename="week1.pdf",
+            kind="file",
+            downloadable=True,
+            course_id=None,
+            course_title=None,
+            course_code=None,
+            course_code_base=None,
+            source="test",
+            confidence=1.0,
+            auth_mode="profile",
+        )
+        with pytest.raises(CommandError) as exc_info:
+            service._download_resolved_item(
+                context=SimpleNamespace(),
+                config=config,
+                item=item,
+                filename_override="../escape.pdf",
+                subdir=None,
+                dest=str(tmp_path / "dest"),
+                if_exists="overwrite",
+                auth_mode="profile",
+            )
+    finally:
+        if old_home is None:
+            os.environ.pop("KAIST_CLI_HOME", None)
+        else:
+            os.environ["KAIST_CLI_HOME"] = old_home
+
+    assert exc_info.value.code == "CONFIG_INVALID"
+    assert not (tmp_path / "escape.pdf").exists()
 
 
 def test_files_pull_emits_stderr_progress(tmp_path: Path, monkeypatch) -> None:

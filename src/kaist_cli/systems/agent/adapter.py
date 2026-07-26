@@ -36,9 +36,15 @@ class AgentAdapter(SystemAdapter):
             command_path="agent status",
         )
 
-        uninstall = agent_sub.add_parser("uninstall", help="Remove an installed `kaist-cli` skill from a supported agent path")
+        uninstall = agent_sub.add_parser("uninstall", help="Remove a verified `kaist-cli` skill from a supported agent path")
         uninstall.add_argument("target", choices=["codex", "claude", "gemini", "custom"])
         uninstall.add_argument("--path", help="Target directory for custom uninstalls.")
+        uninstall.add_argument(
+            "--confirm",
+            metavar="PATH",
+            help="Exact target path confirmation required for an unmarked legacy copy; managed symlinks/copies do not need it.",
+        )
+        uninstall.add_argument("--dry-run", action="store_true", help="Show what would be removed without changing the filesystem.")
         uninstall.set_defaults(
             handler=self._handle_uninstall,
             schema_name="kaist.cli.agent.uninstall.v1",
@@ -52,4 +58,4 @@ class AgentAdapter(SystemAdapter):
         return agent_status(custom_path=args.path)
 
     def _handle_uninstall(self, args: argparse.Namespace) -> dict[str, Any]:
-        return uninstall_agent(args.target, custom_path=args.path)
+        return uninstall_agent(args.target, custom_path=args.path, confirm=args.confirm, dry_run=bool(args.dry_run))
